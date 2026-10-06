@@ -141,10 +141,10 @@ scripts/        CI 扫描脚本。
 - 所有表用 `STRICT`。
 
 ### 备份
-1. 先删除备份目录中残留的 `tmp-*.db`；在备份连接上读取 `seq_before = max(seq)`，再执行 `VACUUM INTO '<备份目录>/tmp-<UUIDv7>.db'`。
+1. 先删除备份目录中残留的 `tmp-*.db`；在备份连接上读取 `seq_before = coalesce(max(seq), 0)`，再执行 `VACUUM INTO '<备份目录>/tmp-<UUIDv7>.db'`。
    - `VACUUM INTO` 不覆盖已存在的文件；固定文件名在上次中途退出后会让之后每次备份都失败。
-2. 只读打开临时文件，执行 `PRAGMA integrity_check`，并校验 `max(seq) >= seq_before` 且 `count(*) = max(seq)`；校验失败则删除临时文件。
-   - 备份期间写入照常提交，备份快照可能包含 `seq_before` 之后的事件，所以只比下界，不比相等。备份自身的 `max(seq)` 记为 `last_backup_seq`。
+2. 只读打开临时文件，执行 `PRAGMA integrity_check`，并以 `n = coalesce(max(seq), 0)` 校验 `n >= seq_before` 且 `count(*) = n`（空账本时三者都为 0）；校验失败则删除临时文件。
+   - 备份期间写入照常提交，备份快照可能包含 `seq_before` 之后的事件，所以只比下界，不比相等。备份自身的 `n` 记为 `last_backup_seq`。
 3. 校验通过后对文件 fsync，原子重命名为 `boh-<UTC时间>.db`，再 fsync 备份目录；按保留策略清理旧文件后再 fsync 一次目录。
    - 只 fsync 文件不能让重命名后的目录项持久化，断电后新备份可能消失。
 4. 低峰时段每小时一次，闭店后一次。`VACUUM INTO` 期间持有读快照，会推迟 WAL checkpoint。
