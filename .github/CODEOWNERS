@@ -1,5 +1,5 @@
-# 受保护路径：合入 main 需要 Code Owner 审核（main 须开启分支保护并勾选 Require review from Code Owners）。
-# 实现 agent 不得修改这些路径，见 AGENTS.md「协作分工」。
+# 锁定路径清单。实现 agent 不得修改这些路径，见 AGENTS.md「协作分工」与「Review guidelines」。
+# 不启用 Code Owner 审核：所有 PR 都由同一账号提交，作者不能自审；锁定由规则与 review 把关。
 
 # 规则与设计文档
 /AGENTS.md @KurodaRyou

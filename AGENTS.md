@@ -18,6 +18,9 @@
 - 「尚未设计」一节和 `docs/domain.md`「待确认问题」中的内容，在设计落地到文档之前**不要实现**。
 - 交付前必须本地通过：`cargo fmt --all`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`、`scripts/ci-scan.sh`。
 - 交付说明写清：改了哪些文件、对应「开发顺序」的哪几步、有哪些未决问题。之后由 Claude 做 code review。
+- 合入：`main` 只接受 PR，CI `check` 必须通过，禁止强推和删除；不要求 PR 批准。
+  - 所有提交和 PR 都用同一个 GitHub 账号，作者不能批准自己的 PR。锁定路径由本文件规则、Codex 自动 review、Claude review 把关，人确认后合入。
+- 锁定路径（`.github/CODEOWNERS` 列出的路径）的改动只能出现在人或 Claude 提交、提交信息以 `spec:`（锁定测试）或 `docs:`（规则、设计、迁移、CI 与构建配置）开头的提交中。
 
 ### 测试分工
 
@@ -37,7 +40,7 @@
 - 预期值由人工确认。**任何人都不允许为了让测试通过而修改预期值。**
 - 实现 agent 认为锁定测试有错时，停下来在交付说明里提出。不得修改，不得加 `#[ignore]`，不得用 `cfg`、feature 或 Cargo 配置让它不编译、不运行。
 - 合入方式：锁定测试作为切片分支的第一个提交（提交信息以 `spec:` 开头，由人提交）；实现 agent 在其上开发，测试与实现在同一个 PR 合入。
-  Review 时 `git diff <spec 提交> HEAD -- <锁定路径>` 必须为空。
+  Review 时 `git diff <spec 提交> HEAD -- <锁定路径>` 必须为空。PR 打开后又有新提交时，合入前评论 `@codex review` 重新触发 Codex review。
 
 ### 文档分层
 - `AGENTS.md`、`docs/`：只写**当前生效的结论**。不写讨论过程、问答记录、被否决的方案、修改历史。
@@ -221,12 +224,12 @@ scripts/        CI 扫描脚本。
 | 禁止 REPLACE 绕过触发器 | `recursive_triggers = ON` + schema 测试；`scripts/ci-scan.sh` 禁止 crate 集成测试以外的 `.rs` / `.sql` 中出现 `REPLACE` / `DO UPDATE` |
 | 时间只有一个来源、闭包内不阻塞 | `disallowed-methods` |
 | 序列化结果确定 | `boh-domain/clippy.toml` 的 `disallowed-types` |
-| 迁移不可修改 | schema 测试中的校验和 + CODEOWNERS |
-| Payload 不可修改 | golden 测试 + CODEOWNERS |
+| 迁移不可修改 | schema 测试中的校验和 + 锁定路径 |
+| Payload 不可修改 | golden 测试 + 锁定路径 |
 | 重放结果确定 | 锁定的重放一致性测试 |
 | 防止溢出 | `overflow-checks` + `checked_*` |
 | 业务规则正确 | 锁定的验收用例，预期值由人工确认 |
-| 锁定测试、CI、构建配置不被改动 | CODEOWNERS + main 分支保护（要求 Code Owner 审核）+ review 时比对 `spec:` 提交 |
+| 锁定测试、CI、构建配置不被改动 | 锁定路径清单（`.github/CODEOWNERS`）+ `main` 分支保护（只接受 PR、CI 通过、禁止强推）+ Codex 与 Claude review 比对 `spec:` 提交 |
 
 ---
 
@@ -258,7 +261,7 @@ scripts/        CI 扫描脚本。
 6. **实现 agent**：`boh-app::service` 中经 `ledger::execute` 组装一个事务；`projections::apply` 增加该事件的投影。
 7. **实现 agent**：`boh-app::http` handler + 路由。
 8. **实现 agent**：全部锁定测试通过，补自己的单元测试，提交交付说明。
-9. **Claude** review（按「不可违反的规则」逐条核对，锁定路径 diff 为空），人合入。
+9. **Codex** 自动 review + **Claude** review（按「不可违反的规则」逐条核对，锁定路径 diff 为空），人合入。
 
 ### 路线图
 
@@ -295,3 +298,23 @@ ARM 门店机改用 `aarch64-unknown-linux-musl`。部署文件见 `deploy/`。
 - 上行同步的实现：总部接收接口、批量大小、mTLS 证书下发与轮换。**延后**；契约见「上行同步」。
 - 局域网 HTTPS 加固。
 - 异地备份复制的实现。
+
+---
+
+## Review guidelines
+
+供 Codex 自动 review 和 Claude review 使用。
+
+**P0（必须阻止合入）**
+- 修改了 `.github/CODEOWNERS` 列出的锁定路径，而该改动所在提交的信息不以 `spec:` 或 `docs:` 开头。逐个列出这些文件。
+- 在不以 `spec:` / `docs:` 开头的提交中让锁定测试（`crates/*/tests/spec_*.rs`、`spec_support/`、`golden/`、`crates/boh-storage/tests/schema.rs`）失效：
+  修改预期值、删除用例、加 `#[ignore]`、用 `cfg` / feature 排除、在 `Cargo.toml` 中设置 `test = false` / `autotests = false`、改 CI 让测试不运行。
+- 修改已合入 `main` 的迁移文件。
+
+**P1**
+- 违反「不可违反的规则」任一条，例如：另开写连接、绕过 `Ledger::append` 写 `store_events`、闭包内做网络 I/O 或 sleep、
+  非测试代码 `unwrap()` / `expect()`、浮点参与业务计算、未经 `checked_*` 的业务算术、新增未在技术栈表登记的依赖。
+- HTTP 响应不符合「HTTP 约定」：信封缺字段、状态码与语义不符、把 SQL 或内部细节返回给客户端。
+- 写命令缺少幂等处理，或缺少重复提交同一 `command_id` 的测试。
+
+`spec:` / `docs:` 提交是设计变更：检查内容是否自洽、是否与 `docs/domain.md` 一致；其中修改已合入的迁移仍按 P0 处理。
