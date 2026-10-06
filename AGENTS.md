@@ -273,7 +273,7 @@ scripts/        CI 扫描脚本。
 - HTTP 状态码要和语义一致：校验失败 400、不存在 404、幂等冲突与业务冲突 409、内部错误 500。`code` 是稳定的大写蛇形字符串，客户端按 `code` 判断，不按 `message`。
 - 通用错误码：结构或取值错误 `400 VALIDATION_FAILED`；引用的实体不存在 `404 REFERENCE_NOT_FOUND`。
 - 其他通用错误码：未匹配的路由 `404 ROUTE_NOT_FOUND`；方法不允许 `405 METHOD_NOT_ALLOWED`；内部错误 `500 INTERNAL_ERROR`；缺少或无效的身份 `401 UNAUTHENTICATED`；角色不够 `403 FORBIDDEN`。
-- 请求体不是合法 JSON、缺少 `Content-Type: application/json`、字段缺失、未知字段、类型或取值不对，以及路径参数无法解析，一律 `400 VALIDATION_FAILED`。
+- 身份与权限通过后，请求体不是合法 JSON、缺少 `Content-Type: application/json`、字段缺失、未知字段、类型或取值不对，以及路径参数无法解析，一律 `400 VALIDATION_FAILED`。
   - axum 提取器默认返回纯文本的 415 / 422，必须转换成信封。
 - 写命令按以下顺序处理，先命中的结果生效：身份与权限 → 请求结构与取值（反序列化成强类型命令）→ 幂等检查 → 业务校验。被前两步拒绝的请求不做幂等比对。
 - 写命令成功一律 `200`，重试返回的原响应也是 `200`。
