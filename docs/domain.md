@@ -114,18 +114,19 @@ occurred_at = recorded_at − lag
 所有数量是基本单位 `i64`，金额是 `i64` 分。`schema_version` 从 1 开始。
 `actor_id`、`device_id`、`occurred_at`、`business_date` 存在 `store_events` 的列中，不重复写进 payload。
 `input` 见「单位」，`alloc` 见「批次」。影响库存的行，要么带 `alloc`（或新建的 `lot_id`），要么带 `absorbed_by_event_id`（被吸收，见「盘点吸收」），二者取一。
+带 `?` 的字段可选：缺省时省略该键，不写 `null`。`a | b` 表示二者恰有一个出现。
 
 | event_type | aggregate_type | payload 要点 | 投影影响 |
 |---|---|---|---|
-| `GOODS_RECEIVED` | `RECEIPT` | `supplier_id`, `lines[{item_id, qty, input, lot_id, supplier_lot_no?, expires_at?, line_cost_cents, absorbed_by_event_id?}]` | 每行新建一个批次；被吸收时不建 |
-| `PRODUCTION_BATCH_COMPLETED` | `PRODUCTION_BATCH` | `recipe_id`, `recipe_version`, `batch_count`, `started_at`, `output{item_id, planned_qty, qty, lot_id, expires_at?, absorbed_by_event_id?}`, `consumed[{item_id, planned_qty, qty, alloc \| absorbed_by_event_id}]` | 原料按分配扣减（或被吸收）；成品新建批次 |
+| `GOODS_RECEIVED` | `RECEIPT` | `supplier_id`, `lines[{item_id, qty, input, lot_id \| absorbed_by_event_id, supplier_lot_no?, expires_at?, line_cost_cents}]` | 每行新建一个批次；被吸收时不建 |
+| `PRODUCTION_BATCH_COMPLETED` | `PRODUCTION_BATCH` | `recipe_id`, `recipe_version`, `batch_count`, `started_at?`, `output{item_id, planned_qty, qty, lot_id \| absorbed_by_event_id, expires_at?}`, `consumed[{item_id, planned_qty, qty, alloc \| absorbed_by_event_id}]` | 原料按分配扣减（或被吸收）；成品新建批次 |
 | `WASTE_LOGGED` | `WASTE_RECORD` | `lines[{item_id, qty, input, reason_code, alloc \| absorbed_by_event_id}]` | 按分配扣减（或被吸收） |
 | `STOCK_COUNT_SUBMITTED` | `STOCK_COUNT` | `purpose`（`CLOSING` / `AUDIT`）, `started_seq`, `lines[{item_id, lot_id \| null, counted_qty}]` | 无 |
 | `STOCK_ADJUSTED` | `STOCK_COUNT` | `lines[{item_id, lot_id \| null, book_qty, counted_qty, delta}]`, `new_lots[{lot_id, item_id, qty}]` | 批次和账外缺口按 delta 变化；新建盘盈批次；写 `inventory_counts` |
 | `PURCHASE_ORDER_SUBMITTED` | `PURCHASE_ORDER` | `supplier_id`, `lines[{item_id, qty, input}]`, `deliver_on` | 无 |
 | `TEMPERATURE_LOGGED` | `TEMPERATURE_READING` | `equipment_id`, `celsius_x10`, `note?` | 食安记录 |
-| `QUANTITY_CORRECTED` | 与原事件相同 | `corrected_event_id`, `reason`, `lines[{line_ref, item_id, old_qty, new_qty, delta, input, line_cost_cents?, alloc \| absorbed_by_event_id}]` | 按差额调整（或被吸收），见「纠错」 |
-| `EVENT_REVERSED` | 与原事件相同 | `reversed_event_id`, `reason`, `lines[{line_ref, item_id, qty, alloc \| absorbed_by_event_id}]` | 精确取反（或被吸收），见「纠错」 |
+| `QUANTITY_CORRECTED` | 与原事件相同 | `corrected_event_id`, `reason`, `lines[{line_ref, item_id, physical_at, old_qty, new_qty, delta, input, line_cost_cents?, alloc \| absorbed_by_event_id}]` | 按差额调整（或被吸收），见「纠错」 |
+| `EVENT_REVERSED` | 与原事件相同 | `reversed_event_id`, `reason`, `lines[{line_ref, item_id, physical_at, qty, alloc \| absorbed_by_event_id}]` | 精确取反（或被吸收），见「纠错」 |
 | `SALES_IMPORTED` | `SALES_DAY` | `source`（`CSV` / `XLSX`）, `file_name`, `lines[{item_id, qty, amount_cents}]`, `ignored_rows` | 覆盖 `daily_sales` 中该营业日；**不写库存流水** |
 | `MASTER_DATA_CHANGED` | 实体名 | `entity`, `source`, `snapshot` | 覆盖对应的主数据表 |
 
@@ -218,6 +219,7 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 - 写入前读取原事件所在聚合的全部事件。已有 `EVENT_REVERSED`：`409 ALREADY_REVERSED`。同一事件可以更正多次。
 - 原事件某一行的**有效数量** = 原值 + 之后全部更正的差额；有效分配同理。
 - 每行按「盘点吸收」判定（t 取原行的值）。被吸收的行不动库存，只更正报表。
+- 每行的 `physical_at` 是原行的 t，由写入线程填写。生产用料的 t 是 `started_at`，与事件的 `occurred_at` 不同，所以必须写进 payload，重放时不查原事件。
 - 纠错行沿用原行的 `kind`，营业日取原行的值。所以按 `kind` 汇总时纠错自动抵消原记录，并回写到原来那天的日报。
 - **扣回时批次余量不够**（原批次已被后续扣减）：批次扣到 0，不足部分记入账外缺口，返回 `STOCK_SHORTFALL`，界面提示「建议现在盘点该物料」。下一次包含该物料的盘点会清零，不会在盘点差异里重复出现。
 - **退回会使账外缺口大于 0**（原分配含账外缺口，而该缺口已被之后一次观察时点更早的盘点清零，只在 `MOVED_DURING_COUNT` 之后出现）：`409 COUNT_REQUIRED`。先盘点该物料，新盘点的观察时点晚于原行，纠错随后会被吸收。
