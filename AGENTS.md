@@ -169,11 +169,11 @@ scripts/        CI 扫描脚本。
 
 ### ID 与时间
 - 所有实体 / 事件主键用 **UUIDv7**（`TEXT`，小写带连字符）。禁止自增整数 ID。
-  唯一例外：`store_events.seq`（门店内提交顺序，由 SQLite 分配）。投影表复合主键中的 `line_no` 是行号，不是自增键。
+  唯一例外：`store_events.seq`（门店内提交顺序，由 SQLite 分配）。投影表中的 `line_no`、`source_line_no` 是行号，不是自增键。
 - 客户端提交的 ID（如 `command_id`）在 `boh-domain` 中校验必须是 v7。
 - 时间戳一律 `INTEGER`，UTC Unix **毫秒**。禁止存格式化的日期时间字符串。
   例外：表示门店当地日期的业务字段——`business_date`（营业日）和采购单的 `deliver_on`（要求到货日），格式 `'YYYY-MM-DD'`，它们是业务概念而不是时间点。
-- **顺序只看 `seq`**：重放、FIFO、同步都按 `seq`，不按任何时间戳。
+- **事件间顺序只看 `seq`**：重放、同步按 `seq`；FIFO 先扣盘盈批次，再按来源事件的 `seq` 升序，同一来源事件内按原 payload 的行序（`source_line_no`）升序。不按任何时间戳。
 - `recorded_at` 取系统时钟原值，**不做单调钳制**。
   - 顺序已由 `seq` 保证；钳制会让一次跳到未来的时钟把之后的时间全部卡在未来。
 - `occurred_at` 由相对校准计算（或补录时显式给出），`business_date` 由 `occurred_at` 计算。规则见 `docs/domain.md`「时间」。

@@ -26,7 +26,7 @@
 
 | 字段 | 含义 | 来源 | 用途 |
 |---|---|---|---|
-| `seq` | 提交顺序 | SQLite 分配 | 重放、FIFO、同步。**顺序只看 `seq`** |
+| `seq` | 提交顺序 | SQLite 分配 | 重放、同步；FIFO 先盘盈，再按 `seq`，同一事件内按原行序。不按时间戳 |
 | `recorded_at` | 门店接收时间 | 系统时钟原值，不做钳制 | 审计、展示 |
 | `occurred_at` | 业务发生时间 | 相对校准，或补录时由员工填写 | 计算 `business_date`；吸收判定 |
 | `business_date` | 营业日 | 由 `occurred_at` 计算；`SALES_IMPORTED` 例外，由命令显式给出 | 报表归属 |
@@ -127,7 +127,8 @@ occurred_at = recorded_at − lag
 
 - **批次 ID**：每条收货行、每次生产产出、每个盘盈由写入线程生成一个 `lot_id`（UUIDv7），写进 payload。供应商批号 `supplier_lot_no` 是可选属性，不作主键。
 - **到期时间** `expires_at`（UTC 毫秒，可空）只用于过期提醒，不参与分配。只有日期的保质期由客户端换算成门店当地当日结束时刻再提交；未填写时可用 `default_shelf_life_ms` 推算，推算结果写进 payload。
-- **FIFO 分配**：未指定 `lot_id` 的扣减，先扣 `origin = 'COUNT_GAIN'` 的批次，其余按来源事件的 `seq` 升序。补录的收货按入账顺序排队。
+- **FIFO 分配**：未指定 `lot_id` 的扣减，按（盘盈优先、`source_seq`、`source_line_no`）升序分配：`origin = 'COUNT_GAIN'` 的批次优先，同一优先级内先按来源事件的 `seq` 升序，再按原 payload 行序升序。同一收货事件允许同一物料有多行，各行分别建批次，按原 `lines` 数组顺序分配。补录的收货按入账顺序排队。
+- **来源行序**：批次投影保存 `source_line_no`，从 0 开始；收货取原 `lines[i]` 的 `i`，盘盈取原 `new_lots[i]` 的 `i`，生产 `output` 固定取 0。被吸收的行不建批次，其他行保留原下标，不重新编号。行序直接从已保存的 payload 恢复，不新增 payload 字段；更正、冲销或盘点调整已有批次时不改变它的 `source_seq` 和 `source_line_no`。
 - 客户端可以指定 `lot_id`；指定批次余量不足时，不足部分继续按 FIFO 分配。
 - **账面不足**：全部批次分配完仍不够时不拒绝，剩余部分记入账外缺口，返回警告 `STOCK_SHORTFALL`。下一次包含该物料的盘点会把账外缺口清零。
 - 分配结果连同来源写进 payload：`alloc[{lot_id?, qty, source}]`。`qty` 为正数，不带 `lot_id` 表示账外缺口；`source`（`SPECIFIED` / `FIFO` / `SHORTFALL`，纠错另有 `CORRECTION` / `REVERSAL`，见「纠错」）。重放时直接使用，不重新分配。
@@ -321,10 +322,12 @@ CREATE TABLE inventory_lots (
     lot_id          TEXT PRIMARY KEY,
     item_id         TEXT NOT NULL,
     origin          TEXT NOT NULL CHECK (origin IN ('RECEIPT', 'PRODUCTION', 'COUNT_GAIN')),
-    source_seq      INTEGER NOT NULL REFERENCES store_events(seq),  -- FIFO 排序键
+    source_seq      INTEGER NOT NULL REFERENCES store_events(seq),  -- FIFO 的事件顺序
+    source_line_no  INTEGER NOT NULL CHECK (source_line_no >= 0),    -- 原 payload 下标；output 为 0
     remaining_qty   INTEGER NOT NULL CHECK (remaining_qty >= 0),
     expires_at      INTEGER,
-    supplier_lot_no TEXT
+    supplier_lot_no TEXT,
+    UNIQUE (source_seq, source_line_no)
 ) STRICT;
 
 CREATE TABLE inventory_unallocated (                -- 账外缺口
@@ -397,6 +400,9 @@ CREATE INDEX idx_inventory_counts_item ON inventory_counts(item_id, observed_at)
 | 盘点后冲销 | 100；09:00 误报损 10，账面 90；09:20 盘点得 100（调整 +10）；10:00 冲销报损 | 被吸收；账面 **100**；报损合计 **0**；未解释损耗 **0** |
 | 闭店重盘 | 成品账面 100；先盘为 80，再盘为 90；销售 0 | 调整净和 **−10**；未解释损耗 **10** |
 | 指定批次不足 | 批次 A 5、B 10；指定 A 扣 8 | 分配 `A 5 SPECIFIED` + `B 3 FIFO` |
+| 同次收货多个批次 | 同一收货事件的同一物料两行：`lines[0]` 建 A 5，`lines[1]` 建 B 10；不指定批次扣 8；B 的 UUID 字典序小于 A | 按行序分配 `A 5 FIFO` + `B 3 FIFO`；余量 A **0**、B **7**，不按 UUID 排序 |
+| 同次收货重复提交 | 上例扣减后，用原 `command_id`、原内容重发收货 | 返回原批次 A、B；`seq` 不增加；余量仍为 A **0**、B **7**，来源行序不变 |
+| 来源行序重建 | 保存同次收货后尚未扣减的原库结果，清空投影，按 `seq` 重建，再不指定批次扣 8 | 重建后投影逐行一致，A、B 的 `source_line_no` 分别为 **0**、**1**；后续分配 `A 5 FIFO` + `B 3 FIFO`，余量 A **0**、B **7** |
 | 按批次盘点 | 批次 A 5、B 10，账外缺口 −2；清点 A 4、B 10、无批次 3 | A 调整 −1；账外缺口 +2 归零；新建 `COUNT_GAIN` 批次 3；账面 **17** |
 | 盘点漏填批次 | 批次 A 5、B 10；只提交 A 4 | `400 COUNT_LINE_MISSING`，列出 B；不入账 |
 | 盘点填 0 | 批次 A 5、B 10；提交 A 4、B 0 | A 调整 −1，B 调整 −10；账面 **4** |
