@@ -21,6 +21,7 @@
 - 合入：`main` 只接受 PR，CI `check` 必须通过，禁止强推和删除；不要求 PR 批准。
   - 所有提交和 PR 都用同一个 GitHub 账号，作者不能批准自己的 PR。锁定路径由本文件规则、Codex 自动 review、Claude review 把关，人确认后合入。
 - 锁定路径（`.github/CODEOWNERS` 列出的路径）的改动只能出现在人或 Claude 提交、提交信息以 `spec:`（锁定测试）或 `docs:`（规则、设计、迁移、CI 与构建配置）开头的提交中。
+- 切片需要的依赖、构建或 CI 改动用 `docs:` 提交，放在 `spec:` 提交之前。
 
 ### 测试分工
 
@@ -40,8 +41,8 @@
 - 锁定测试的辅助代码只放在 `crates/*/tests/spec_support/`（同样锁定），不依赖任何不受保护的代码。
 - 预期值由人工确认。**任何人都不允许为了让测试通过而修改预期值。**
 - 实现 agent 认为锁定测试有错时，停下来在交付说明里提出。不得修改，不得加 `#[ignore]`，不得用 `cfg`、feature 或 Cargo 配置让它不编译、不运行。
-- 合入方式：锁定测试作为切片分支的第一个提交（提交信息以 `spec:` 开头，由人提交）；实现 agent 在其上开发，测试与实现在同一个 PR 合入。
-  Review 时 `git diff <spec 提交> HEAD -- <锁定路径>` 必须为空。PR 打开后又有新提交时，合入前评论 `@codex review` 重新触发 Codex review。
+- 合入方式：锁定测试以 `spec:` 提交（由人提交）；实现 agent 在其上开发，测试与实现在同一个 PR 合入。
+  Review 的比对基准是切片分支开头连续的 `spec:` / `docs:` 提交中的最后一个，`git diff <比对基准> HEAD -- <锁定路径>` 必须为空。PR 打开后又有新提交时，合入前评论 `@codex review` 重新触发 Codex review。
 
 ### 文档分层
 - `AGENTS.md`、`docs/`：只写**当前生效的结论**。不写讨论过程、问答记录、被否决的方案、修改历史。
@@ -132,7 +133,7 @@ scripts/        CI 扫描脚本。
 - **只有一个写连接**，由 `sqlite-writer` 线程独占。所有写操作必须走 `Writer::call`。禁止在任何地方另开写连接。
   `open_writer` / `open_reader` / `spawn_writer` 为 `pub(crate)`，对外只暴露 `boh_storage::open()`。
   - 锁定测试需要的原始连接（已设好 PRAGMA）只经 `#[doc(hidden)] pub mod boh_storage::testing` 提供；
-    `clippy.toml` 的 `disallowed-methods` 禁用 `boh_storage::testing` 中的函数，只有锁定测试可以 `#[allow]`。
+    `clippy.toml` 的 `disallowed-methods` 禁用 `boh_storage::testing` 中的函数，只有锁定测试及 `spec_support/` 可以 `#[allow]`。
 - 写事务一律 `BEGIN IMMEDIATE`（`Writer::call` 已处理）。
 - 读连接 `query_only = ON`，只通过 `Readers::call` 使用；`Readers::call` 内部包一个 DEFERRED 读事务，读事务保持简短。
 - **受控例外：备份连接**。只在备份模块中打开，都用 `SQLITE_OPEN_READ_ONLY`，不设 `query_only`，不进读连接池：
@@ -144,6 +145,8 @@ scripts/        CI 扫描脚本。
 - 所有表用 `STRICT`。
 
 ### 备份
+备份目录由必填配置项 `backup_dir` 指定。
+
 1. 先删除备份目录中残留的 `tmp-*.db`；在备份连接上读取 `seq_before = coalesce(max(seq), 0)`，再执行 `VACUUM INTO '<备份目录>/tmp-<UUIDv7>.db'`。
    - `VACUUM INTO` 不覆盖已存在的文件；固定文件名在上次中途退出后会让之后每次备份都失败。
 2. 只读打开临时文件，执行 `PRAGMA integrity_check`，并以 `n = coalesce(max(seq), 0)` 校验 `n >= seq_before` 且 `count(*) = n`（空账本时三者都为 0）；校验失败则删除临时文件。
@@ -195,10 +198,10 @@ scripts/        CI 扫描脚本。
 ### 幂等
 - 每个写命令必须带客户端生成的 `command_id`（UUIDv7）。超时或结果未知时，客户端**必须用原 ID、原内容重试**。
 - 规范化请求：把命令反序列化成强类型结构体再序列化，剥离 `command_id` 和 `sent_at` 后存进 `processed_commands.request`。
-  只剥离这两个字段（`captured_at` 是业务内容）。比对规范化文本，不用哈希。
+  只剥离这两个字段（`captured_at` 是业务内容）。比对 `command_type` + 规范化请求（文本，不用哈希）。
 - **幂等检查先于任何业务校验**。
-  - 同一 `command_id` + 同一规范化请求 → 直接返回保存的响应（含 warnings），不重复执行。
-  - 同一 `command_id` + 不同规范化请求 → `409 IDEMPOTENCY_CONFLICT`，响应中给出差异字段。
+  - 同一 `command_id` + 同一 `command_type` + 同一规范化请求 → 直接返回保存的响应（含 warnings），不重复执行。
+  - 同一 `command_id`，但 `command_type` 或规范化请求不同 → `409 IDEMPOTENCY_CONFLICT`，响应中给出差异字段。
 - 只有成功的命令写入 `processed_commands`。被业务校验拒绝的命令不落库，修正后可以用同一个 ID 重提。
 - 命令和事件结构体禁止 `HashMap` / `HashSet`，只用 `Vec` / `BTreeMap`。
 
@@ -222,6 +225,7 @@ scripts/        CI 扫描脚本。
   | 禁用 | 只允许 `#[allow]` 的位置 |
   |---|---|
   | `rusqlite::Connection::open*` | `boh-storage/src/connection.rs`、备份模块 |
+  | `boh_storage::testing` 中的函数 | 锁定测试及 `spec_support/` |
   | `std::time::SystemTime::now`、`jiff::Timestamp::now`、`jiff::Zoned::now` | 时钟模块 |
   | `std::thread::sleep` | 无 |
   | `HashMap` / `HashSet`（`boh-domain`） | 无 |
@@ -245,7 +249,7 @@ scripts/        CI 扫描脚本。
 | 重放结果确定 | 锁定的重放一致性测试 |
 | 防止溢出 | `overflow-checks` + `checked_*` |
 | 业务规则正确 | 锁定的验收用例，预期值由人工确认 |
-| 锁定测试、CI、构建配置不被改动 | 锁定路径清单（`.github/CODEOWNERS`）+ `main` 分支保护（只接受 PR、CI 通过、禁止强推）+ Codex 与 Claude review 比对 `spec:` 提交 |
+| 锁定测试、CI、构建配置不被改动 | 锁定路径清单（`.github/CODEOWNERS`）+ `main` 分支保护（只接受 PR、CI 通过、禁止强推）+ Codex 与 Claude review 比对切片分支开头连续的 `spec:` / `docs:` 提交中的最后一个 |
 
 ---
 
@@ -256,11 +260,13 @@ scripts/        CI 扫描脚本。
 
 ```json
 { "success": true,  "data": { },  "warnings": [ { "code": "STOCK_SHORTFALL", "message": "...", "details": { } } ], "error": null }
-{ "success": false, "data": null, "warnings": [], "error": { "code": "IDEMPOTENCY_CONFLICT", "message": "..." } }
+{ "success": false, "data": null, "warnings": [], "error": { "code": "IDEMPOTENCY_CONFLICT", "message": "...", "details": { } } }
 ```
 
 - 警告不改变 `success`。警告码见 `docs/domain.md`：`STOCK_SHORTFALL`、`ABSORBED_BY_COUNT`、`EXPIRES_BEFORE_OLDER_STOCK`、`CAPTURE_TIME_ADJUSTED`。
+- 错误对象包含 `code`、`message`、`details`；`details` 总是存在，没有明细时为 `{}`。
 - HTTP 状态码要和语义一致：校验失败 400、不存在 404、幂等冲突与业务冲突 409、内部错误 500。`code` 是稳定的大写蛇形字符串，客户端按 `code` 判断，不按 `message`。
+- 通用错误码：结构或取值错误 `400 VALIDATION_FAILED`；引用的实体不存在 `404 REFERENCE_NOT_FOUND`。
 - 内部错误只记日志，不把 SQL / 内部细节返回给客户端。
 - `/health` 暴露：`clock_regression_ms`（超过 5 分钟为 `degraded`）、`last_backup_ok_at`、`last_backup_seq`、WAL 文件大小、最近一次不变量自检的结果；认证实现后加 `auth_failures_last_hour`；同步实现后加 `max(seq) − acked_seq` 和最后一次成功同步的时间。
   不变量自检由定时任务在读连接上执行，`/health` 只返回最近一次的结果，不现场计算。
@@ -283,7 +289,7 @@ scripts/        CI 扫描脚本。
 
 1. **核心管道**：时钟模块、相对校准、营业日纯函数；`ledger::execute` / `Ledger::append` / `projections::apply` 骨架与 `rebuild-projections`；
    `Readers::call` 包读事务、写线程任务计时；信封加 `warnings`、`Actor` 提取器；`boh_storage::open()` 收口（先由 Claude 以 `spec:` 提交把 schema 测试改用 `boh_storage::testing`）；备份模块与恢复演练测试。
-2. **黄金切片**：温度记录（含设备主数据事件，打通管道、幂等、重放、golden）→ 002：主数据与库存投影表 → 收货 + 报损（FIFO、账外缺口、分配来源、吸收规则、不变量自检）→ 局域网 HTTPS → 员工认证。
+2. **黄金切片**：温度记录（含 `EQUIPMENT` 主数据写接口、设备主数据事件和迁移 002：`equipment`、`temperature_readings` 投影表，打通管道、幂等、重放、golden）→ 003：主数据与库存投影表 → 收货 + 报损（FIFO、账外缺口、分配来源、吸收规则、不变量自检）→ 局域网 HTTPS → 员工认证。
 3. **扩展**：生产 → 盘点 → 纠错（冲销、数量更正）→ 补录入口 → 销售导入。每一步配对应的验收用例。
 
 ---

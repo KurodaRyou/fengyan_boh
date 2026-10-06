@@ -81,7 +81,11 @@ occurred_at = recorded_at − lag
 - 快照字段与枚举随 `MASTER_DATA_CHANGED@1` 冻结，改动按 AGENTS.md「只追加」升 `schema_version`。
 
 - 主键一律 UUIDv7。`code` 人可读、各门店统一（物料的 `code` 用于销售导入）。
+- `code` 和 `ITEM` 的 `base_unit` 创建后不可修改。
+  理由：账本数量按基本单位存。
 - 每行带 `revision`，每次变更 +1。主数据只停用（`active = 0`），不删除。
+- 命令引用已停用的主数据照常受理，停用只在界面上隐藏。
+- 主数据写接口只允许 `MANAGER`。
 - 每次变更写一条 `MASTER_DATA_CHANGED`：聚合类型是实体名，聚合 ID 是行的主键，`aggregate_version` 是变更后的 `revision`；payload 是 `{entity, source, snapshot}`，`source`（`LOCAL` / `HQ_PACKAGE`）。主数据表是投影，可以从事件流重建。
 - 内容没有变化的变更不写事件（导入主数据包时逐行比对快照）。
 - **认证状态不进事件流**：`employee_credentials`（PIN 的 Argon2id 哈希）、设备注册、设备解锁码哈希、设备锁定状态与失败计数、会话都是普通状态表，不同步，不参与重建。
@@ -117,7 +121,7 @@ occurred_at = recorded_at − lag
   - 每次 PIN 失败记 `warn` 日志，含员工和 `device_id`。
 - 客户端不缓存 PIN 哈希。
 - **传输加密**：设备令牌、PIN、会话令牌只经 HTTPS 传输。局域网 HTTPS（证书方案见 Q9）是认证切片的前置条件；节点未配置 TLS 时不注册认证接口，release 构建启用认证但未配置 TLS 时**拒绝启动**。
-- 认证落地之前，业务切片只依赖 `Actor` 提取器。开发桩只在 debug 构建中可用；release 构建配置了开发桩时**拒绝启动**。
+- 认证落地之前，业务切片只依赖 `Actor` 提取器，开发桩同时提供员工 ID 和 `role`。开发桩只在 debug 构建中可用；release 构建配置了开发桩时**拒绝启动**。
 
 ## 单位
 
@@ -127,6 +131,7 @@ occurred_at = recorded_at − lag
   - `unit_code` 未配置：`400 UNKNOWN_UNIT`；
   - 系数和当前值不一致：`409 UNIT_CONVERSION_CHANGED`，不入账，由人工确认后重新提交。
 - payload 同时写入换算后的 `qty` 和 `input` 快照。
+- 盘点的 `counted_qty` 只用基本单位，不带 `input`，这是 `input` 规则的例外。
 
 ## 批次
 
@@ -322,7 +327,7 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 
 ## 投影表
 
-表结构随库存切片进入 002，下面的 SQL 是设计意图，**不冻结**：
+表结构随库存切片进入 003，下面的 SQL 是设计意图，**不冻结**：
 
 ```sql
 CREATE TABLE inventory_lots (
@@ -444,7 +449,6 @@ CREATE INDEX idx_inventory_counts_item ON inventory_counts(item_id, observed_at)
 ## 待确认问题
 
 - **Q6 锁账日**：默认方案是店长在管理界面设置锁账日，`business_date` 不晚于它的补录和纠错返回 `409 BOOKS_LOCKED`；另外默认最多补录 7 天以内。**阻塞补录入口**。
-- **Q7 会话的「班次」如何结束**：默认方案是员工主动登出，或登录满 12 小时。**阻塞认证切片**。
-- **Q8 主数据管理接口权限**：默认方案是只允许店长角色。**阻塞主数据管理接口**。
+- **Q7 会话的「班次」如何结束**：默认方案是员工主动登出，或登录满 12 小时。**阻塞认证切片**。会话结束时平板队列中未提交命令的处理一并确认，因为 `actor_id` 取提交时的会话。
 - **Q9 局域网证书**：默认方案是总部私有 CA 为每个门店节点签发证书，平板初始化时安装一次根证书；备选是公网域名 + ACME DNS 验证（平板无需配置，但续期依赖联网）。**阻塞认证切片**。
 - **Q11 店长复核的频率与形式**：复核范围见 [SOP](sop.md)「复核」；频率，以及用纸质签字还是在软件中留复核记录，待定。软件中留记录需新增事件类型。
