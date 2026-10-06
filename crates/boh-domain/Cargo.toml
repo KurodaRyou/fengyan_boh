@@ -5,6 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+jiff.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 uuid.workspace = true

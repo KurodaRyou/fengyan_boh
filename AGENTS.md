@@ -71,7 +71,7 @@
 | 日志 | `tracing` / `tracing-subscriber` |
 | 错误 | 库 crate 用 `thiserror`，只有 `boh-server` 的 `main` 用 `anyhow` |
 | 测试临时目录 | `tempfile`（仅 dev-dependency） |
-| 时区 / 营业日（待引入） | `jiff` |
+| 时区 / 营业日 | `jiff`，启用 `tzdb-bundle-always`：时区库编进二进制，不依赖门店机的 zoneinfo |
 | 员工 PIN 哈希（待引入，认证切片） | `argon2`（Argon2id） |
 | 局域网 HTTPS（待引入，认证切片之前） | `rustls`，接入方式随 `docs/domain.md` Q9 确定 |
 | 上行同步（待实现） | `reqwest` + `rustls`，mTLS |
@@ -230,7 +230,7 @@ scripts/        CI 扫描脚本。
   |---|---|
   | `rusqlite::Connection::open*` | `boh-storage/src/connection.rs`、备份模块 |
   | `boh_storage::testing` 中的函数 | 锁定测试及 `spec_support/` |
-  | `std::time::SystemTime::now`、`jiff::Timestamp::now`、`jiff::Zoned::now` | 时钟模块 |
+  | `std::time::SystemTime::now`、`jiff::Timestamp::now`、`jiff::Zoned::now`、`jiff::tz::TimeZone::system`、`jiff::tz::TimeZone::try_system` | 时钟模块 |
   | `std::thread::sleep` | 无 |
   | `HashMap` / `HashSet`（`boh-domain`） | 无 |
 
