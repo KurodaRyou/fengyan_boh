@@ -39,10 +39,12 @@ occurred_at = recorded_at − lag
 ```
 
 两个时间来自同一块时钟，相减后绝对偏差抵消。
+这只校准时钟偏差，不证明真实录入时点；两个时间都由客户端提交，72 小时上限也不能防止已认证员工伪造。当前仍按此规则计算发生时间与盘点吸收，不新增店长确认流程；可信时间方案见 Q10。
 
 - `lag < 0`：按 0 处理，返回警告 `CAPTURE_TIME_ADJUSTED`。
 - `lag > 72h`：`400 CAPTURE_TOO_OLD`，改走补录入口。
-- 生产命令另带 `started_captured_at`，同样换算出 `started_at` 写进 payload。
+- 生产命令可带 `started_captured_at`，用同一个 `sent_at`、`recorded_at` 按上述规则换算出 `started_at` 写进 payload。
+- 带开始时间时，先校验 `started_captured_at <= captured_at`，再计算两段 lag；开始时间也适用 72 小时上限。开始晚于完成时返回 `400 INVALID_PRODUCTION_TIME`，不得用 lag 的负值归零掩盖错误顺序。
 
 **补录**（显式入口，Q6 确认后实现）：
 
@@ -56,6 +58,7 @@ occurred_at = recorded_at − lag
 - 一个命令产生的所有事件共用同一组 `recorded_at`、`occurred_at`、`business_date`。
 - 冲销和数量更正的 `occurred_at`、`business_date` 取原事件的值，由写入线程填写，客户端不能指定。
 - 首次提交时算出的 `occurred_at` 随事件保存；重试时返回原响应，不重新计算。
+- 生产带 `started_at` 时必须满足 `started_at <= occurred_at`（相等允许），相对校准和显式补录都适用。不满足时返回 `400 INVALID_PRODUCTION_TIME`，不写事件或 `processed_commands`；此校验与其他业务校验一样在幂等检查之后执行。
 - **营业日**：配置项 `timezone = "Asia/Shanghai"`、`business_day_cutoff = "04:00"`。`occurred_at` 换算到门店当地时间，早于日切的算前一营业日。由 `jiff` 纯函数计算。修改日切配置不重算历史事件。
 - **时钟异常**：`recorded_at` 不保证递增，这是预期行为。`/health` 暴露 `clock_regression_ms = max(0, max(recorded_at) − now)`，超过 5 分钟时状态为 `degraded`，**不拒绝写入**。
 
@@ -368,6 +371,7 @@ CREATE INDEX idx_inventory_counts_item ON inventory_counts(item_id, observed_at)
 - **被吸收的收货不建批次**。那批货在批次层面的来源由盘点产生的 `COUNT_GAIN` 批次代替。被吸收的冲销也不会把错误收货建出的批次扣掉，这些批次按 FIFO 自然消耗。
 - **盘点期间的实物变动**：系统不检测，靠操作规范禁止，违反时由重盘纠正。
 - **时钟**：系统时钟跳到未来再拨回时，期间事件的 `business_date` 是错的，不能自动修正；`/health` 会暴露这种情况。
+- **客户端时间可伪造**：已认证员工可以修改 `captured_at`、`sent_at` 或生产的 `started_captured_at`，把盘点后的收货 / 报损 / 用料伪装成盘点前发生，使其被吸收而不改库存；类别报表（收货金额亦用于对账 / 应付）仍计入该记录。普通相对校准命令目前也没有 Q6 中补录入口的锁账校验。HTTPS、设备令牌和 PIN 不能证明真实录入时间。当前保留现行规则，防护设计见 Q10；本项风险尚未解决。
 - **门店节点长时间宕机**时没有离线写入能力，改用纸质登记，恢复后走补录入口。
 - **客户端暂存**：普通命令只承诺页面不刷新期间，命令进入 `IndexedDB` 队列，界面显示「待提交 N 条」。盘点草稿是例外，可跨刷新、休眠恢复，规则见「盘点」第 1 条。客户端不维护库存镜像，不做批次分配。排队命令补交被拒时，界面列出命令和原因，由人工处理。
 
@@ -379,6 +383,9 @@ CREATE INDEX idx_inventory_counts_item ON inventory_counts(item_id, observed_at)
 |---|---|---|
 | 生产期间盘点 | 面粉 100；09:10 开始生产，取 20；09:20 盘点得 80（调整 −20）；09:30 完工，用料 20，`started_at = 09:10` | 用料被吸收；账面 **80**；返回 `ABSORBED_BY_COUNT` |
 | 生产没带开始时间 | 同上，没有 `started_at` | 不被吸收，账面 **60** |
+| 生产开始晚于完成 | 相对校准命令的 `started_captured_at = 09:30`、`captured_at = 09:10`、`sent_at = 09:40`；或补录的 `started_at > occurred_at` | `400 INVALID_PRODUCTION_TIME`；库存、事件和 `processed_commands` 不变 |
+| 负 lag 不掩盖生产顺序 | `sent_at = 09:00`、`captured_at = 09:10`、`started_captured_at = 09:30` | 归零前拒绝：`400 INVALID_PRODUCTION_TIME`；不入账 |
+| 生产开始等于完成 | `started_captured_at = captured_at`，其余内容合法 | 时间顺序合法，照常处理 |
 | 迟到报损 | 100；09:00 报损 10 留在平板队列；09:20 盘点得 90（调整 −10）；09:40 报损送达 | 被吸收；账面 **90**；未解释损耗 **0** |
 | 补录报损 | 100；15:00 盘点得 50（调整 −50）；16:00 补录报损 50，`occurred_at = 10:00` | 被吸收；账面 **50**；报损 **50**；未解释损耗 **0** |
 | 盘点后冲销 | 100；09:00 误报损 10，账面 90；09:20 盘点得 100（调整 +10）；10:00 冲销报损 | 被吸收；账面 **100**；报损合计 **0**；未解释损耗 **0** |
@@ -415,3 +422,4 @@ CREATE INDEX idx_inventory_counts_item ON inventory_counts(item_id, observed_at)
 - **Q7 会话的「班次」如何结束**：默认方案是员工主动登出，或登录满 12 小时。**阻塞认证切片**。
 - **Q8 主数据管理接口权限**：默认方案是只允许店长角色。**阻塞主数据管理接口**。
 - **Q9 局域网证书**：默认方案是总部私有 CA 为每个门店节点签发证书，平板初始化时安装一次根证书；备选是公网域名 + ACME DNS 验证（平板无需配置，但续期依赖联网）。**阻塞认证切片**。
+- **Q10 客户端时间可信边界**：离线录入时间的可验证证据、普通命令与补录的权限 / 锁账边界，以及盘点吸收是否需要店长确认，均待设计。当前相对校准和吸收规则继续生效；方案写入文档并经人工确认前，不实现防护变更，不将现有相对校准当作防篡改机制。

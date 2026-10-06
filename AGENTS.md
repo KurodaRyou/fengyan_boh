@@ -28,11 +28,12 @@
 |---|---|---|---|
 | Schema 测试、迁移校验和 | Claude | 是 | `crates/boh-storage/tests/schema.rs` |
 | 验收用例（`docs/domain.md`「验收用例」） | Claude 写，预期值由人确认 | 是 | `crates/*/tests/spec_*.rs` |
-| Golden payload：每个 `event_type@schema_version` 一份 | Claude | 是 | `crates/*/tests/golden/` |
+| Golden payload：每个 `event_type@schema_version` 的每种 payload 结构变体至少一份 | Claude | 是 | `crates/*/tests/golden/` |
 | HTTP 契约：状态码、错误码、信封、重复提交同一 `command_id` | Claude | 是 | `crates/*/tests/spec_*.rs` |
 | 重放一致性：清空投影、重建、逐行比对 | Claude | 是 | `crates/*/tests/spec_*.rs` |
 | `src/` 内的单元测试、其他集成测试 | 实现 agent | 否 | 任意，但不得以 `spec_` 开头 |
 
+- Golden 按 payload 的结构分支覆盖，不只按事件类型计数：`MASTER_DATA_CHANGED` 的 `ITEM`、`RECIPE`、`SUPPLIER`、`EMPLOYEE`、`WASTE_REASON`、`EQUIPMENT` 各有独立样本；库存影响的正常 / 吸收互斥分支及可选字段的出现 / 省略分支也分别覆盖。每个分支须校验完整序列化 JSON，不得仅检查公共字段。
 - 锁定测试只规定行为，不规定实现。它只通过稳定接口访问系统：
   HTTP 黑盒（测试入口：用数据库路径和可注入的时钟构造 `Router`）、对已冻结表的只读 SQL、接口说明中列出的纯函数。
   接口签名由 Claude 随锁定测试一起给出，写进 `docs/`。
@@ -147,11 +148,15 @@ scripts/        CI 扫描脚本。
    - `VACUUM INTO` 不覆盖已存在的文件；固定文件名在上次中途退出后会让之后每次备份都失败。
 2. 只读打开临时文件，执行 `PRAGMA integrity_check`，并以 `n = coalesce(max(seq), 0)` 校验 `n >= seq_before` 且 `count(*) = n`（空账本时三者都为 0）；校验失败则删除临时文件。
    - 备份期间写入照常提交，备份快照可能包含 `seq_before` 之后的事件，所以只比下界，不比相等。备份自身的 `n` 记为 `last_backup_seq`。
-3. 校验通过后对文件 fsync，原子重命名为 `boh-<UTC时间>-<UUIDv7>.db`（与临时文件同一个 UUID），再 fsync 备份目录；按保留策略清理旧文件后再 fsync 一次目录。
+3. 校验通过后对文件 fsync，原子重命名为 `boh-<UTC时间>-<备份序号>-<UUIDv7>.db`（与临时文件同一个 UUID），再 fsync 备份目录；按保留策略清理旧文件后再 fsync 一次目录。
    - 只 fsync 文件不能让重命名后的目录项持久化，断电后新备份可能消失。
    - 文件名带 UUID：时钟回拨或同一时刻两次备份时，同名重命名会覆盖已有的备份。
-4. 低峰时段每小时一次，闭店后一次。`VACUUM INTO` 期间持有读快照，会推迟 WAL checkpoint。
+   - 备份序号从 1 开始，之后取备份目录中最终文件的最大序号，用 `checked_add(1)` 递增；仅用于备份文件的保留顺序，与账本 `seq` 无关。
+   - **保留策略**：配置项 `backup_keep_count`，默认 `168`，必须是正整数，否则拒绝启动。按备份序号从大到小保留最近成功生成的 N 份；每小时和闭店备份共用此额度。只在本次新备份校验、文件 fsync、重命名及目录 fsync 全部成功后清理超出额度的最终备份文件，始终保留本次新备份；备份失败时不清理已有的最终备份。
+   - 清理只处理本节点备份目录中符合最终命名格式的文件，不删除其他文件。删除失败时记日志，保留超出额度的文件，后续成功备份时再次清理。保留顺序由备份序号保证，时钟回拨不改变它。
+4. 低峰时段每小时一次，闭店后一次；两种触发共用串行的备份任务入口，禁止并发备份。`VACUUM INTO` 期间持有读快照，会推迟 WAL checkpoint。
 5. **恢复演练写成测试**：从备份恢复、清空投影并重建，结果必须和原库一致。只验证备份文件生成了不算数。
+   - 保留策略测试覆盖默认值与非法配置、第 N+1 份成功后清理、失败不清理、重启后序号继续递增、时钟回拨以及定时 / 闭店触发的串行执行。
 6. 异地复制（有公网用对象存储，没有公网用 NAS 或双盘轮换）本期不开发。
 
 ### 迁移
@@ -304,6 +309,7 @@ ARM 门店机改用 `aarch64-unknown-linux-musl`。部署文件见 `deploy/`。
 - 下行同步：主数据包的格式、拉取与导入流程（原则已定：总部维护统一的 JSON 主数据包，逐行比对快照，`source = HQ_PACKAGE`）。**总部本期不开发，延后。**
 - 上行同步的实现：总部接收接口、批量大小、mTLS 证书下发与轮换。**延后**；契约见「上行同步」。
 - 局域网 HTTPS：证书签发与平板信任方式（见 `docs/domain.md` Q9）。**认证切片的前置条件。**
+- 客户端录入时间的可信证据与盘点吸收防篡改：见 `docs/domain.md` Q10。当前相对校准和吸收规则继续生效，防护变更待设计与人工确认。
 - 异地备份复制的实现。
 
 ---
