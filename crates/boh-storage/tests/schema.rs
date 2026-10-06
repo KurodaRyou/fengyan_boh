@@ -5,9 +5,8 @@
 use std::fmt::Debug;
 
 use boh_storage::rusqlite::{self, Connection, TransactionBehavior, ffi, params};
-use boh_storage::{
-    LATEST_SCHEMA_VERSION, StorageError, migrate, open_reader, open_writer, schema_version,
-};
+use boh_storage::testing::{migrate, open_reader, open_writer};
+use boh_storage::{LATEST_SCHEMA_VERSION, StorageError, schema_version};
 use tempfile::TempDir;
 
 const MIGRATION_001: &str = include_str!("../../../migrations/001_initial_schema.sql");
@@ -86,6 +85,7 @@ impl<'a> Event<'a> {
     }
 }
 
+#[allow(clippy::disallowed_methods)] // 锁定测试经 boh_storage::testing 取得原始连接。
 fn fresh_db() -> (TempDir, Connection) {
     let dir = tempfile::tempdir().unwrap();
     let mut conn = open_writer(&dir.path().join("boh.db")).unwrap();
@@ -147,6 +147,7 @@ fn migration_001_matches_frozen_checksum() {
 
 // 5 + 保留的迁移契约：重复执行迁移不改变版本，也不丢失已有数据。
 #[test]
+#[allow(clippy::disallowed_methods)] // 锁定测试经 boh_storage::testing 取得原始连接。
 fn migrate_reaches_latest_and_is_idempotent() {
     let (_dir, mut conn) = fresh_db();
     insert_meta(&conn, 1, STORE).unwrap();
@@ -169,6 +170,7 @@ fn migrate_reaches_latest_and_is_idempotent() {
 
 // 5 + 保留的迁移契约：未知的新版本必须拒绝，不能向下覆盖。
 #[test]
+#[allow(clippy::disallowed_methods)] // 锁定测试经 boh_storage::testing 取得原始连接。
 fn refuses_schema_newer_than_binary() {
     let (_dir, mut conn) = fresh_db();
     let future = LATEST_SCHEMA_VERSION + 1;
@@ -183,6 +185,7 @@ fn refuses_schema_newer_than_binary() {
 
 // 4.2「禁止用 REPLACE 绕过触发器」：写、读连接都启用 recursive_triggers。
 #[test]
+#[allow(clippy::disallowed_methods)] // 锁定测试经 boh_storage::testing 取得原始连接。
 fn writer_and_reader_apply_required_pragmas() {
     let (dir, writer) = fresh_db();
     let reader = open_reader(&dir.path().join("boh.db")).unwrap();

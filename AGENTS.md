@@ -3,7 +3,7 @@
 烘焙门店后厨（BOH）系统的门店本地节点。部署在每家门店的一台 Linux 机器上，局域网内的平板通过浏览器（门店节点托管的 Web SPA）访问。
 **断网是常态，不是异常**：所有门店内核心操作必须在完全离线时正常工作，联网后再把事件同步到总部。
 
-业务决策、事件目录与领域规则见 [docs/domain.md](docs/domain.md)；系统依赖的门店操作规范见 [docs/sop.md](docs/sop.md)；规范用词见 [docs/glossary.md](docs/glossary.md)。
+业务决策、事件目录与领域规则见 [docs/domain.md](docs/domain.md)；系统依赖的门店操作规范见 [docs/sop.md](docs/sop.md)；规范用词见 [docs/glossary.md](docs/glossary.md)；锁定测试使用的接口见 [docs/interfaces.md](docs/interfaces.md)。
 
 本文件是所有编码 agent（Codex、Antigravity、Claude Code 等）共用的项目规则。
 
@@ -37,7 +37,7 @@
 - Golden 按 payload 的结构分支覆盖，不只按事件类型计数：`MASTER_DATA_CHANGED` 的 `ITEM`、`RECIPE`、`SUPPLIER`、`EMPLOYEE`、`WASTE_REASON`、`EQUIPMENT` 各有独立样本；库存影响的正常 / 吸收互斥分支及可选字段的出现 / 省略分支也分别覆盖。每个分支须校验完整序列化 JSON，不得仅检查公共字段。
 - 锁定测试只规定行为，不规定实现。它只通过稳定接口访问系统：
   HTTP 黑盒（测试入口：用数据库路径和可注入的时钟构造 `Router`）、对已冻结表的只读 SQL、接口说明中列出的纯函数。
-  接口签名由 Claude 随锁定测试一起给出，写进 `docs/`。
+  接口签名由 Claude 随锁定测试一起给出，写进 [docs/interfaces.md](docs/interfaces.md)。
 - 锁定测试的辅助代码只放在 `crates/*/tests/spec_support/`（同样锁定），不依赖任何不受保护的代码。
 - 预期值由人工确认。**任何人都不允许为了让测试通过而修改预期值。**
 - 实现 agent 认为锁定测试有错时，停下来在交付说明里提出。不得修改，不得加 `#[ignore]`，不得用 `cfg`、feature 或 Cargo 配置让它不编译、不运行。
@@ -71,7 +71,7 @@
 | 日志 | `tracing` / `tracing-subscriber` |
 | 错误 | 库 crate 用 `thiserror`，只有 `boh-server` 的 `main` 用 `anyhow` |
 | 测试临时目录 | `tempfile`（仅 dev-dependency） |
-| 时区 / 营业日（待引入） | `jiff` |
+| 时区 / 营业日 | `jiff`，启用 `tzdb-bundle-always`：时区库编进二进制，不依赖门店机的 zoneinfo |
 | 员工 PIN 哈希（待引入，认证切片） | `argon2`（Argon2id） |
 | 局域网 HTTPS（待引入，认证切片之前） | `rustls`，接入方式随 `docs/domain.md` Q9 确定 |
 | 上行同步（待实现） | `reqwest` + `rustls`，mTLS |
@@ -131,7 +131,7 @@ scripts/        CI 扫描脚本。
   - 用 `FULL` 而不是 `NORMAL`：`NORMAL` 在断电时可能回滚已经回复客户端“成功”的事务。不要改回去。
   - `recursive_triggers` 关闭时，`INSERT OR REPLACE` 会绕过只追加触发器，静默替换账本行。不要关。
 - **只有一个写连接**，由 `sqlite-writer` 线程独占。所有写操作必须走 `Writer::call`。禁止在任何地方另开写连接。
-  `open_writer` / `open_reader` / `spawn_writer` 为 `pub(crate)`，对外只暴露 `boh_storage::open()`。
+  `open_writer` / `open_reader` / `migrate` / `spawn_writer` 为 `pub(crate)`，对外只暴露 `boh_storage::open()`（公开 API 见 [docs/interfaces.md](docs/interfaces.md)）。
   - 锁定测试需要的原始连接（已设好 PRAGMA）只经 `#[doc(hidden)] pub mod boh_storage::testing` 提供；
     `clippy.toml` 的 `disallowed-methods` 禁用 `boh_storage::testing` 中的函数，只有锁定测试及 `spec_support/` 可以 `#[allow]`。
 - 写事务一律 `BEGIN IMMEDIATE`（`Writer::call` 已处理）。
@@ -230,7 +230,7 @@ scripts/        CI 扫描脚本。
   |---|---|
   | `rusqlite::Connection::open*` | `boh-storage/src/connection.rs`、备份模块 |
   | `boh_storage::testing` 中的函数 | 锁定测试及 `spec_support/` |
-  | `std::time::SystemTime::now`、`jiff::Timestamp::now`、`jiff::Zoned::now` | 时钟模块 |
+  | `std::time::SystemTime::now`、`jiff::Timestamp::now`、`jiff::Zoned::now`、`jiff::tz::TimeZone::system`、`jiff::tz::TimeZone::try_system` | 时钟模块 |
   | `std::thread::sleep` | 无 |
   | `HashMap` / `HashSet`（`boh-domain`） | 无 |
 

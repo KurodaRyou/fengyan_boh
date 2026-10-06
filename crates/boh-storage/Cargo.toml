@@ -5,9 +5,12 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+boh-domain.workspace = true
+jiff.workspace = true
 rusqlite.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

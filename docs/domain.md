@@ -43,6 +43,7 @@ occurred_at = recorded_at − lag
 
 - `lag < 0`：按 0 处理，返回警告 `CAPTURE_TIME_ADJUSTED`。
 - `lag > 72h`：`400 CAPTURE_TOO_OLD`，改走补录入口。
+- 换算溢出（时间戳超出可表示范围）：`400 VALIDATION_FAILED`。
 - 生产命令可带 `started_captured_at`，用同一个 `sent_at`、`recorded_at` 按上述规则换算出 `started_at` 写进 payload。
 - 带开始时间时，先校验 `started_captured_at <= captured_at`，再计算两段 lag；开始时间也适用 72 小时上限。开始晚于完成时返回 `400 INVALID_PRODUCTION_TIME`，不得用 lag 的负值归零掩盖错误顺序。
 
@@ -59,7 +60,7 @@ occurred_at = recorded_at − lag
 - 冲销和数量更正的 `occurred_at`、`business_date` 取原事件的值，由写入线程填写，客户端不能指定。
 - 首次提交时算出的 `occurred_at` 随事件保存；重试时返回原响应，不重新计算。
 - 生产带 `started_at` 时必须满足 `started_at <= occurred_at`（相等允许），相对校准和显式补录都适用。不满足时返回 `400 INVALID_PRODUCTION_TIME`，不写事件或 `processed_commands`；此校验与其他业务校验一样在幂等检查之后执行。
-- **营业日**：配置项 `timezone = "Asia/Shanghai"`、`business_day_cutoff = "04:00"`。`occurred_at` 换算到门店当地时间，早于日切的算前一营业日。由 `jiff` 纯函数计算。修改日切配置不重算历史事件。
+- **营业日**：配置项 `timezone = "Asia/Shanghai"`（IANA 时区名）、`business_day_cutoff = "04:00"`（`'HH:MM'`），都必填，缺失或非法时拒绝启动。`occurred_at` 换算到门店当地时间，早于日切的算前一营业日。由 `jiff` 纯函数计算。修改日切配置不重算历史事件。
 - **展示与导出**：记录的展示和导出同时给出操作人、设备、`recorded_at` 和 `occurred_at`。不设阈值、不打标签，由复核的人比对两者判断。被纠错的记录与它的更正、冲销按聚合 version 顺序一起展示。
 - **时钟异常**：`recorded_at` 不保证递增，这是预期行为。`/health` 暴露 `clock_regression_ms = max(0, max(recorded_at) − now)`，超过 5 分钟时状态为 `degraded`，**不拒绝写入**。
 

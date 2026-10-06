@@ -7,6 +7,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub mod time;
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DomainError {
     #[error("invalid UUIDv7: {0}")]
@@ -67,6 +69,10 @@ macro_rules! uuid_v7_id {
     };
 }
 
+uuid_v7_id!(
+    /// 门店 ID（`store_meta.store_id`）。
+    StoreId
+);
 uuid_v7_id!(
     /// 事件 ID（`store_events.id`）。
     EventId
