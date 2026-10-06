@@ -91,7 +91,7 @@
                 ├─ 业务校验 → 分配 / 吸收判定，结果写进 payload
                 ├─ Ledger::append（0～N 次）
                 │    ├─ INSERT store_events（seq 由 SQLite 分配）
-                │    └─ projections::apply（只读 payload；重建时共用）
+                │    └─ projections::apply（只读事件本身；重建时共用）
                 └─ INSERT processed_commands（含响应和 warnings）
               COMMIT
 
@@ -135,9 +135,11 @@ scripts/        CI 扫描脚本。
 - 所有表用 `STRICT`。
 
 ### 备份
-1. 用备份连接执行 `VACUUM INTO '<备份目录>/tmp.db'`。
-2. 只读打开 `tmp.db`，执行 `PRAGMA integrity_check`，并比对 `max(seq)`。
-3. 校验通过后对文件 fsync，原子重命名为 `boh-<UTC时间>.db`，按保留策略清理旧文件。
+1. 先删除备份目录中残留的 `tmp-*.db`，再用备份连接执行 `VACUUM INTO '<备份目录>/tmp-<UUIDv7>.db'`。
+   - `VACUUM INTO` 不覆盖已存在的文件；固定文件名在上次中途退出后会让之后每次备份都失败。
+2. 只读打开临时文件，执行 `PRAGMA integrity_check`，并比对 `max(seq)`；校验失败则删除临时文件。
+3. 校验通过后对文件 fsync，原子重命名为 `boh-<UTC时间>.db`，再 fsync 备份目录；按保留策略清理旧文件后再 fsync 一次目录。
+   - 只 fsync 文件不能让重命名后的目录项持久化，断电后新备份可能消失。
 4. 低峰时段每小时一次，闭店后一次。`VACUUM INTO` 期间持有读快照，会推迟 WAL checkpoint。
 5. **恢复演练写成测试**：从备份恢复、清空投影并重建，结果必须和原库一致。只验证备份文件生成了不算数。
 6. 异地复制（有公网用对象存储，没有公网用 NAS 或双盘轮换）本期不开发。
@@ -165,7 +167,7 @@ scripts/        CI 扫描脚本。
 - **只有 `Ledger::append` 能写 `store_events`**，并在同一处调用 `projections::apply`。
 - 纠错 = 追加一条冲销 / 更正事件，绝不修改原事件。
 - 当前状态（库存余量等）放在**投影表**中，在产生事件的**同一事务内**同步更新。投影必须能从事件流按 `seq` 完整重建。
-  - `projections::apply` 只读 payload，不查主数据，不重新做决策（分配、吸收）。在线写入和 `rebuild-projections` 共用同一个 `apply`。
+  - `projections::apply` 只读事件本身（`store_events` 的列和 payload），不查主数据，不重新做决策（分配、吸收）。在线写入和 `rebuild-projections` 共用同一个 `apply`。
   - 业务决策在 `append` 之前完成，结果写进 payload。
 - 主数据也走事件流（`MASTER_DATA_CHANGED`），主数据表是投影。
   例外：员工凭据、设备注册、会话等认证状态表不进事件流、不同步、不参与重建。

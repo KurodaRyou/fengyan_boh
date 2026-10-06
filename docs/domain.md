@@ -124,7 +124,7 @@ occurred_at = recorded_at − lag
 | `TEMPERATURE_LOGGED` | `TEMPERATURE_READING` | `equipment_id`, `celsius_x10`, `note?` | 食安记录 |
 | `QUANTITY_CORRECTED` | 与原事件相同 | `corrected_event_id`, `reason`, `lines[{line_ref, item_id, old_qty, new_qty, delta, input, line_cost_cents?, alloc \| absorbed_by_event_id}]` | 按差额调整（或被吸收），见「纠错」 |
 | `EVENT_REVERSED` | 与原事件相同 | `reversed_event_id`, `reason`, `lines[{line_ref, item_id, qty, alloc \| absorbed_by_event_id}]` | 精确取反（或被吸收），见「纠错」 |
-| `SALES_IMPORTED` | `SALES_DAY` | `business_date`, `source`（`CSV` / `XLSX`）, `file_name`, `lines[{item_id, qty, amount_cents}]`, `ignored_rows` | 覆盖 `daily_sales` 中该营业日；**不写库存流水** |
+| `SALES_IMPORTED` | `SALES_DAY` | `source`（`CSV` / `XLSX`）, `file_name`, `lines[{item_id, qty, amount_cents}]`, `ignored_rows` | 覆盖 `daily_sales` 中该营业日；**不写库存流水** |
 | `MASTER_DATA_CHANGED` | 实体名 | `entity`, `source`, `snapshot` | 覆盖对应的主数据表 |
 
 - `reason_code` 的值对应 `WASTE_REASON` 的 `code`。

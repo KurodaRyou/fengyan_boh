@@ -20,6 +20,7 @@
 /scripts/ @KurodaRyou
 /.cargo/ @KurodaRyou
 Cargo.toml @KurodaRyou
+/Cargo.lock @KurodaRyou
 clippy.toml @KurodaRyou
 .clippy.toml @KurodaRyou
 rustfmt.toml @KurodaRyou
