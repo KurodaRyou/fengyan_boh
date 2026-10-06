@@ -111,7 +111,7 @@ crates/
   boh-domain/   纯类型与校验不变量、相对校准与营业日纯函数。只允许依赖 serde / uuid / thiserror / jiff。禁止数据库、HTTP、系统 I/O（包括读系统时钟）。
   boh-storage/  SQLite：连接初始化、迁移、写入线程、读连接池、ledger（唯一写事件入口）、projections、备份、时钟模块（可注入）、原生 SQL。
   boh-app/      http（路由、响应信封）、service（命令编排）、sync（同步 worker，待实现）。
-  boh-server/   main：加载配置、启动、信号处理、优雅关闭；子命令 init、rebuild-projections。
+  boh-server/   main：加载配置、启动、信号处理、优雅关闭；子命令 init、rebuild-projections；认证切片加设备管理子命令 enroll-code、unlock-device、reset-unlock-code、revoke-device。
 migrations/     编号 SQL 文件，001_xxx.sql、002_xxx.sql……
 deploy/         systemd unit、示例配置。
 scripts/        CI 扫描脚本。
@@ -164,7 +164,7 @@ scripts/        CI 扫描脚本。
   唯一例外：`store_events.seq`（门店内提交顺序，由 SQLite 分配，禁止显式指定）。投影表复合主键中的 `line_no` 是行号，不是自增键。
 - 客户端提交的 ID（如 `command_id`）在 `boh-domain` 中校验必须是 v7。
 - 时间戳一律 `INTEGER`，UTC Unix **毫秒**。禁止存格式化的日期时间字符串。
-  唯一例外：`business_date`（营业日，`'YYYY-MM-DD'`），它是业务概念而不是时间点。
+  例外：表示门店当地日期的业务字段——`business_date`（营业日）和采购单的 `deliver_on`（要求到货日），格式 `'YYYY-MM-DD'`，它们是业务概念而不是时间点。
 - **顺序只看 `seq`**：重放、FIFO、同步都按 `seq`，不按任何时间戳。
 - `recorded_at` 取系统时钟原值，**不做单调钳制**。
   - 顺序已由 `seq` 保证；钳制会让一次跳到未来的时钟把之后的时间全部卡在未来。

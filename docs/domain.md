@@ -18,7 +18,7 @@
 | 8 | 录错 | 只有数量错用数量更正（保持原批次）；其他错误整条冲销 | 纠错 |
 | 9 | 账面不足 | 不拒绝：批次扣到 0，不足部分记入账外缺口，返回警告，下次盘点清零。冲销 / 更正时批次已被消耗也按此处理 | 批次、纠错 |
 | 10 | 营业日 | 时区 `Asia/Shanghai`，日切 `04:00` | 时间 |
-| 11 | 操作人 | 员工在终端上用 PIN 登录；平板需先注册；会话按班次有效 | 主数据、待确认问题 |
+| 11 | 操作人 | 员工在已注册的平板上用 PIN 登录；平板安装时注册一次；会话按班次有效 | 主数据、待确认问题 |
 | 12 | 总部 | 本期不开发。主数据由总部维护统一的 JSON 主数据包，`code` 和 UUID 全部门店统一 | 主数据 |
 | 13 | 不存在的业务 | 调拨、套餐、半批生产本期都不存在 | 未来功能 |
 
@@ -74,18 +74,28 @@ occurred_at = recorded_at − lag
 - 每行带 `revision`，每次变更 +1。主数据只停用（`active = 0`），不删除。
 - 每次变更写一条 `MASTER_DATA_CHANGED`：聚合类型是实体名，聚合 ID 是行的主键，`aggregate_version` 是变更后的 `revision`；payload 是 `{entity, source, snapshot}`，`source`（`LOCAL` / `HQ_PACKAGE`）。主数据表是投影，可以从事件流重建。
 - 内容没有变化的变更不写事件（导入主数据包时逐行比对快照）。
-- **认证状态不进事件流**：`employee_credentials`（PIN 的 Argon2id 哈希）、设备注册、会话都是普通状态表，不同步，不参与重建。
+- **认证状态不进事件流**：`employee_credentials`（PIN 的 Argon2id 哈希）、设备注册、设备解锁码哈希、设备锁定状态与失败计数、会话都是普通状态表，不同步，不参与重建。
 - **系统操作人**：初始化和主数据包导入在没有登录员工时，`actor_id` 使用保留 ID `00000000-0000-7000-8000-000000000000`。
 - **初始化**：`boh-server init` 写入 `store_meta`，再创建第一个店长账号。启动时配置里的 `store_id` 和 `store_meta` 不一致，拒绝启动。
 
 ### 员工认证
 
-- **设备注册**：店长在新平板上登录一次，服务端签发设备令牌，作为 `device_id` 的来源。
-- **员工登录**：PIN 由服务端用 Argon2id 校验，签发会话令牌（服务端状态表）。普通员工 4～6 位，店长（能注册设备）6 位。会话按班次有效（结束判定见 Q7）。
+- **设备注册**（平板安装时做一次）：在节点上运行 `boh-server enroll-code` 生成一次性注册码。新平板提交注册码和设备名，服务端签发设备令牌，作为 `device_id` 的来源，同时生成这台设备的解锁码。
+  - 注册不使用 PIN：否则局域网内任何人都能对店长 PIN 试错。
+  - 注册码由 CSPRNG 生成，不少于 40 bit，一次有效，10 分钟过期；错误的注册码尝试整个节点每分钟最多 10 次。
+  - 在节点上运行 `boh-server revoke-device <设备>` 吊销设备。
+- **解锁码**：每台设备一个，注册成功时由 CSPRNG 生成，不少于 80 bit（例如 16 位 Base32），只在注册界面显示一次，由店长自行保存（例如存在手机里）。节点只保存 Argon2id 哈希。
+  - 丢失或泄露时在节点上运行 `boh-server reset-unlock-code <设备>` 重新生成，旧码立即失效。
+- **员工登录**：只接受带有效设备令牌的请求。PIN 由服务端用 Argon2id 校验，签发会话令牌（服务端状态表）。普通员工 4～6 位，店长 6 位。会话按班次有效（结束判定见 Q7）。
 - **在线限速**（PIN 能安全使用的前提）：
-  - 失败次数**按员工**计数，跨所有设备，登录和设备注册共用同一计数；成功一次清零。
-  - 连续失败 5 次后锁定该员工，锁定时长从 5 分钟起每次翻倍，上限 1 小时；锁定期间不影响该员工已有的会话。
-  - 整个节点每小时失败超过 50 次时，所有 PIN 校验额外延迟 5 秒，并在 `/health` 中报告 `auth_failures_last_hour`。
+  - 按设备计数：同一设备 1 小时内 PIN 校验失败 5 次（不论输入的是哪个员工），该设备的登录功能锁定，界面显示设备名并提示由店长解锁。其他员工在该设备上登录成功不清零计数。
+    - 按时间窗口计数，不按「连续失败」：否则夹一次自己的成功登录就能无限试错。
+  - 锁定不自动过期，只能输入该设备的解锁码解锁，或在节点上运行 `boh-server unlock-device <设备>`。解锁后计数清零。锁定不影响已有会话。
+  - 不按员工锁定：否则任何人都能针对性地锁住某个员工（尤其是店长）。
+  - 解锁码校验每台设备每 10 秒最多一次，失败不锁定，记 `warn` 日志。
+    - 解锁码失败不锁定：解锁码无法猜中，再加锁定只会让人能把平板推到只能在节点上解锁的状态。
+  - 整个节点每小时 PIN 失败超过 50 次时，所有 PIN 校验额外延迟 5 秒，并在 `/health` 中报告 `auth_failures_last_hour`。
+  - 每次 PIN 失败记 `warn` 日志，含员工和 `device_id`。
 - 客户端不缓存 PIN 哈希。
 - **传输加密**：设备令牌、PIN、会话令牌只经 HTTPS 传输。局域网 HTTPS（证书方案见 Q9）是认证切片的前置条件；节点未配置 TLS 时不注册认证接口，release 构建启用认证但未配置 TLS 时**拒绝启动**。
 - 认证落地之前，业务切片只依赖 `Actor` 提取器。开发桩只在 debug 构建中可用；release 构建配置了开发桩时**拒绝启动**。
@@ -126,7 +136,7 @@ occurred_at = recorded_at − lag
 | `WASTE_LOGGED` | `WASTE_RECORD` | `lines[{item_id, qty, input, reason_code, alloc \| absorbed_by_event_id}]` | 按分配扣减（或被吸收） |
 | `STOCK_COUNT_SUBMITTED` | `STOCK_COUNT` | `purpose`（`CLOSING` / `AUDIT`）, `started_seq`, `lines[{item_id, lot_id?, counted_qty}]` | 无 |
 | `STOCK_ADJUSTED` | `STOCK_COUNT` | `lines[{item_id, lot_id?, book_qty, counted_qty, delta}]`, `new_lots[{lot_id, item_id, qty}]` | 批次和账外缺口按 delta 变化；新建盘盈批次；写 `inventory_counts` |
-| `PURCHASE_ORDER_SUBMITTED` | `PURCHASE_ORDER` | `supplier_id`, `lines[{item_id, qty, input}]`, `deliver_on` | 无 |
+| `PURCHASE_ORDER_SUBMITTED` | `PURCHASE_ORDER` | `supplier_id`, `lines[{item_id, qty, input}]`, `deliver_on`（门店当地日期 `'YYYY-MM-DD'`） | 无 |
 | `TEMPERATURE_LOGGED` | `TEMPERATURE_READING` | `equipment_id`, `celsius_x10`, `note?` | 食安记录 |
 | `QUANTITY_CORRECTED` | 与原事件相同 | `corrected_event_id`, `reason`, `lines[{line_ref, item_id, physical_at, old_qty, new_qty, delta, input?, line_cost_cents?, alloc \| absorbed_by_event_id}]` | 按差额调整（或被吸收），见「纠错」 |
 | `EVENT_REVERSED` | 与原事件相同 | `reversed_event_id`, `reason`, `lines[{line_ref, item_id, physical_at, qty, alloc \| absorbed_by_event_id}]` | 精确取反（或被吸收），见「纠错」 |
