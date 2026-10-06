@@ -13,5 +13,8 @@ disallowed-methods = [
     { path = "jiff::Zoned::now", reason = "System time must be read through the clock module; business code must receive time explicitly." },
     { path = "jiff::tz::TimeZone::system", reason = "Business dates use the configured timezone only; never read the host time zone." },
     { path = "jiff::tz::TimeZone::try_system", reason = "Business dates use the configured timezone only; never read the host time zone." },
+    { path = "boh_storage::testing::open_writer", reason = "Raw SQLite connections are for locked tests only; use boh_storage::open()." },
+    { path = "boh_storage::testing::open_reader", reason = "Raw SQLite connections are for locked tests only; use boh_storage::open()." },
+    { path = "boh_storage::testing::migrate", reason = "Raw SQLite connections are for locked tests only; use boh_storage::open()." },
     { path = "std::thread::sleep", reason = "Blocking sleeps can stall the only SQLite writer thread or an async executor thread." },
 ]

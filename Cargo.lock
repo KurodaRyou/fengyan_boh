@@ -92,9 +92,12 @@ name = "boh-app"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "boh-domain",
  "boh-storage",
  "serde",
  "serde_json",
+ "tempfile",
+ "tokio",
  "tracing",
 ]
 
@@ -116,6 +119,7 @@ dependencies = [
  "anyhow",
  "axum",
  "boh-app",
+ "boh-domain",
  "boh-storage",
  "serde",
  "tokio",
@@ -128,11 +132,13 @@ dependencies = [
 name = "boh-storage"
 version = "0.1.0"
 dependencies = [
+ "boh-domain",
  "jiff",
  "rusqlite",
  "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
