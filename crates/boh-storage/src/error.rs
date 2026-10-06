@@ -15,6 +15,9 @@ pub enum StorageError {
     #[error("writer thread panicked")]
     WriterPanicked,
 
+    #[error("WAL checkpoint could not truncate because the database is busy")]
+    CheckpointBusy,
+
     #[error("reader pool is closed")]
     ReadersClosed,
 

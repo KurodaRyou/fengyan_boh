@@ -7,8 +7,8 @@ use crate::StorageError;
 
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
 
-/// 打开唯一的写连接。整个进程只调用一次，返回的连接交给 [`crate::spawn_writer`]。
-pub fn open_writer(path: &Path) -> Result<Connection, StorageError> {
+/// 打开唯一的写连接。整个进程只调用一次，返回的连接交给写线程。
+pub(crate) fn open_writer(path: &Path) -> Result<Connection, StorageError> {
     // 连接工厂是允许打开 SQLite 连接的边界，并统一应用必需的 PRAGMA。
     #[allow(clippy::disallowed_methods)]
     let conn = Connection::open_with_flags(
@@ -22,7 +22,7 @@ pub fn open_writer(path: &Path) -> Result<Connection, StorageError> {
 }
 
 /// 打开一个只读连接（`query_only = ON`）。必须在写连接完成迁移之后调用。
-pub fn open_reader(path: &Path) -> Result<Connection, StorageError> {
+pub(crate) fn open_reader(path: &Path) -> Result<Connection, StorageError> {
     // 读连接也必须从此处打开，以统一应用必需的 PRAGMA 和 query_only。
     #[allow(clippy::disallowed_methods)]
     let conn = Connection::open_with_flags(
@@ -35,8 +35,11 @@ pub fn open_reader(path: &Path) -> Result<Connection, StorageError> {
 }
 
 /// 把 WAL 内容写回主库并截断 WAL 文件。只在关闭前对写连接调用。
-pub fn checkpoint_truncate(conn: &Connection) -> Result<(), StorageError> {
-    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+pub(crate) fn checkpoint_truncate(conn: &Connection) -> Result<(), StorageError> {
+    let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+    if busy != 0 {
+        return Err(StorageError::CheckpointBusy);
+    }
     Ok(())
 }
 

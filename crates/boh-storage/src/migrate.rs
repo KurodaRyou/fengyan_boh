@@ -10,7 +10,7 @@ pub const LATEST_SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 
 /// 把数据库升级到 [`LATEST_SCHEMA_VERSION`]。每个迁移在独立的事务中执行。
 /// 数据库版本高于本程序支持的版本时返回错误，调用方必须拒绝启动。
-pub fn migrate(conn: &mut Connection) -> Result<(), StorageError> {
+pub(crate) fn migrate(conn: &mut Connection) -> Result<(), StorageError> {
     let current = schema_version(conn)?;
     if !(0..=LATEST_SCHEMA_VERSION).contains(&current) {
         return Err(StorageError::UnsupportedSchemaVersion {

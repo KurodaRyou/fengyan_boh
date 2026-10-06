@@ -1,5 +1,7 @@
 # 生产环境放在 /etc/boh/config.toml
-store_id = "store-001"
+store_id = "01890a5d-ac96-774b-bcce-b302099a8050"
+timezone = "Asia/Shanghai"
+business_day_cutoff = "04:00"
 db_path = "/var/lib/boh/boh.db"
 listen_addr = "0.0.0.0:8080"
 reader_pool_size = 4
