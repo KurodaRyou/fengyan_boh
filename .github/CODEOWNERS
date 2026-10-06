@@ -1,4 +1,30 @@
-/migrations/ @KurodaRyou
+# 锁定路径清单。实现 agent 不得修改这些路径，见 AGENTS.md「协作分工」与「Review guidelines」。
+# 不启用 Code Owner 审核：所有 PR 都由同一账号提交，作者不能自审；锁定由规则与 review 把关。
+
+# 规则与设计文档
 /AGENTS.md @KurodaRyou
+/CLAUDE.md @KurodaRyou
 /docs/ @KurodaRyou
+
+# 迁移与 schema 测试
+/migrations/ @KurodaRyou
 /crates/boh-storage/tests/schema.rs @KurodaRyou
+
+# 锁定测试及其辅助代码、golden payload
+/crates/*/tests/spec_*.rs @KurodaRyou
+/crates/*/tests/spec_support/ @KurodaRyou
+/crates/*/tests/golden/ @KurodaRyou
+
+# 能让检查失效的 CI、脚本与构建配置（含本文件）
+/.github/ @KurodaRyou
+/scripts/ @KurodaRyou
+/.cargo/ @KurodaRyou
+Cargo.toml @KurodaRyou
+/Cargo.lock @KurodaRyou
+clippy.toml @KurodaRyou
+.clippy.toml @KurodaRyou
+rustfmt.toml @KurodaRyou
+.rustfmt.toml @KurodaRyou
+/rust-toolchain @KurodaRyou
+/rust-toolchain.toml @KurodaRyou
+build.rs @KurodaRyou
