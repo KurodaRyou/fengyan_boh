@@ -137,7 +137,7 @@ occurred_at = recorded_at − lag
 | `GOODS_RECEIVED` | `RECEIPT` | `supplier_id`, `lines[{item_id, qty, input, lot_id \| absorbed_by_event_id, supplier_lot_no?, expires_at?, line_cost_cents}]` | 每行新建一个批次；被吸收时不建 |
 | `PRODUCTION_BATCH_COMPLETED` | `PRODUCTION_BATCH` | `recipe_id`, `recipe_version`, `batch_count`, `started_at?`, `output{item_id, planned_qty, qty, lot_id \| absorbed_by_event_id, expires_at?}`, `consumed[{item_id, planned_qty, qty, alloc \| absorbed_by_event_id}]` | 原料按分配扣减（或被吸收）；成品新建批次 |
 | `WASTE_LOGGED` | `WASTE_RECORD` | `lines[{item_id, qty, input, reason_code, alloc \| absorbed_by_event_id}]` | 按分配扣减（或被吸收） |
-| `STOCK_COUNT_SUBMITTED` | `STOCK_COUNT` | `purpose`（`CLOSING` / `AUDIT`）, `started_seq`, `lines[{item_id, lot_id?, counted_qty}]` | 无 |
+| `STOCK_COUNT_SUBMITTED` | `STOCK_COUNT` | `purpose`（`CLOSING` / `AUDIT`）, `lines[{item_id, lot_id?, counted_qty}]` | 无 |
 | `STOCK_ADJUSTED` | `STOCK_COUNT` | `lines[{item_id, lot_id?, book_qty, counted_qty, delta}]`, `new_lots[{lot_id, item_id, qty}]` | 批次和账外缺口按 delta 变化；新建盘盈批次；写 `inventory_counts` |
 | `PURCHASE_ORDER_SUBMITTED` | `PURCHASE_ORDER` | `supplier_id`, `lines[{item_id, qty, input}]`, `deliver_on`（门店当地日期 `'YYYY-MM-DD'`） | 无 |
 | `TEMPERATURE_LOGGED` | `TEMPERATURE_READING` | `equipment_id`, `celsius_x10`, `note?` | 食安记录 |
@@ -161,18 +161,28 @@ occurred_at = recorded_at − lag
 
 ## 盘点
 
-1. **开始盘点**：客户端调用只读接口 `GET /api/v1/stock-counts/snapshot`，拿到 `started_seq = max(seq)` 和当时每个物料的批次明细（`lot_id`、余量、到期时间、供应商批号）及账外缺口。开始盘点**不产生事件**。
-2. **提交盘点**：命令携带 `started_seq` 和逐批次的清点结果，同一事务内写入 `STOCK_COUNT_SUBMITTED` 和 `STOCK_ADJUSTED`。
-3. **盘点范围**：只针对 `lines` 里出现的物料。对其中每个物料，范围是 `source_seq <= started_seq` 的批次加上该物料的账外缺口。盘点期间新建的批次不在范围内。
+1. **盘点表与草稿**：客户端按库存明细生成盘点表，不调用专门的盘点接口，不产生事件。库存明细查询返回物料的全部批次、账外缺口及门店节点当前的 `business_date`。
+   - 每个批次行显示收货或生产时间、到期日、供应商批号。盘点表不预填清点数量，有空格时客户端不允许提交。
+   - 草稿按设备保存在平板的 `IndexedDB` 中，刷新、休眠后都能恢复。草稿保存清点数及物料 / 批次标识、营业日和重试所需的命令信息，不保存库存余量，不改变「客户端不维护库存镜像」的规则。
+   - 提交成功后删除草稿；提交被拒时保留已填的数，刷新盘点表后只补新出现的批次行。
+   - 首次提交时生成的 `command_id` 存进草稿。结果未知时草稿锁定为只读，用原 ID、原内容重试，直到拿到结果。
+   - **【默认】草稿跨营业日不能提交**：草稿保存打开盘点表时门店节点返回的当前 `business_date`；首次提交或被拒后重新提交前，用库存明细查询返回的当前 `business_date` 核对，跨营业日时清空草稿、重新清点。客户端不自己计算时区和日切。结果未知的命令先按原 ID、原内容取回结果，再处理草稿的营业日。
+2. **提交盘点**：命令携带 `purpose`（`CLOSING` / `AUDIT`）和逐批次的清点结果，`captured_at` 取员工点「完成盘点」的时刻，同一事务内写入 `STOCK_COUNT_SUBMITTED` 和 `STOCK_ADJUSTED`。不加审批，提交即调整，录错就重盘。
+   - **【默认】允许按区域或物料组分几次提交**，界面默认这样组织；同一营业日分次提交的 `CLOSING` 盘点各自入账。本期不加存放位置字段。
+3. **范围与校验**：只针对 `lines` 里出现的物料。对其中每个物料，范围是该物料的全部批次（含余量为 0 的）加上账外缺口，范围与余量一律以门店节点提交时的值为准。
+   - 填入的数量一律视为实有数量，没填不等于 0。被盘物料中余量大于 0 的每个批次都必须出现在 `lines` 中，实物没有就填 0；缺少时返回 `400 COUNT_LINE_MISSING`，列出缺少的批次，整条命令不入账。打开盘点表之后新建的批次同样校验，客户端刷新盘点表后补填。
+   - 余量为 0 的批次可以不列；不带 `lot_id` 的行可以不列，不列表示没有对不上批次的货。
    - `lines` 中的 `lot_id` 不属于该物料或不在范围内：`400 LOT_NOT_IN_COUNT_SCOPE`；同一批次出现两次：`400 DUPLICATE_COUNT_LINE`。
+   - **【默认】同一物料出现两行不带 `lot_id`**：`400 DUPLICATE_COUNT_LINE`。
 4. **逐批次调整**：
-   - 范围内每个批次：`delta = counted_qty − remaining_qty`。范围内没有列出的批次按 `counted_qty = 0` 处理。
+   - 对每个列出的批次：`delta = counted_qty − remaining_qty`，`remaining_qty` 取提交时的余量；未列出的零余量批次不调整。
    - 账外缺口清零。
    - 不带 `lot_id` 且 `counted_qty > 0`（找到了对不上批次的货）：新建一个 `COUNT_GAIN` 批次，写进 `new_lots`。每个物料最多一行不带 `lot_id`。
    - `book_qty`、`delta` 和新批次都写进 payload，重放时不重新计算。`STOCK_ADJUSTED.lines` 包含范围内余量非 0 或被清点的每个批次，另外每个物料恰有一行不带 `lot_id`：`book_qty` 是账外缺口，`counted_qty` 是无批次的清点数（没有时为 0）。投影把这一行拆成账外缺口的 `−book_qty`（归零）和 `new_lots` 中的新批次。
-5. **盘点期间有变动**：被盘物料在 `seq > started_seq` 之后有 `qty_delta ≠ 0` 的流水时，盘点照常入账，同时返回警告 `MOVED_DURING_COUNT`（列出这些物料），由店长决定是否重盘。不做差分自动合并（清点持续好几分钟，实物在过程中已经反映了一部分消耗，自动合并必然重复扣减）。
-6. 被盘的每个物料写一行 `inventory_counts`（零差异也写）：`book_qty` 是范围内批次余量与账外缺口之和，`counted_qty` 是清点合计。
-7. **操作规范**（写进门店 SOP，系统不强制）：盘点只数货架上的实物，不含在制品；清点期间暂停领用和收货。
+5. **提交响应**：响应 `data` 返回服务端计算的 `lines[{item_id, lot_id?, book_qty, counted_qty, delta}]` 和 `new_lots[{lot_id, item_id, qty}]`，与第 4 条的调整 payload 一致。界面以响应为准，不显示客户端自己计算的差异。同一 `command_id`、同一规范化请求重发时，原样返回首次的响应（含 warnings），不按当前库存重新计算，`seq` 不增加。
+6. **盘点投影**：被盘的每个物料写一行 `inventory_counts`（零差异也写）：`book_qty` 是提交时范围内批次余量与账外缺口之和，`counted_qty` 是清点合计。分次提交分别写入。
+7. **操作规范**（写进门店 SOP）：盘点只数货架上的实物，不含在制品；从开始清点到提交，被盘物料不得领用、收货、报损或生产取料。
+   系统不检测盘点期间的变动，违反规范时差异会算错，由店长重盘。
 
 ## 盘点吸收
 
@@ -213,7 +223,6 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 
 **边界**：
 
-- t(e) 落在盘点进行期间时，归属判断不了，一律按已吸收处理并返回警告；靠「盘点」第 7 条的操作规范降到最少。
 - 被吸收的收货不建批次。供应商、批号、金额只留在事件里，对账和应付不受影响。
 
 ## 纠错
@@ -241,7 +250,7 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 - 纠错行沿用原行的 `kind`（由聚合类型和 `line_ref` 确定，不查原事件），营业日取原行的值。所以按 `kind` 汇总时纠错自动抵消原记录，并回写到原来那天的日报。
 - 纠错行的 `alloc`：方向上，更正 `delta > 0` 与原行相同、`delta < 0` 与原行相反，冲销与原行相反；来源上，对原批次 / 原账外缺口的增减和退回记 `CORRECTION`（冲销记 `REVERSAL`），追加分配记 `FIFO`，扣回不足的部分记 `SHORTFALL`。
 - **扣回时批次余量不够**（原批次已被后续扣减）：批次扣到 0，不足部分记入账外缺口，返回 `STOCK_SHORTFALL`，界面提示「建议现在盘点该物料」。下一次包含该物料的盘点会清零，不会在盘点差异里重复出现。
-- **退回会使账外缺口大于 0**（原分配含账外缺口，而该缺口已被之后一次观察时点更早的盘点清零，只在 `MOVED_DURING_COUNT` 之后出现）：`409 COUNT_REQUIRED`。先盘点该物料，新盘点的观察时点晚于原行，纠错随后会被吸收。
+- **退回会使账外缺口大于 0**（原分配含账外缺口，而该缺口已被一次入账在后、观察时点却早于原行的盘点清零，只在违反盘点操作规范时出现）：`409 COUNT_REQUIRED`。先盘点该物料，新盘点的观察时点晚于原行，纠错随后会被吸收。
 
 **数量更正 `QUANTITY_CORRECTED`**：
 
@@ -357,10 +366,10 @@ CREATE INDEX idx_inventory_counts_item ON inventory_counts(item_id, observed_at)
 
 - **批次追溯是账面推定**。员工实际拿的批次和系统推定的不一致时，批次余量会偏离实物，直到下一次盘点。
 - **被吸收的收货不建批次**。那批货在批次层面的来源由盘点产生的 `COUNT_GAIN` 批次代替。被吸收的冲销也不会把错误收货建出的批次扣掉，这些批次按 FIFO 自然消耗。
-- **盘点期间的实物变动**只检测并警告，靠操作规范避免，系统不自动修正。
+- **盘点期间的实物变动**：系统不检测，靠操作规范禁止，违反时由重盘纠正。
 - **时钟**：系统时钟跳到未来再拨回时，期间事件的 `business_date` 是错的，不能自动修正；`/health` 会暴露这种情况。
 - **门店节点长时间宕机**时没有离线写入能力，改用纸质登记，恢复后走补录入口。
-- **客户端暂存**：只承诺页面不刷新期间，命令进入 `IndexedDB` 队列，界面显示「待提交 N 条」。客户端不维护库存镜像，不做批次分配。排队命令补交被拒时，界面列出命令和原因，由人工处理。
+- **客户端暂存**：普通命令只承诺页面不刷新期间，命令进入 `IndexedDB` 队列，界面显示「待提交 N 条」。盘点草稿是例外，可跨刷新、休眠恢复，规则见「盘点」第 1 条。客户端不维护库存镜像，不做批次分配。排队命令补交被拒时，界面列出命令和原因，由人工处理。
 
 ## 验收用例
 
@@ -376,10 +385,16 @@ CREATE INDEX idx_inventory_counts_item ON inventory_counts(item_id, observed_at)
 | 闭店重盘 | 成品账面 100；先盘为 80，再盘为 90；销售 0 | 调整净和 **−10**；未解释损耗 **10** |
 | 指定批次不足 | 批次 A 5、B 10；指定 A 扣 8 | 分配 `A 5 SPECIFIED` + `B 3 FIFO` |
 | 按批次盘点 | 批次 A 5、B 10，账外缺口 −2；清点 A 4、B 10、无批次 3 | A 调整 −1；账外缺口 +2 归零；新建 `COUNT_GAIN` 批次 3；账面 **17** |
+| 盘点漏填批次 | 批次 A 5、B 10；只提交 A 4 | `400 COUNT_LINE_MISSING`，列出 B；不入账 |
+| 盘点填 0 | 批次 A 5、B 10；提交 A 4、B 0 | A 调整 −1，B 调整 −10；账面 **4** |
+| 盘点后新到批次 | 批次 A 5；打开盘点表后收货建批次 C 10；提交 A 5 | `400 COUNT_LINE_MISSING`，列出 C；不入账 |
+| 余量以提交时为准 | 打开盘点表时 A 5；提交前另一台平板报损 A 2 已入账；提交 A 4 | `book_qty` **3**，`delta` **+1**；账面 **4**；响应返回这些值 |
+| 盘点重复提交 | 盘点成功后又报损该物料；同一 `command_id` 重发盘点 | 原样返回首次的响应；`seq` 不增加 |
+| 分次闭店盘点 | 面粉账面 100、黄油账面 50；21:00 `CLOSING` 只盘面粉得 90；21:30 `CLOSING` 只盘黄油得 48 | 面粉调整 −10、黄油调整 −2；各写一行 `inventory_counts` |
+| 无批次行重复 | 同一物料提交两行不带 `lot_id` | `400 DUPLICATE_COUNT_LINE` |
 | 换算变化 | 离线录入「2 袋，每袋 25000 g」；提交前换算改为 20000 | `409 UNIT_CONVERSION_CHANGED`，不入账 |
 | 销售示例 | 生产 100、报损 8、闭店实数 5（调整 −87）、销售 84 | 未解释损耗 **3** |
 | 幂等 | 同一命令发送 2 次，`sent_at` 不同 | 第二次原样返回首次响应（含 warnings），`seq` 不增加 |
-| 盘点期间变动 | `started_seq = 10`；seq 11 领用了该物料；seq 12 提交盘点 | 照常入账，返回 `MOVED_DURING_COUNT` |
 | 盘点后的正常业务 | 09:20 盘点；10:30 报损并提交 | 不被吸收，正常扣减 |
 | 冲销时批次已消耗 | 收货批次 L 10，已用掉 3，之后没有盘点；冲销这次收货 | L 扣到 **0**；账外缺口 **−3**；返回 `STOCK_SHORTFALL` |
 | 数量更正 | 收货录成 1000（实际 100），批次 L1；生产从 L1 扣 300；之后没有盘点；更正为 100 | L1 **0**；账外缺口 **−200**；返回 `STOCK_SHORTFALL` |
@@ -392,6 +407,7 @@ CREATE INDEX idx_inventory_counts_item ON inventory_counts(item_id, observed_at)
 - **门店调拨**：`TRANSFER_SENT` / `TRANSFER_RECEIVED`，含在途归属规则。
 - **总部同步**：上行契约见 AGENTS.md「上行同步」；下行为主数据包导入（`source = HQ_PACKAGE`）。总部从事件自行计算报表，必须区分被吸收的行和正常生效的行。总部关账后可下发锁账日（见 Q6）。
 - **采购对接**：采购单与收货的关联、在途库存。
+- **批次标签与短码**：收货时给每个批次贴标签，标签印人能读的批次短码；短码及标签生成功能延后。
 
 ## 待确认问题
 

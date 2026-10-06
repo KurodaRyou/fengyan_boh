@@ -250,7 +250,7 @@ scripts/        CI 扫描脚本。
 { "success": false, "data": null, "warnings": [], "error": { "code": "IDEMPOTENCY_CONFLICT", "message": "..." } }
 ```
 
-- 警告不改变 `success`。警告码见 `docs/domain.md`：`STOCK_SHORTFALL`、`MOVED_DURING_COUNT`、`ABSORBED_BY_COUNT`、`EXPIRES_BEFORE_OLDER_STOCK`、`CAPTURE_TIME_ADJUSTED`。
+- 警告不改变 `success`。警告码见 `docs/domain.md`：`STOCK_SHORTFALL`、`ABSORBED_BY_COUNT`、`EXPIRES_BEFORE_OLDER_STOCK`、`CAPTURE_TIME_ADJUSTED`。
 - HTTP 状态码要和语义一致：校验失败 400、不存在 404、幂等冲突与业务冲突 409、内部错误 500。`code` 是稳定的大写蛇形字符串，客户端按 `code` 判断，不按 `message`。
 - 内部错误只记日志，不把 SQL / 内部细节返回给客户端。
 - `/health` 暴露：`clock_regression_ms`（超过 5 分钟为 `degraded`）、`last_backup_ok_at`、`last_backup_seq`、WAL 文件大小、最近一次不变量自检的结果；认证实现后加 `auth_failures_last_hour`；同步实现后加 `max(seq) − acked_seq` 和最后一次成功同步的时间。
