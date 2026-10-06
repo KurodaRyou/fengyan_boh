@@ -124,7 +124,7 @@ scripts/        CI 扫描脚本。
 ## 不可违反的规则
 
 ### SQLite
-- 每个连接打开时都设置（见 `boh-storage/src/connection.rs`）：
+- 每个连接打开时都设置（见 `boh-storage/src/connection.rs`；备份校验连接例外，见下）：
   `journal_mode = WAL`、`busy_timeout = 5000`、`synchronous = FULL`、`foreign_keys = ON`、`recursive_triggers = ON`。
   - 用 `FULL` 而不是 `NORMAL`：`NORMAL` 在断电时可能回滚已经回复客户端“成功”的事务。不要改回去。
   - `recursive_triggers` 关闭时，`INSERT OR REPLACE` 会绕过只追加触发器，静默替换账本行。不要关。
@@ -134,8 +134,10 @@ scripts/        CI 扫描脚本。
     `clippy.toml` 的 `disallowed-methods` 禁用 `boh_storage::testing` 中的函数，只有锁定测试可以 `#[allow]`。
 - 写事务一律 `BEGIN IMMEDIATE`（`Writer::call` 已处理）。
 - 读连接 `query_only = ON`，只通过 `Readers::call` 使用；`Readers::call` 内部包一个 DEFERRED 读事务，读事务保持简短。
-- **受控例外：备份连接**。只在备份模块中单独打开一个 `SQLITE_OPEN_READ_ONLY` 连接执行 `VACUUM INTO`，不设 `query_only`，不进读连接池。
-  - `query_only` 连接上执行 `VACUUM INTO` 会失败，所以不能复用读连接池。
+- **受控例外：备份连接**。只在备份模块中打开，都用 `SQLITE_OPEN_READ_ONLY`，不设 `query_only`，不进读连接池：
+  - 源库连接：照常设置上面的 PRAGMA，执行 `VACUUM INTO`。`query_only` 连接上执行 `VACUUM INTO` 会失败，所以不能复用读连接池。
+  - 校验连接：打开 `VACUUM INTO` 生成的临时文件，只执行校验查询，**不设置 `journal_mode`**。
+    - 生成的文件是 DELETE 模式，只读连接上改成 WAL 会报 `attempt to write a readonly database`。
 - **禁止跨 `.await` 持有 `Connection`**；禁止在 `Writer::call` / `Readers::call` 的闭包里做网络 I/O 或 sleep——闭包会阻塞唯一的写线程。
   写线程对每个任务计时，超过 50ms 记 `warn`。
 - 所有表用 `STRICT`。
@@ -145,8 +147,9 @@ scripts/        CI 扫描脚本。
    - `VACUUM INTO` 不覆盖已存在的文件；固定文件名在上次中途退出后会让之后每次备份都失败。
 2. 只读打开临时文件，执行 `PRAGMA integrity_check`，并以 `n = coalesce(max(seq), 0)` 校验 `n >= seq_before` 且 `count(*) = n`（空账本时三者都为 0）；校验失败则删除临时文件。
    - 备份期间写入照常提交，备份快照可能包含 `seq_before` 之后的事件，所以只比下界，不比相等。备份自身的 `n` 记为 `last_backup_seq`。
-3. 校验通过后对文件 fsync，原子重命名为 `boh-<UTC时间>.db`，再 fsync 备份目录；按保留策略清理旧文件后再 fsync 一次目录。
+3. 校验通过后对文件 fsync，原子重命名为 `boh-<UTC时间>-<UUIDv7>.db`（与临时文件同一个 UUID），再 fsync 备份目录；按保留策略清理旧文件后再 fsync 一次目录。
    - 只 fsync 文件不能让重命名后的目录项持久化，断电后新备份可能消失。
+   - 文件名带 UUID：时钟回拨或同一时刻两次备份时，同名重命名会覆盖已有的备份。
 4. 低峰时段每小时一次，闭店后一次。`VACUUM INTO` 期间持有读快照，会推迟 WAL checkpoint。
 5. **恢复演练写成测试**：从备份恢复、清空投影并重建，结果必须和原库一致。只验证备份文件生成了不算数。
 6. 异地复制（有公网用对象存储，没有公网用 NAS 或双盘轮换）本期不开发。
@@ -250,7 +253,7 @@ scripts/        CI 扫描脚本。
 - 警告不改变 `success`。警告码见 `docs/domain.md`：`STOCK_SHORTFALL`、`MOVED_DURING_COUNT`、`ABSORBED_BY_COUNT`、`EXPIRES_BEFORE_OLDER_STOCK`、`CAPTURE_TIME_ADJUSTED`。
 - HTTP 状态码要和语义一致：校验失败 400、不存在 404、幂等冲突与业务冲突 409、内部错误 500。`code` 是稳定的大写蛇形字符串，客户端按 `code` 判断，不按 `message`。
 - 内部错误只记日志，不把 SQL / 内部细节返回给客户端。
-- `/health` 暴露：`clock_regression_ms`（超过 5 分钟为 `degraded`）、`last_backup_ok_at`、`last_backup_seq`、WAL 文件大小、最近一次不变量自检的结果；同步实现后加 `max(seq) − acked_seq` 和最后一次成功同步的时间。
+- `/health` 暴露：`clock_regression_ms`（超过 5 分钟为 `degraded`）、`last_backup_ok_at`、`last_backup_seq`、WAL 文件大小、最近一次不变量自检的结果；认证实现后加 `auth_failures_last_hour`；同步实现后加 `max(seq) − acked_seq` 和最后一次成功同步的时间。
   不变量自检由定时任务在读连接上执行，`/health` 只返回最近一次的结果，不现场计算。
 
 ---

@@ -72,7 +72,7 @@ occurred_at = recorded_at − lag
 
 - 主键一律 UUIDv7。`code` 列唯一、人可读、各门店统一（物料的 `code` 用于销售导入）。
 - 每行带 `revision`，每次变更 +1。主数据只停用（`active = 0`），不删除。
-- 每次变更写一条 `MASTER_DATA_CHANGED`：聚合类型是实体名，聚合 ID 是行的主键，`aggregate_version` 是变更后的 `revision`；payload 是 `{entity, source: LOCAL | HQ_PACKAGE, snapshot}`。主数据表是投影，可以从事件流重建。
+- 每次变更写一条 `MASTER_DATA_CHANGED`：聚合类型是实体名，聚合 ID 是行的主键，`aggregate_version` 是变更后的 `revision`；payload 是 `{entity, source, snapshot}`，`source`（`LOCAL` / `HQ_PACKAGE`）。主数据表是投影，可以从事件流重建。
 - 内容没有变化的变更不写事件（导入主数据包时逐行比对快照）。
 - **认证状态不进事件流**：`employee_credentials`（PIN 的 Argon2id 哈希）、设备注册、会话都是普通状态表，不同步，不参与重建。
 - **系统操作人**：初始化和主数据包导入在没有登录员工时，`actor_id` 使用保留 ID `00000000-0000-7000-8000-000000000000`。
@@ -108,7 +108,7 @@ occurred_at = recorded_at − lag
 - **FIFO 分配**：未指定 `lot_id` 的扣减，先扣 `origin = 'COUNT_GAIN'` 的批次，其余按来源事件的 `seq` 升序。补录的收货按入账顺序排队。
 - 客户端可以指定 `lot_id`；指定批次余量不足时，不足部分继续按 FIFO 分配。
 - **账面不足**：全部批次分配完仍不够时不拒绝，剩余部分记入账外缺口，返回警告 `STOCK_SHORTFALL`。下一次包含该物料的盘点会把账外缺口清零。
-- 分配结果连同来源写进 payload：`alloc[{lot_id | null, qty, source: SPECIFIED | FIFO | SHORTFALL}]`。重放时直接使用，不重新分配。
+- 分配结果连同来源写进 payload：`alloc[{lot_id?, qty, source}]`。`qty` 为正数，不带 `lot_id` 表示账外缺口；`source`（`SPECIFIED` / `FIFO` / `SHORTFALL`，纠错另有 `CORRECTION` / `REVERSAL`，见「纠错」）。重放时直接使用，不重新分配。
 - 新批次的 `expires_at` 早于同物料现存最老的批次时，返回警告 `EXPIRES_BEFORE_OLDER_STOCK`。
 - **承诺边界**：批次是账面推定，不是实物证据。追溯报告分开显示「员工指定」「系统推定」「账外 / 吸收」三类。
 
@@ -116,25 +116,26 @@ occurred_at = recorded_at − lag
 
 所有数量是基本单位 `i64`，金额是 `i64` 分。`schema_version` 从 1 开始。
 `actor_id`、`device_id`、`occurred_at`、`business_date` 存在 `store_events` 的列中，不重复写进 payload。
-`input` 见「单位」，`alloc` 见「批次」。影响库存的行，要么带 `alloc`（或新建的 `lot_id`），要么带 `absorbed_by_event_id`（被吸收，见「盘点吸收」），二者取一。
-带 `?` 的字段可选：缺省时省略该键，不写 `null`。`a | b` 表示二者恰有一个出现。
+`input` 见「单位」，`alloc` 见「批次」。影响库存的行（盘点行除外），要么带 `alloc`（或新建的 `lot_id`），要么带 `absorbed_by_event_id`（被吸收，见「盘点吸收」），二者取一。
+带 `?` 的字段可选：缺省时省略该键，payload 中不出现 `null`。字段之间的 `a | b` 表示二者恰有一个出现；枚举值写作（`A` / `B`）。
 
 | event_type | aggregate_type | payload 要点 | 投影影响 |
 |---|---|---|---|
 | `GOODS_RECEIVED` | `RECEIPT` | `supplier_id`, `lines[{item_id, qty, input, lot_id \| absorbed_by_event_id, supplier_lot_no?, expires_at?, line_cost_cents}]` | 每行新建一个批次；被吸收时不建 |
 | `PRODUCTION_BATCH_COMPLETED` | `PRODUCTION_BATCH` | `recipe_id`, `recipe_version`, `batch_count`, `started_at?`, `output{item_id, planned_qty, qty, lot_id \| absorbed_by_event_id, expires_at?}`, `consumed[{item_id, planned_qty, qty, alloc \| absorbed_by_event_id}]` | 原料按分配扣减（或被吸收）；成品新建批次 |
 | `WASTE_LOGGED` | `WASTE_RECORD` | `lines[{item_id, qty, input, reason_code, alloc \| absorbed_by_event_id}]` | 按分配扣减（或被吸收） |
-| `STOCK_COUNT_SUBMITTED` | `STOCK_COUNT` | `purpose`（`CLOSING` / `AUDIT`）, `started_seq`, `lines[{item_id, lot_id \| null, counted_qty}]` | 无 |
-| `STOCK_ADJUSTED` | `STOCK_COUNT` | `lines[{item_id, lot_id \| null, book_qty, counted_qty, delta}]`, `new_lots[{lot_id, item_id, qty}]` | 批次和账外缺口按 delta 变化；新建盘盈批次；写 `inventory_counts` |
+| `STOCK_COUNT_SUBMITTED` | `STOCK_COUNT` | `purpose`（`CLOSING` / `AUDIT`）, `started_seq`, `lines[{item_id, lot_id?, counted_qty}]` | 无 |
+| `STOCK_ADJUSTED` | `STOCK_COUNT` | `lines[{item_id, lot_id?, book_qty, counted_qty, delta}]`, `new_lots[{lot_id, item_id, qty}]` | 批次和账外缺口按 delta 变化；新建盘盈批次；写 `inventory_counts` |
 | `PURCHASE_ORDER_SUBMITTED` | `PURCHASE_ORDER` | `supplier_id`, `lines[{item_id, qty, input}]`, `deliver_on` | 无 |
 | `TEMPERATURE_LOGGED` | `TEMPERATURE_READING` | `equipment_id`, `celsius_x10`, `note?` | 食安记录 |
-| `QUANTITY_CORRECTED` | 与原事件相同 | `corrected_event_id`, `reason`, `lines[{line_ref, item_id, physical_at, old_qty, new_qty, delta, input, line_cost_cents?, alloc \| absorbed_by_event_id}]` | 按差额调整（或被吸收），见「纠错」 |
+| `QUANTITY_CORRECTED` | 与原事件相同 | `corrected_event_id`, `reason`, `lines[{line_ref, item_id, physical_at, old_qty, new_qty, delta, input?, line_cost_cents?, alloc \| absorbed_by_event_id}]` | 按差额调整（或被吸收），见「纠错」 |
 | `EVENT_REVERSED` | 与原事件相同 | `reversed_event_id`, `reason`, `lines[{line_ref, item_id, physical_at, qty, alloc \| absorbed_by_event_id}]` | 精确取反（或被吸收），见「纠错」 |
-| `SALES_IMPORTED` | `SALES_DAY` | `source`（`CSV` / `XLSX`）, `file_name`, `lines[{item_id, qty, amount_cents}]`, `ignored_rows` | 覆盖 `daily_sales` 中该营业日；**不写库存流水** |
+| `SALES_IMPORTED` | `SALES_DAY` | `source`（`CSV` / `XLSX`）, `file_name`, `lines[{item_id, qty, amount_cents}]`, `ignored_rows`（整数） | 覆盖 `daily_sales` 中该营业日；**不写库存流水** |
 | `MASTER_DATA_CHANGED` | 实体名 | `entity`, `source`, `snapshot` | 覆盖对应的主数据表 |
 
 - `reason_code` 的值对应 `WASTE_REASON` 的 `code`。
 - 温度记录每条读数一个新的 `TEMPERATURE_READING` 聚合。
+- 一次盘点的 `STOCK_COUNT_SUBMITTED`、`STOCK_ADJUSTED` 属于同一个 `STOCK_COUNT` 聚合，version 分别为 1、2。
 - **可纠错事件的聚合版本**：原事件是 version 1，每次数量更正 +1，冲销是该聚合的最后一个版本。
 
 ### 生产规则
@@ -154,8 +155,8 @@ occurred_at = recorded_at − lag
 4. **逐批次调整**：
    - 范围内每个批次：`delta = counted_qty − remaining_qty`。范围内没有列出的批次按 `counted_qty = 0` 处理。
    - 账外缺口清零。
-   - `lot_id = null, counted_qty > 0`（找到了对不上批次的货）：新建一个 `COUNT_GAIN` 批次，写进 `new_lots`。每个物料最多一行 `lot_id = null`。
-   - `book_qty`、`delta` 和新批次都写进 payload，重放时不重新计算。
+   - 不带 `lot_id` 且 `counted_qty > 0`（找到了对不上批次的货）：新建一个 `COUNT_GAIN` 批次，写进 `new_lots`。每个物料最多一行不带 `lot_id`。
+   - `book_qty`、`delta` 和新批次都写进 payload，重放时不重新计算。`STOCK_ADJUSTED.lines` 包含范围内余量非 0 或被清点的每个批次，另外每个物料恰有一行不带 `lot_id`：`book_qty` 是账外缺口，`counted_qty` 是无批次的清点数（没有时为 0）。投影把这一行拆成账外缺口的 `−book_qty`（归零）和 `new_lots` 中的新批次。
 5. **盘点期间有变动**：被盘物料在 `seq > started_seq` 之后有 `qty_delta ≠ 0` 的流水时，盘点照常入账，同时返回警告 `MOVED_DURING_COUNT`（列出这些物料），由店长决定是否重盘。不做差分自动合并（清点持续好几分钟，实物在过程中已经反映了一部分消耗，自动合并必然重复扣减）。
 6. 被盘的每个物料写一行 `inventory_counts`（零差异也写）：`book_qty` 是范围内批次余量与账外缺口之和，`counted_qty` 是清点合计。
 7. **操作规范**（写进门店 SOP，系统不强制）：盘点只数货架上的实物，不含在制品；清点期间暂停领用和收货。
@@ -187,7 +188,7 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 
 查到时 e 被它吸收：
 
-- `qty_delta = 0`，`absorbed_by_event_id = c 的事件 id`，`lot_id = NULL`，`alloc_source = 'ABSORBED'`；
+- `qty_delta = 0`，`absorbed_by_event_id = c 的 STOCK_ADJUSTED 事件 id`，`lot_id = NULL`，`alloc_source = 'ABSORBED'`；
 - 不分配批次，不新建批次，不改动账外缺口；
 - 事件照常入账，payload 记录 `absorbed_by_event_id`，重放时直接读取，不重新判定；
 - 返回警告 `ABSORBED_BY_COUNT`，列出受影响的物料和对应的盘点。
@@ -215,7 +216,8 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 
 - `GOODS_RECEIVED`、`PRODUCTION_BATCH_COMPLETED`、`WASTE_LOGGED`：可以更正，也可以冲销。
 - `PURCHASE_ORDER_SUBMITTED`、`TEMPERATURE_LOGGED`：只能冲销（`lines` 为空）。
-- 盘点类事件、`EVENT_REVERSED`、`QUANTITY_CORRECTED`、`MASTER_DATA_CHANGED`、`SALES_IMPORTED` 不能被纠错（盘点录错就重盘；主数据再改一次；销售重新导入）。
+- 盘点类事件、`EVENT_REVERSED`、`QUANTITY_CORRECTED`、`MASTER_DATA_CHANGED`、`SALES_IMPORTED` 不能被纠错（盘点录错就重盘；主数据再改一次；销售重新导入），提交时返回 `400 EVENT_NOT_CORRECTABLE`。
+- 原事件不存在：`404 EVENT_NOT_FOUND`。
 
 **通用规则**：
 
@@ -223,14 +225,15 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 - 原事件某一行的**有效数量** = 原值 + 之后全部更正的差额；有效分配同理。
 - 每行按「盘点吸收」判定（t 取原行的值）。被吸收的行不动库存，只更正报表。
 - 每行的 `physical_at` 是原行的 t，由写入线程填写。生产用料的 t 是 `started_at`，与事件的 `occurred_at` 不同，所以必须写进 payload，重放时不查原事件。
-- 纠错行沿用原行的 `kind`，营业日取原行的值。所以按 `kind` 汇总时纠错自动抵消原记录，并回写到原来那天的日报。
+- 纠错行沿用原行的 `kind`（由聚合类型和 `line_ref` 确定，不查原事件），营业日取原行的值。所以按 `kind` 汇总时纠错自动抵消原记录，并回写到原来那天的日报。
+- 纠错行的 `alloc`：方向上，更正 `delta > 0` 与原行相同、`delta < 0` 与原行相反，冲销与原行相反；来源上，对原批次 / 原账外缺口的增减和退回记 `CORRECTION`（冲销记 `REVERSAL`），追加分配记 `FIFO`，扣回不足的部分记 `SHORTFALL`。
 - **扣回时批次余量不够**（原批次已被后续扣减）：批次扣到 0，不足部分记入账外缺口，返回 `STOCK_SHORTFALL`，界面提示「建议现在盘点该物料」。下一次包含该物料的盘点会清零，不会在盘点差异里重复出现。
 - **退回会使账外缺口大于 0**（原分配含账外缺口，而该缺口已被之后一次观察时点更早的盘点清零，只在 `MOVED_DURING_COUNT` 之后出现）：`409 COUNT_REQUIRED`。先盘点该物料，新盘点的观察时点晚于原行，纠错随后会被吸收。
 
 **数量更正 `QUANTITY_CORRECTED`**：
 
 - `line_ref` 定位原事件中的一行：`lines[i]`（收货、报损）、`consumed[i]`、`output`（生产），`i` 为原数组下标。`item_id` 必须与该行一致，否则 `400 LINE_MISMATCH`。
-- `old_qty` 是该行当前有效数量，`delta = new_qty − old_qty`，`delta ≠ 0`，`new_qty >= 0`。新数量照常带 `input`。
+- `old_qty` 是该行当前有效数量，`delta = new_qty − old_qty`，`delta ≠ 0`，`new_qty >= 0`。原行带 `input` 时（收货、报损），新数量照常带 `input`；生产的行不带。
 - 收货行可同时更正 `line_cost_cents`。生产只更正数量，不更正 `batch_count` 和配方（录错配方要冲销）。
 - 未被吸收的行：
 
@@ -262,11 +265,11 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 
 - Excel / CSV 在**平板浏览器中解析**，转成统一的 JSON 命令提交。Rust 端只处理 JSON，不为 Excel 引入依赖。命令走普通写入管道，幂等规则不变。
 - 营业日取自文件内容，由命令显式给出，不按 `occurred_at` 计算。一个文件只能包含一个营业日。
-- 出现未知 `item_code` 时**整份拒绝**，列出未知编码。前厅现做、不经后厨的商品由「忽略编码清单」过滤，计入 `ignored_rows`。
+- 出现未知 `item_code` 时**整份拒绝**（`400 UNKNOWN_ITEM_CODE`），列出未知编码。前厅现做、不经后厨的商品由「忽略编码清单」过滤，计入 `ignored_rows`。
 - **同一营业日可以重复导入**：每个营业日一个 `SALES_DAY` 聚合，由投影 `sales_days` 映射。第一次导入时生成 UUIDv7，之后每次 version +1；`daily_sales` 以最新版本为准。不需要冲销。
 - **遗漏提醒**：已导入销售但当天没有闭店盘点，或已闭店盘点但当天没有导入销售，界面提示。
 
-**未解释损耗**（按「两次闭店盘点之间」的窗口计算；被吸收的行计入吸收它的那次盘点所在窗口）：
+**未解释损耗**（按物料分窗口计算：窗口的边界是每个营业日该物料最后一次 `CLOSING` 盘点，同一营业日的重盘在同一窗口内；被吸收的行计入吸收它的那次盘点所在窗口）：
 
 ```
 未解释损耗 = −Σ(窗口内 ADJUST 的 qty_delta) + Σ(窗口内被吸收行的 nominal_qty) − Σ(窗口内销售 qty)
@@ -327,7 +330,7 @@ CREATE TABLE inventory_counts (                     -- 每次盘点的每个物�
 CREATE INDEX idx_inventory_counts_item ON inventory_counts(item_id, observed_at);
 ```
 
-- `alloc_source`：新建批次 `NEW_LOT`；扣减 `SPECIFIED` / `FIFO` / `SHORTFALL`；盘点 `COUNT`；数量更正对原批次的增减和退回 `CORRECTION`（追加分配仍记 `FIFO` / `SHORTFALL`）；冲销 `REVERSAL`（扣回不足部分记 `SHORTFALL`）；被吸收 `ABSORBED`。
+- `alloc_source`：新建批次（含盘盈批次）`NEW_LOT`；盘点对已有批次和账外缺口的调整 `COUNT`；被吸收 `ABSORBED`；其余直接取 payload 中 `alloc` 的 `source`。
 - **不变量**（测试和定时自检都检查）：
   - 批次余量 `remaining_qty` = 该批次所有流水的 `qty_delta` 之和；
   - 账外缺口 = 该物料 `lot_id IS NULL` 的流水 `qty_delta` 之和，且 `<= 0`；
