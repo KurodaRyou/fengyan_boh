@@ -64,16 +64,22 @@ occurred_at = recorded_at − lag
 
 ## 主数据
 
-| 实体（聚合类型） | 内容 |
-|---|---|
-| `ITEM` | 物料：`code`、名称、基本单位（`g` / `ml` / `pcs`）、类别（`RAW` / `SEMI` / `FINISHED`）、`default_shelf_life_ms?`；**含单位换算** |
-| `RECIPE` | 配方：`code`、产出物料；**含全部版本**，每个版本有每批产出和每批用料。版本只增不改 |
-| `SUPPLIER` | 供应商 |
-| `EMPLOYEE` | 员工：姓名、角色、启用状态。**不含凭据** |
-| `WASTE_REASON` | 报损原因：`code`、名称。初始化时预置 `EXPIRED`、`DAMAGED`、`PRODUCTION_DEFECT`、`TASTING`、`OTHER` |
-| `EQUIPMENT` | 设备：名称、类型（冷柜 / 烤箱…） |
+| 实体（聚合类型） | 含义 | `snapshot` 字段 |
+|---|---|---|
+| `ITEM` | 物料，**含单位换算** | `code`, `name`, `base_unit`（`g` / `ml` / `pcs`）, `category`（`RAW` / `SEMI` / `FINISHED`）, `default_shelf_life_ms?`, `units[{unit_code, base_qty_per_unit}]`, `active` |
+| `RECIPE` | 配方，**含全部版本**；版本只增不改 | `code`, `name`, `output_item_id`, `versions[{version, output_qty_per_batch, lines[{item_id, qty_per_batch}]}]`, `active` |
+| `SUPPLIER` | 供应商 | `code`, `name`, `active` |
+| `EMPLOYEE` | 员工，**不含凭据** | `name`, `role`（`STAFF` / `MANAGER`）, `active` |
+| `WASTE_REASON` | 报损原因；初始化时预置 `EXPIRED`、`DAMAGED`、`PRODUCTION_DEFECT`、`TASTING`、`OTHER` | `code`, `name`, `active` |
+| `EQUIPMENT` | 需要记录温度的设备 | `name`, `equipment_type`（`FRIDGE` / `FREEZER` / `OVEN` / `PROOFER` / `OTHER`）, `active` |
 
-- 主键一律 UUIDv7。`code` 列唯一、人可读、各门店统一（物料的 `code` 用于销售导入）。
+- 快照是该行变更后的完整内容，不是差量。行的主键是事件的 `aggregate_id`，`revision` 是 `aggregate_version`，都不重复写进快照。`active` 是布尔值。
+- `name` 非空；`code` 非空，在同一实体内唯一。`MANAGER` 是店长，`STAFF` 是普通员工。
+- `units` 不含基本单位：`unit_code` 等于 `base_unit` 时系数恒为 1。`units` 中的 `unit_code` 在同一物料内唯一、不等于 `base_unit`，按 `unit_code` 升序；系数规则见「单位」。
+- `versions` 按 `version` 升序，从 1 连续编号；`output_qty_per_batch`、`qty_per_batch` 是正整数基本单位；同一版本的 `lines` 中 `item_id` 不重复，顺序为录入顺序。
+- 快照字段与枚举随 `MASTER_DATA_CHANGED@1` 冻结，改动按 AGENTS.md「只追加」升 `schema_version`。
+
+- 主键一律 UUIDv7。`code` 人可读、各门店统一（物料的 `code` 用于销售导入）。
 - 每行带 `revision`，每次变更 +1。主数据只停用（`active = 0`），不删除。
 - 每次变更写一条 `MASTER_DATA_CHANGED`：聚合类型是实体名，聚合 ID 是行的主键，`aggregate_version` 是变更后的 `revision`；payload 是 `{entity, source, snapshot}`，`source`（`LOCAL` / `HQ_PACKAGE`）。主数据表是投影，可以从事件流重建。
 - 内容没有变化的变更不写事件（导入主数据包时逐行比对快照）。
