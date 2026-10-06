@@ -71,6 +71,7 @@
 | 测试临时目录 | `tempfile`（仅 dev-dependency） |
 | 时区 / 营业日（待引入） | `jiff` |
 | 员工 PIN 哈希（待引入，认证切片） | `argon2`（Argon2id） |
+| 局域网 HTTPS（待引入，认证切片之前） | `rustls`，接入方式随 `docs/domain.md` Q9 确定 |
 | 上行同步（待实现） | `reqwest` + `rustls`，mTLS |
 
 禁止引入：Redis、消息队列、ORM、微服务、任何需要外部进程的依赖。整个节点是**一个静态链接二进制 + 一个 SQLite 文件**。
@@ -269,7 +270,7 @@ scripts/        CI 扫描脚本。
 
 1. **核心管道**：时钟模块、相对校准、营业日纯函数；`ledger::execute` / `Ledger::append` / `projections::apply` 骨架与 `rebuild-projections`；
    `Readers::call` 包读事务、写线程任务计时；信封加 `warnings`、`Actor` 提取器；`boh_storage::open()` 收口（先由 Claude 以 `spec:` 提交把 schema 测试改用 `boh_storage::testing`）；备份模块与恢复演练测试。
-2. **黄金切片**：温度记录（含设备主数据事件，打通管道、幂等、重放、golden）→ 002：主数据与库存投影表 → 收货 + 报损（FIFO、账外缺口、分配来源、吸收规则、不变量自检）→ 员工认证。
+2. **黄金切片**：温度记录（含设备主数据事件，打通管道、幂等、重放、golden）→ 002：主数据与库存投影表 → 收货 + 报损（FIFO、账外缺口、分配来源、吸收规则、不变量自检）→ 局域网 HTTPS → 员工认证。
 3. **扩展**：生产 → 盘点 → 纠错（冲销、数量更正）→ 补录入口 → 销售导入。每一步配对应的验收用例。
 
 ---
@@ -298,7 +299,7 @@ ARM 门店机改用 `aarch64-unknown-linux-musl`。部署文件见 `deploy/`。
 
 - 下行同步：主数据包的格式、拉取与导入流程（原则已定：总部维护统一的 JSON 主数据包，逐行比对快照，`source = HQ_PACKAGE`）。**总部本期不开发，延后。**
 - 上行同步的实现：总部接收接口、批量大小、mTLS 证书下发与轮换。**延后**；契约见「上行同步」。
-- 局域网 HTTPS 加固。
+- 局域网 HTTPS：证书签发与平板信任方式（见 `docs/domain.md` Q9）。**认证切片的前置条件。**
 - 异地备份复制的实现。
 
 ---
@@ -318,5 +319,6 @@ ARM 门店机改用 `aarch64-unknown-linux-musl`。部署文件见 `deploy/`。
   非测试代码 `unwrap()` / `expect()`、浮点参与业务计算、未经 `checked_*` 的业务算术、新增未在技术栈表登记的依赖。
 - HTTP 响应不符合「HTTP 约定」：信封缺字段、状态码与语义不符、把 SQL 或内部细节返回给客户端。
 - 写命令缺少幂等处理，或缺少重复提交同一 `command_id` 的测试。
+- 认证接口、PIN 或令牌可经明文 HTTP 访问或传输。
 
 `spec:` / `docs:` 提交是设计变更：检查内容是否自洽、是否与 `docs/domain.md` 一致；其中修改已合入的迁移仍按 P0 处理。
