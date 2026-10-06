@@ -1,7 +1,5 @@
 //! 阶段 0.4：锁定终版第 5 节的 001；每项测试注明对应的设计条款。
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
 use std::fmt::Debug;
 
 use boh_storage::rusqlite::{self, Connection, TransactionBehavior, ffi, params};
@@ -86,6 +84,7 @@ impl<'a> Event<'a> {
 }
 
 #[allow(clippy::disallowed_methods)] // 锁定测试经 boh_storage::testing 取得原始连接。
+#[allow(clippy::unwrap_used)] // 测试夹具：建库或迁移失败时测试无法开始，直接终止。
 fn fresh_db() -> (TempDir, Connection) {
     let dir = tempfile::tempdir().unwrap();
     let mut conn = open_writer(&dir.path().join("boh.db")).unwrap();
@@ -108,15 +107,13 @@ fn insert_command(conn: &Connection, command_id: &str, request: &str) -> rusqlit
     )
 }
 
-fn event_seqs(conn: &Connection) -> Vec<i64> {
-    conn.prepare("SELECT seq FROM store_events ORDER BY seq")
-        .unwrap()
-        .query_map([], |row| row.get(0))
-        .unwrap()
-        .collect::<rusqlite::Result<_>>()
-        .unwrap()
+fn event_seqs(conn: &Connection) -> rusqlite::Result<Vec<i64>> {
+    conn.prepare("SELECT seq FROM store_events ORDER BY seq")?
+        .query_map([], |row| row.get(0))?
+        .collect()
 }
 
+#[allow(clippy::expect_used)] // 断言辅助函数：SQL 未被拒绝本身就是断言失败，应直接终止测试。
 fn assert_sqlite_error<T: Debug>(result: rusqlite::Result<T>, extended_code: i32) -> String {
     match result.expect_err("SQL must be rejected") {
         rusqlite::Error::SqliteFailure(error, message) => {
@@ -165,7 +162,7 @@ fn migrate_reaches_latest_and_is_idempotent() {
         )
         .unwrap();
     assert_eq!(stored, (STORE.into(), CMD.into(), EVT.into()));
-    assert_eq!(event_seqs(&conn), [1]);
+    assert_eq!(event_seqs(&conn).unwrap(), [1]);
 }
 
 // 5 + 保留的迁移契约：未知的新版本必须拒绝，不能向下覆盖。
@@ -319,7 +316,7 @@ fn event_command_id_cannot_reference_an_invalid_uuid() {
         event.insert(&tx).unwrap();
         assert_sqlite_error(tx.commit(), ffi::SQLITE_CONSTRAINT_FOREIGNKEY);
     }
-    assert!(event_seqs(&conn).is_empty());
+    assert!(event_seqs(&conn).unwrap().is_empty());
 }
 
 // 5：request 必须是 JSON 对象，数组、标量和非法 JSON 都不能成为规范化请求。
@@ -393,7 +390,7 @@ fn deferred_command_fk_allows_event_before_command() {
     Event::new(EVT).insert(&tx).unwrap();
     insert_command(&tx, CMD, "{}").unwrap();
     tx.commit().unwrap();
-    assert_eq!(event_seqs(&conn), [1]);
+    assert_eq!(event_seqs(&conn).unwrap(), [1]);
 }
 
 // 5 + 附录：命令始终不存在时在提交阶段拒绝，并回滚事件。
@@ -405,10 +402,10 @@ fn deferred_command_fk_rejects_missing_command_at_commit() {
         .unwrap();
     Event::new(EVT).insert(&tx).unwrap();
     assert_sqlite_error(tx.commit(), ffi::SQLITE_CONSTRAINT_FOREIGNKEY);
-    assert!(event_seqs(&conn).is_empty());
+    assert!(event_seqs(&conn).unwrap().is_empty());
     insert_command(&conn, CMD, "{}").unwrap();
     Event::new(EVT).insert(&conn).unwrap();
-    assert_eq!(event_seqs(&conn), [1]);
+    assert_eq!(event_seqs(&conn).unwrap(), [1]);
 }
 
 // 3.1 + 5：省略 seq，由 SQLite 从 1 连续分配。
@@ -419,7 +416,7 @@ fn automatically_assigned_seq_is_contiguous() {
     for id in [EVT, EVT2, EVT3] {
         Event::new(id).insert(&conn).unwrap();
     }
-    assert_eq!(event_seqs(&conn), [1, 2, 3]);
+    assert_eq!(event_seqs(&conn).unwrap(), [1, 2, 3]);
 }
 
 // 3.1 + 附录：包含多个事件的事务回滚后，下一个 seq 仍是已提交的 max + 1。
@@ -433,12 +430,12 @@ fn rolled_back_events_do_not_leave_seq_gaps() {
         .unwrap();
     Event::new(EVT2).insert(&tx).unwrap();
     Event::new(EVT3).insert(&tx).unwrap();
-    assert_eq!(event_seqs(&tx), [1, 2, 3]);
+    assert_eq!(event_seqs(&tx).unwrap(), [1, 2, 3]);
     tx.rollback().unwrap();
-    assert_eq!(event_seqs(&conn), [1]);
+    assert_eq!(event_seqs(&conn).unwrap(), [1]);
     Event::new(EVT2).insert(&conn).unwrap();
     Event::new(EVT3).insert(&conn).unwrap();
-    assert_eq!(event_seqs(&conn), [1, 2, 3]);
+    assert_eq!(event_seqs(&conn).unwrap(), [1, 2, 3]);
 }
 
 // 3.1 + 5 的连续性触发器 + 附录显式 seq = 10 的反例。
@@ -458,10 +455,10 @@ fn explicit_seq_cannot_skip_numbers() {
             conn.execute(sql, params![seq, EVT2]),
             "store_events.seq must be contiguous",
         );
-        assert_eq!(event_seqs(&conn), [1]);
+        assert_eq!(event_seqs(&conn).unwrap(), [1]);
     }
     conn.execute(sql, params![2, EVT2]).unwrap();
-    assert_eq!(event_seqs(&conn), [1, 2]);
+    assert_eq!(event_seqs(&conn).unwrap(), [1, 2]);
 }
 
 // 5：command_id 主键唯一。
@@ -501,7 +498,7 @@ fn duplicate_aggregate_version_is_rejected() {
     event.aggregate_version = 1;
     event.aggregate_type = "OTHER_RECORD";
     event.insert(&conn).unwrap();
-    assert_eq!(event_seqs(&conn), [1, 2, 3]);
+    assert_eq!(event_seqs(&conn).unwrap(), [1, 2, 3]);
 }
 
 // 5：schema_version 和 aggregate_version 都从 1 开始。
@@ -647,5 +644,5 @@ fn store_events_are_append_only() {
         )
         .unwrap();
     assert_eq!(stored, (EVT.into(), r#"{"lines":[]}"#.into()));
-    assert_eq!(event_seqs(&conn), [1]);
+    assert_eq!(event_seqs(&conn).unwrap(), [1]);
 }
