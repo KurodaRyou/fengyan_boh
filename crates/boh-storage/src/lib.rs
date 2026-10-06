@@ -2,8 +2,11 @@
 
 mod connection;
 mod error;
+pub mod ledger;
 mod migrate;
+mod projections;
 mod readers;
+pub mod store;
 mod writer;
 
 pub mod clock;

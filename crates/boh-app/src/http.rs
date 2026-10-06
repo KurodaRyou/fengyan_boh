@@ -1,15 +1,22 @@
 //! 路由与统一响应信封。
 
-use axum::extract::State;
+use axum::extract::rejection::{JsonRejection, PathRejection};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, put};
 use axum::{Json, Router};
 use boh_storage::{StorageError, schema_version};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::AppState;
+use crate::{
+    actor::{Actor, Manager},
+    service,
+};
+use boh_domain::AggregateId;
+use boh_domain::equipment::{CreateEquipment, UpdateEquipment};
 
 /// 所有接口的统一响应格式：`{ "success", "data", "warnings", "error" }`。
 #[derive(Debug, Serialize)]
@@ -61,6 +68,30 @@ impl ApiError {
             details: Map::new(),
         }
     }
+
+    pub fn with_details(mut self, details: Value) -> Self {
+        if let Value::Object(details) = details {
+            self.details = details;
+        }
+        self
+    }
+
+    pub fn validation() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "VALIDATION_FAILED",
+            "invalid request",
+        )
+    }
+
+    pub fn internal(error: impl std::fmt::Display) -> Self {
+        tracing::error!(error = %error, "internal error");
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "internal error",
+        )
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -81,20 +112,65 @@ impl IntoResponse for ApiError {
 
 impl From<StorageError> for ApiError {
     fn from(err: StorageError) -> Self {
-        // 内部细节只进日志，不返回给客户端。
-        tracing::error!(error = %err, "storage error");
-        Self::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "STORAGE_ERROR",
-            "internal storage error",
-        )
+        Self::internal(err)
     }
 }
 
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route(
+            "/api/v1/equipment",
+            get(list_equipment).post(create_equipment),
+        )
+        .route("/api/v1/equipment/{equipment_id}", put(update_equipment))
+        .fallback(route_not_found)
+        .method_not_allowed_fallback(method_not_allowed)
         .with_state(state)
+}
+
+async fn route_not_found() -> ApiError {
+    ApiError::new(StatusCode::NOT_FOUND, "ROUTE_NOT_FOUND", "route not found")
+}
+
+async fn method_not_allowed() -> ApiError {
+    ApiError::new(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "METHOD_NOT_ALLOWED",
+        "method not allowed",
+    )
+}
+
+async fn list_equipment(
+    State(state): State<AppState>,
+    _actor: Actor,
+) -> Result<Json<Envelope<Value>>, ApiError> {
+    Ok(ok(
+        serde_json::json!({ "equipment": service::list(state).await? }),
+    ))
+}
+
+async fn create_equipment(
+    State(state): State<AppState>,
+    Manager(actor): Manager,
+    body: Result<Json<CreateEquipment>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Json(command) = body.map_err(|_| ApiError::validation())?;
+    command.validate().map_err(|_| ApiError::validation())?;
+    Ok(Json(service::create(state, actor, command).await?))
+}
+
+async fn update_equipment(
+    State(state): State<AppState>,
+    Manager(actor): Manager,
+    path: Result<Path<String>, PathRejection>,
+    body: Result<Json<UpdateEquipment>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Path(id) = path.map_err(|_| ApiError::validation())?;
+    let id = AggregateId::parse(&id).map_err(|_| ApiError::validation())?;
+    let Json(command) = body.map_err(|_| ApiError::validation())?;
+    command.validate().map_err(|_| ApiError::validation())?;
+    Ok(Json(service::update(state, actor, id, command).await?))
 }
 
 #[derive(Debug, Serialize)]
@@ -137,7 +213,7 @@ mod tests {
             body,
             serde_json::json!({
                 "success": false, "data": null, "warnings": [],
-                "error": { "code": "STORAGE_ERROR", "message": "internal storage error", "details": {} }
+                "error": { "code": "INTERNAL_ERROR", "message": "internal error", "details": {} }
             })
         );
     }

@@ -22,9 +22,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let config_path = std::env::args()
-        .nth(1)
-        .map_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH), PathBuf::from);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (operation, config_path) = cli(&args)?;
     let text = std::fs::read_to_string(&config_path)
         .with_context(|| format!("read config {}", config_path.display()))?;
     let config =
@@ -39,6 +38,36 @@ async fn main() -> anyhow::Result<()> {
 
     let storage =
         boh_storage::open(&config.db_path, config.reader_pool_size).context("open storage")?;
+    let clock = Clock::system();
+    let store_id = config.store_id;
+    if operation == Operation::Init {
+        let now = clock.now();
+        let result = storage
+            .writer
+            .call(move |tx| boh_storage::store::initialize(tx, store_id, now))
+            .await;
+        storage.writer_handle.shutdown().await?;
+        result.context("initialize store")?;
+        tracing::info!(store_id = %store_id, "store initialized");
+        return Ok(());
+    }
+    let verified = storage
+        .writer
+        .call(move |tx| boh_storage::store::verify(tx, store_id))
+        .await;
+    if let Err(error) = verified {
+        storage.writer_handle.shutdown().await?;
+        return Err(error).context("verify store identity; run init for a new node");
+    }
+    if operation == Operation::Rebuild {
+        let result = storage.writer.rebuild_projections().await;
+        storage.writer_handle.shutdown().await?;
+        tracing::info!(
+            replayed = result.context("rebuild projections")?,
+            "projections rebuilt"
+        );
+        return Ok(());
+    }
 
     let mut sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
     let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
@@ -53,7 +82,10 @@ async fn main() -> anyhow::Result<()> {
     let app = http::router(AppState {
         writer: storage.writer,
         readers: storage.readers,
-        clock: Clock::system(),
+        clock,
+        timezone: config.timezone,
+        business_day_cutoff: config.business_day_cutoff,
+        dev_actor_stub: config.dev_actor_stub,
     });
     let listener = tokio::net::TcpListener::bind(config.listen_addr)
         .await
@@ -68,4 +100,24 @@ async fn main() -> anyhow::Result<()> {
     storage.writer_handle.shutdown().await?;
     tracing::info!("shutdown complete");
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Operation {
+    Serve,
+    Init,
+    Rebuild,
+}
+
+fn cli(args: &[String]) -> anyhow::Result<(Operation, PathBuf)> {
+    let (operation, path) = match args {
+        [] => (Operation::Serve, DEFAULT_CONFIG_PATH),
+        [command] if command == "init" => (Operation::Init, DEFAULT_CONFIG_PATH),
+        [command] if command == "rebuild-projections" => (Operation::Rebuild, DEFAULT_CONFIG_PATH),
+        [path] => (Operation::Serve, path.as_str()),
+        [command, path] if command == "init" => (Operation::Init, path.as_str()),
+        [command, path] if command == "rebuild-projections" => (Operation::Rebuild, path.as_str()),
+        _ => anyhow::bail!("usage: boh-server [init | rebuild-projections] [config file]"),
+    };
+    Ok((operation, PathBuf::from(path)))
 }
