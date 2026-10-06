@@ -85,6 +85,7 @@ occurred_at = recorded_at − lag
 - `code` 和 `ITEM` 的 `base_unit` 创建后不可修改。
   理由：账本数量按基本单位存。
 - 每行带 `revision`，每次变更 +1。主数据只停用（`active = 0`），不删除。
+- HTTP 修改命令携带客户端看到的 `base_revision`，与当前 `revision` 不等时返回 `409 REVISION_CONFLICT`（`details` 为 `{"current_revision": n}`），不写事件或 `processed_commands`。新建命令不带 `base_revision`；主数据包导入按快照逐行比对，不适用此规则。
 - 命令引用已停用的主数据照常受理，停用只在界面上隐藏。
 - 主数据写接口只允许 `MANAGER`。
 - HTTP `EMPLOYEE` 命令新建 `MANAGER`、将 `STAFF` 改为 `MANAGER`，或将停用员工启用且新 `role = MANAGER` 时，首次执行须校验已验证会话所属店长的当前 PIN；条件在同一写事务内按变更前投影和新快照判定，不因 `source = HQ_PACKAGE` 豁免。
@@ -96,7 +97,22 @@ occurred_at = recorded_at − lag
 - **系统操作人**：初始化和主数据包导入在没有登录员工时，`actor_id` 使用保留 ID `00000000-0000-7000-8000-000000000000`。
 - **系统设备**：初始化和没有登录平板的主数据包导入，`device_id` 使用保留 ID `00000000-0000-7000-8000-000000000001`，表示产生事件的本门店节点。该身份不需要设备注册、设备令牌、解锁码或员工会话，不写入设备注册表；事件的 `device_id` 仍为非空 UUIDv7。
 - 两个保留 ID 不得分配给真实员工或注册平板。系统身份只由节点内部的初始化和主数据包导入入口填写，表示事件来源，不授予 HTTP 访问权限。
-- **初始化**：`boh-server init` 写入 `store_meta`，再创建第一个店长账号（在终端输入两次 PIN）和预置主数据；产生的每条 `MASTER_DATA_CHANGED` 都使用上述系统 `actor_id` 和系统 `device_id`，`source = LOCAL`。没有登录平板的总部包导入同样使用这两个系统 ID，`source = HQ_PACKAGE`。启动时配置里的 `store_id` 和 `store_meta` 不一致，拒绝启动。
+- **初始化**：`boh-server init` 写入 `store_meta`，再创建第一个店长账号（在终端输入两次 PIN）和预置主数据；产生的每条 `MASTER_DATA_CHANGED` 都使用上述系统 `actor_id` 和系统 `device_id`，`source = LOCAL`。没有登录平板的总部包导入同样使用这两个系统 ID，`source = HQ_PACKAGE`。启动时 `store_meta` 为空（未初始化）或与配置里的 `store_id` 不一致，拒绝启动。`store_meta` 已存在时 `init` 拒绝执行，不改动任何数据。
+
+### 设备接口
+
+| 方法与路径 | `command_type` | 请求体 | 权限 |
+|---|---|---|---|
+| `POST /api/v1/equipment` | `equipment.create` | `command_id`, `code`, `name`, `equipment_type`, `active` | `MANAGER` |
+| `PUT /api/v1/equipment/{equipment_id}` | `equipment.update` | `command_id`, `base_revision`, `name`, `equipment_type`, `active` | `MANAGER` |
+| `GET /api/v1/equipment` | — | — | 已认证员工 |
+
+- 写命令成功的 `data` 是 `{"equipment": 行}`，行为该命令执行后的 `{equipment_id, code, name, equipment_type, active, revision}`。查询的 `data` 是 `{"equipment": [行…]}`，含停用的设备，按 `code` 的字节序升序。
+- 取值：`code`、`name` 非空，首尾不能有空白字符；`equipment_type` 取「主数据」中的枚举值；`active` 是布尔值；`base_revision` 是正整数。不满足时 `400 VALIDATION_FAILED`。
+- 不带 `captured_at` / `sent_at`：`occurred_at = recorded_at`，`business_date` 由它计算。
+- **新建**：服务端生成 UUIDv7 作为设备 ID，写一条 `aggregate_version = 1` 的 `MASTER_DATA_CHANGED`。`code` 已被其他设备使用（含停用的）：`409 CODE_ALREADY_EXISTS`，`details` 为 `{"code", "equipment_id"}`（已占用该 `code` 的设备）。
+- **修改**：请求体不含 `code`，快照中的 `code` 取当前值。设备不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": "EQUIPMENT", "id"}`。`base_revision` 规则见上。
+  - 新快照与当前快照相同时不写事件，命令照常成功并写入 `processed_commands`，响应为当前行。
 
 ### 员工认证
 
@@ -132,6 +148,9 @@ occurred_at = recorded_at − lag
 - 丢失内存后，登录或自行改 PIN 以新命令登录核实当前 PIN；重新创建重置授权须店长重新登录、校验当前 PIN 并使用新 `command_id`。
 - **传输加密**：设备令牌、PIN、会话令牌、PIN 重置授权只经 HTTPS 传输。局域网 HTTPS（证书方案见 Q9）是认证切片的前置条件；节点未配置 TLS 时不注册认证接口，release 构建启用认证但未配置 TLS 时**拒绝启动**。
 - 认证落地之前，业务切片只依赖 `Actor` 提取器，开发桩同时提供员工 ID 和 `role`。开发桩只在 debug 构建中可用；release 构建配置了开发桩时**拒绝启动**。
+  - 配置项 `dev_actor_stub = true` 时启用，默认 `false`。未启用时没有任何身份来源，业务接口一律 `401 UNAUTHENTICATED`。
+  - 开发桩按请求读取 `X-Dev-Employee-Id`（UUIDv7，作为 `actor_id`）、`X-Dev-Device-Id`（UUIDv7，作为 `device_id`）和 `X-Dev-Role`（`STAFF` / `MANAGER`）。缺少任一个、取值非法或使用保留系统 ID：`401 UNAUTHENTICATED`。
+  - 开发桩不查 `employees` 投影，也不校验设备注册。
 
 ## 单位
 

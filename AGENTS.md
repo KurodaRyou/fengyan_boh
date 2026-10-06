@@ -230,6 +230,7 @@ scripts/        CI 扫描脚本。
   |---|---|
   | `rusqlite::Connection::open*` | `boh-storage/src/connection.rs`、备份模块 |
   | `boh_storage::testing` 中的函数 | 锁定测试及 `spec_support/` |
+  | `boh_app::test_router` | 锁定测试及 `spec_support/` |
   | `std::time::SystemTime::now`、`jiff::Timestamp::now`、`jiff::Zoned::now`、`jiff::tz::TimeZone::system`、`jiff::tz::TimeZone::try_system` | 时钟模块 |
   | `std::thread::sleep` | 无 |
   | `HashMap` / `HashSet`（`boh-domain`） | 无 |
@@ -271,6 +272,12 @@ scripts/        CI 扫描脚本。
 - 错误对象包含 `code`、`message`、`details`；`details` 总是存在，没有明细时为 `{}`。
 - HTTP 状态码要和语义一致：校验失败 400、不存在 404、幂等冲突与业务冲突 409、内部错误 500。`code` 是稳定的大写蛇形字符串，客户端按 `code` 判断，不按 `message`。
 - 通用错误码：结构或取值错误 `400 VALIDATION_FAILED`；引用的实体不存在 `404 REFERENCE_NOT_FOUND`。
+- 其他通用错误码：未匹配的路由 `404 ROUTE_NOT_FOUND`；方法不允许 `405 METHOD_NOT_ALLOWED`；内部错误 `500 INTERNAL_ERROR`；缺少或无效的身份 `401 UNAUTHENTICATED`；角色不够 `403 FORBIDDEN`。
+- 请求体不是合法 JSON、缺少 `Content-Type: application/json`、字段缺失、未知字段、类型或取值不对，以及路径参数无法解析，一律 `400 VALIDATION_FAILED`。
+  - axum 提取器默认返回纯文本的 415 / 422，必须转换成信封。
+- 写命令按以下顺序处理，先命中的结果生效：身份与权限 → 请求结构与取值（反序列化成强类型命令）→ 幂等检查 → 业务校验。被前两步拒绝的请求不做幂等比对。
+- 写命令成功一律 `200`，重试返回的原响应也是 `200`。
+- `409 IDEMPOTENCY_CONFLICT` 的 `details` 是 `{"fields": [...]}`：`command_type` 不同时只列 `"command_type"`；否则列出规范化请求中取值不同或只在一方出现的顶层字段名，按字典序排列。规范化请求包含路径参数（如设备 ID）。
 - 内部错误只记日志，不把 SQL / 内部细节返回给客户端。
 - `/health` 暴露：`clock_regression_ms`（超过 5 分钟为 `degraded`）、`last_backup_ok_at`、`last_backup_seq`、WAL 文件大小、最近一次不变量自检的结果；认证实现后加 `auth_failures_last_hour`；同步实现后加 `max(seq) − acked_seq` 和最后一次成功同步的时间。
   不变量自检由定时任务在读连接上执行，`/health` 只返回最近一次的结果，不现场计算。
@@ -291,9 +298,11 @@ scripts/        CI 扫描脚本。
 
 ### 路线图
 
-1. **Write path 与基础设施**：时钟模块、相对校准、营业日纯函数；`ledger::execute` / `Ledger::append` / `projections::apply` 骨架与 `rebuild-projections`；
-   `Readers::call` 包读事务、写线程任务计时；信封加 `warnings`、`Actor` 提取器；`boh_storage::open()` 收口（先由 Claude 以 `spec:` 提交把 schema 测试改用 `boh_storage::testing`）；备份模块与恢复演练测试。
-2. **Walking skeleton 与首批切片**：温度记录（walking skeleton；含 `EQUIPMENT` 主数据写接口、设备主数据事件和迁移 002：`equipment`、`temperature_readings` 投影表，打通 write path、幂等、重放、golden payload）→ 003：主数据与库存投影表 → 收货 + 报损（FIFO、账外缺口、分配来源、吸收规则、不变量自检）→ 局域网 HTTPS → 员工认证。
+1. **Write path 与基础设施**：时钟模块、相对校准、营业日纯函数；`Readers::call` 包读事务、写线程任务计时；信封加 `warnings`；`boh_storage::open()` 收口。
+2. **Walking skeleton 与首批切片**：
+   设备主数据（walking skeleton：`ledger::execute` / `Ledger::append` / `projections::apply` 骨架与 `rebuild-projections`、`Actor` 开发桩、`boh-server init`、`EQUIPMENT` 写接口、迁移 002：`equipment`；打通 write path、幂等、重放、golden payload）
+   → 温度记录（迁移 003：`temperature_readings`）→ 备份模块与恢复演练测试、`/health` 字段 → 004：其余主数据与库存投影表 → 收货 + 报损（FIFO、账外缺口、分配来源、吸收规则、不变量自检）→ 局域网 HTTPS → 员工认证。
+   - 设备主数据切片的 `init` 只写 `store_meta`；第一个店长和预置报损原因随 004 加入，PIN 步骤随认证切片加入。
 3. **扩展**：生产 → 盘点 → 纠错（冲销、数量更正）→ 补录入口 → 销售导入。每一步配对应的验收用例。
 
 ---

@@ -24,6 +24,7 @@ impl Writer {
         F: FnOnce(&Transaction<'_>) -> Result<T, E> + Send + 'static,
         T: Send + 'static,
         E: From<StorageError> + Send + 'static;
+    pub async fn rebuild_projections(&self) -> Result<u64, StorageError>;
 }
 
 pub struct WriterHandle { /* 私有 */ }
@@ -54,6 +55,9 @@ pub use rusqlite;
 - `open`：打开数据库（不存在则创建）→ 打开唯一写连接 → 在写连接上迁移到 `LATEST_SCHEMA_VERSION`，每个迁移一个事务 → 打开 `reader_pool_size` 个读连接 → 启动 `sqlite-writer` 线程。一个进程对同一数据库只调用一次。
 - 数据库的 `user_version` 高于 `LATEST_SCHEMA_VERSION`：返回 `StorageError::UnsupportedSchemaVersion { found, supported }`，不迁移、不启动写线程，`boh-server` 拒绝启动。
 - `Writer::call`：在写线程上以 `BEGIN IMMEDIATE` 执行 `f`，`Ok` 提交、`Err` 回滚；单个任务超过 50ms 记 `warn`。写线程已停止时返回 `StorageError::WriterClosed`。
+- `Writer::rebuild_projections`：在写线程上的一个写事务中清空全部投影表，再按 `seq` 升序对每个事件调用在线写入使用的同一个 `projections::apply`，提交后返回重放的事件数。失败时回滚，投影不变。
+  - 投影表 = `sqlite_master` 中除 `sqlite_` 开头的内部表、`store_meta`、`processed_commands`、`store_events` 和认证状态表以外的全部表。
+  - `boh-server rebuild-projections <配置文件>` 经 `boh_storage::open()` 调用它，只在服务停止时运行。
 - `WriterHandle::shutdown`：处理完已入队的任务后停止写线程，在写连接上执行 `wal_checkpoint(TRUNCATE)`，然后关闭写连接。
 - `Readers::call`：借出一个只读连接，在一个 DEFERRED 读事务中执行 `f`，`f` 内的读取看到同一个快照；在 `spawn_blocking` 上运行。
 - `StorageError` 的变体由实现决定；锁定测试只依赖 `UnsupportedSchemaVersion { found: i64, supported: i64 }`。
@@ -67,15 +71,17 @@ pub mod testing {
     pub fn open_writer(path: &Path) -> Result<Connection, StorageError>;
     pub fn open_reader(path: &Path) -> Result<Connection, StorageError>;
     pub fn migrate(conn: &mut Connection) -> Result<(), StorageError>;
+    pub fn rebuild_projections(conn: &mut Connection) -> Result<u64, StorageError>;
 }
 ```
 
 - `open_writer`：读写连接（文件不存在则创建），已设好全部 PRAGMA，不迁移。
 - `open_reader`：只读连接，已设好全部 PRAGMA 和 `query_only = ON`。
 - `migrate`：与 `open` 内部相同的迁移。
-- 三个都是转发到 crate 内部函数的独立函数，不用 `pub use`。
+- `rebuild_projections`：在 `conn` 上以 `BEGIN IMMEDIATE` 执行与 `Writer::rebuild_projections` 相同的重建。`conn` 须由 `open_writer` 打开。
+- 这些函数都是转发到 crate 内部函数的独立函数，不用 `pub use`。
   - clippy 按函数定义禁用；重导出会让 crate 内部对原函数的调用也被禁用。
-- 两份 `clippy.toml` 禁用这三个函数，只有锁定测试及 `spec_support/` 可以 `#[allow]`。
+- 两份 `clippy.toml` 禁用这些函数，只有锁定测试及 `spec_support/` 可以 `#[allow]`。
 
 ### 时钟（`boh_storage::clock`）
 
@@ -186,5 +192,15 @@ pub fn test_router(db_path: &Path, clock: Clock) -> Result<Router, StorageError>
 ```
 
 - 在 `db_path` 上调用 `boh_storage::open()`，以 `clock` 作为服务端时钟，构造与生产入口路由相同的 `axum::Router`。
-- 不读环境变量和配置文件，不监听端口；测试直接用这个 `Router` 处理请求。
+- 不读环境变量和配置文件，不监听端口；测试直接用这个 `Router` 处理请求。使用固定的测试配置：
+
+  | 配置项 | 值 |
+  |---|---|
+  | `store_id` | `01890a5d-ac96-774b-bcce-b302099a8050` |
+  | `timezone` | `Asia/Shanghai` |
+  | `business_day_cutoff` | `04:00` |
+  | `dev_actor_stub` | `true`（身份由请求头提供，见 domain.md「员工认证」开发桩） |
+
+- `store_meta` 为空时，用与 `boh-server init` 相同的代码写入上表的 `store_id`，`created_at` 取 `clock.now()`；已存在且 `store_id` 不同时返回 `Err`。
 - 写线程不经 `shutdown`：`Router` 及其全部克隆释放后，写线程自行退出。
+- 两份 `clippy.toml` 禁用 `test_router`，只有锁定测试及 `spec_support/` 可以 `#[allow]`。
