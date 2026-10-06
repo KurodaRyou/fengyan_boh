@@ -174,14 +174,14 @@ occurred_at = recorded_at − lag
 **规则**：写入 e 时，在已入账、覆盖了物料 I、且 o(c) > t(e) 的盘点中，取 o(c) 最早的一次：
 
 ```sql
-SELECT event_seq FROM inventory_counts
-WHERE item_id = ?1 AND observed_at > ?2
-ORDER BY observed_at, event_seq LIMIT 1
+SELECT e.id FROM inventory_counts c JOIN store_events e ON e.seq = c.event_seq
+WHERE c.item_id = ?1 AND c.observed_at > ?2
+ORDER BY c.observed_at, c.event_seq LIMIT 1
 ```
 
 查到时 e 被它吸收：
 
-- `qty_delta = 0`，`absorbed_by_seq = c.seq`，`lot_id = NULL`，`alloc_source = 'ABSORBED'`；
+- `qty_delta = 0`，`absorbed_by_event_id = c 的事件 id`，`lot_id = NULL`，`alloc_source = 'ABSORBED'`；
 - 不分配批次，不新建批次，不改动账外缺口；
 - 事件照常入账，payload 记录 `absorbed_by_event_id`，重放时直接读取，不重新判定；
 - 返回警告 `ABSORBED_BY_COUNT`，列出受影响的物料和对应的盘点。
@@ -301,12 +301,12 @@ CREATE TABLE inventory_movements (                  -- 每条库存影响按批�
                     ('NEW_LOT', 'SPECIFIED', 'FIFO', 'SHORTFALL', 'COUNT', 'CORRECTION', 'REVERSAL', 'ABSORBED')),
     nominal_qty     INTEGER NOT NULL,                -- 按申报内容应有的变动量
     qty_delta       INTEGER NOT NULL,                -- 实际作用于账面的变动量
-    absorbed_by_seq INTEGER REFERENCES store_events(seq),
+    absorbed_by_event_id TEXT REFERENCES store_events(id), -- 直接取自 payload，重放不查其他事件
     physical_at     INTEGER NOT NULL,                -- 实物时点 t(e)
     business_date   TEXT NOT NULL,
     PRIMARY KEY (event_seq, line_no),
-    CHECK ((absorbed_by_seq IS NULL AND qty_delta = nominal_qty)
-        OR (absorbed_by_seq IS NOT NULL AND qty_delta = 0 AND lot_id IS NULL))
+    CHECK ((absorbed_by_event_id IS NULL AND qty_delta = nominal_qty)
+        OR (absorbed_by_event_id IS NOT NULL AND qty_delta = 0 AND lot_id IS NULL))
 ) STRICT;
 
 CREATE TABLE inventory_counts (                     -- 每次盘点的每个物料一行，零差异也写

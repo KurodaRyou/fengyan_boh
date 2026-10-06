@@ -129,6 +129,8 @@ scripts/        CI 扫描脚本。
   - `recursive_triggers` 关闭时，`INSERT OR REPLACE` 会绕过只追加触发器，静默替换账本行。不要关。
 - **只有一个写连接**，由 `sqlite-writer` 线程独占。所有写操作必须走 `Writer::call`。禁止在任何地方另开写连接。
   `open_writer` / `open_reader` / `spawn_writer` 为 `pub(crate)`，对外只暴露 `boh_storage::open()`。
+  - 锁定测试需要的原始连接（已设好 PRAGMA）只经 `#[doc(hidden)] pub mod boh_storage::testing` 提供；
+    `clippy.toml` 的 `disallowed-methods` 禁用 `boh_storage::testing` 中的函数，只有锁定测试可以 `#[allow]`。
 - 写事务一律 `BEGIN IMMEDIATE`（`Writer::call` 已处理）。
 - 读连接 `query_only = ON`，只通过 `Readers::call` 使用；`Readers::call` 内部包一个 DEFERRED 读事务，读事务保持简短。
 - **受控例外：备份连接**。只在备份模块中单独打开一个 `SQLITE_OPEN_READ_ONLY` 连接执行 `VACUUM INTO`，不设 `query_only`，不进读连接池。
@@ -266,7 +268,7 @@ scripts/        CI 扫描脚本。
 ### 路线图
 
 1. **核心管道**：时钟模块、相对校准、营业日纯函数；`ledger::execute` / `Ledger::append` / `projections::apply` 骨架与 `rebuild-projections`；
-   `Readers::call` 包读事务、写线程任务计时；信封加 `warnings`、`Actor` 提取器；`boh_storage::open()` 收口；备份模块与恢复演练测试。
+   `Readers::call` 包读事务、写线程任务计时；信封加 `warnings`、`Actor` 提取器；`boh_storage::open()` 收口（先由 Claude 以 `spec:` 提交把 schema 测试改用 `boh_storage::testing`）；备份模块与恢复演练测试。
 2. **黄金切片**：温度记录（含设备主数据事件，打通管道、幂等、重放、golden）→ 002：主数据与库存投影表 → 收货 + 报损（FIFO、账外缺口、分配来源、吸收规则、不变量自检）→ 员工认证。
 3. **扩展**：生产 → 盘点 → 纠错（冲销、数量更正）→ 补录入口 → 销售导入。每一步配对应的验收用例。
 
