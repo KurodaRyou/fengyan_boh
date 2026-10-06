@@ -1,0 +1,5 @@
+# 生产环境放在 /etc/boh/config.toml
+store_id = "store-001"
+db_path = "/var/lib/boh/boh.db"
+listen_addr = "0.0.0.0:8080"
+reader_pool_size = 4

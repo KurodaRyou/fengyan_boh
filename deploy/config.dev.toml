@@ -1,0 +1,5 @@
+# 本机开发用：cargo run -p boh-server -- deploy/config.dev.toml
+store_id = "store-dev"
+db_path = "boh-dev.db"
+listen_addr = "127.0.0.1:8080"
+reader_pool_size = 2

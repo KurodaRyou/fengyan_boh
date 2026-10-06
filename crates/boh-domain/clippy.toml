@@ -1,0 +1,19 @@
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+
+disallowed-methods = [
+    { path = "rusqlite::Connection::open", reason = "SQLite connections must be opened in boh-storage/src/connection.rs so every connection receives the required PRAGMAs." },
+    { path = "rusqlite::Connection::open_with_flags", reason = "SQLite connections must be opened in boh-storage/src/connection.rs so every connection receives the required PRAGMAs." },
+    { path = "rusqlite::Connection::open_with_flags_and_vfs", reason = "SQLite connections must be opened in boh-storage/src/connection.rs so every connection receives the required PRAGMAs." },
+    { path = "rusqlite::Connection::open_in_memory", reason = "In-memory connections bypass the file-backed WAL setup in boh-storage/src/connection.rs." },
+    { path = "rusqlite::Connection::open_in_memory_with_flags", reason = "In-memory connections bypass the file-backed WAL setup in boh-storage/src/connection.rs." },
+    { path = "rusqlite::Connection::open_in_memory_with_flags_and_vfs", reason = "In-memory connections bypass the file-backed WAL setup in boh-storage/src/connection.rs." },
+    { path = "std::time::SystemTime::now", reason = "System time must be read through the clock module; business code must receive time explicitly." },
+    { path = "std::thread::sleep", reason = "Blocking sleeps can stall the only SQLite writer thread or an async executor thread." },
+]
+
+# Crate-local configuration replaces the root configuration; keep the full copy above.
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "Domain iteration must be deterministic; use BTreeMap instead." },
+    { path = "std::collections::HashSet", reason = "Domain iteration must be deterministic; use BTreeSet instead." },
+]

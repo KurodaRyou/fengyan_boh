@@ -1,0 +1,31 @@
+# /etc/systemd/system/boh.service
+[Unit]
+Description=Fengyan BOH store edge node
+# 只依赖 network.target，不依赖 network-online：断网是正常工作状态
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/boh-server /etc/boh/config.toml
+Environment=RUST_LOG=info
+
+# panic = "abort" 后由 systemd 立即拉起
+Restart=always
+RestartSec=2
+
+# 优雅关闭：SIGTERM → 停 HTTP → 排空写队列 → WAL checkpoint
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# 数据目录 /var/lib/boh，无需手动创建用户
+DynamicUser=yes
+StateDirectory=boh
+StateDirectoryMode=0750
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
