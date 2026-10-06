@@ -3,7 +3,7 @@
 烘焙门店后厨（BOH）系统的门店本地节点。部署在每家门店的一台 Linux 机器上，局域网内的平板通过浏览器（门店节点托管的 Web SPA）访问。
 **断网是常态，不是异常**：所有门店内核心操作必须在完全离线时正常工作，联网后再把事件同步到总部。
 
-业务决策、事件目录与领域规则见 [docs/domain.md](docs/domain.md)；系统依赖的门店操作规范见 [docs/sop.md](docs/sop.md)。
+业务决策、事件目录与领域规则见 [docs/domain.md](docs/domain.md)；系统依赖的门店操作规范见 [docs/sop.md](docs/sop.md)；规范用词见 [docs/glossary.md](docs/glossary.md)。
 
 本文件是所有编码 agent（Codex、Antigravity、Claude Code 等）共用的项目规则。
 
@@ -291,9 +291,9 @@ scripts/        CI 扫描脚本。
 
 ### 路线图
 
-1. **核心管道**：时钟模块、相对校准、营业日纯函数；`ledger::execute` / `Ledger::append` / `projections::apply` 骨架与 `rebuild-projections`；
+1. **Write path 与基础设施**：时钟模块、相对校准、营业日纯函数；`ledger::execute` / `Ledger::append` / `projections::apply` 骨架与 `rebuild-projections`；
    `Readers::call` 包读事务、写线程任务计时；信封加 `warnings`、`Actor` 提取器；`boh_storage::open()` 收口（先由 Claude 以 `spec:` 提交把 schema 测试改用 `boh_storage::testing`）；备份模块与恢复演练测试。
-2. **黄金切片**：温度记录（含 `EQUIPMENT` 主数据写接口、设备主数据事件和迁移 002：`equipment`、`temperature_readings` 投影表，打通管道、幂等、重放、golden）→ 003：主数据与库存投影表 → 收货 + 报损（FIFO、账外缺口、分配来源、吸收规则、不变量自检）→ 局域网 HTTPS → 员工认证。
+2. **Walking skeleton 与首批切片**：温度记录（walking skeleton；含 `EQUIPMENT` 主数据写接口、设备主数据事件和迁移 002：`equipment`、`temperature_readings` 投影表，打通 write path、幂等、重放、golden payload）→ 003：主数据与库存投影表 → 收货 + 报损（FIFO、账外缺口、分配来源、吸收规则、不变量自检）→ 局域网 HTTPS → 员工认证。
 3. **扩展**：生产 → 盘点 → 纠错（冲销、数量更正）→ 补录入口 → 销售导入。每一步配对应的验收用例。
 
 ---

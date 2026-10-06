@@ -1,6 +1,6 @@
 # BOH 领域模型
 
-本文件定义业务决策、事件目录、投影与业务规则。工程规则见 [AGENTS.md](../AGENTS.md)，门店操作规范见 [sop.md](sop.md)。
+本文件定义业务决策、事件目录、投影与业务规则。工程规则见 [AGENTS.md](../AGENTS.md)，门店操作规范见 [sop.md](sop.md)，规范用词见 [glossary.md](glossary.md)。
 实现落地后，字段与表结构以代码为准（`boh-domain` 结构体、迁移 SQL），本文件只保留语义与不变量。
 「待确认问题」中的条目，确认前不要实现依赖它的部分。
 
@@ -316,7 +316,7 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
   | `qty` | 整数 | 售出数量，基本单位；退货为负 |
   | `amount_cents` | 整数 | 实收金额，单位分 |
 
-- Excel / CSV 在**平板浏览器中解析**，转成统一的 JSON 命令提交。Rust 端只处理 JSON，不为 Excel 引入依赖。命令走普通写入管道，幂等规则不变。
+- Excel / CSV 在**平板浏览器中解析**，转成统一的 JSON 命令提交。Rust 端只处理 JSON，不为 Excel 引入依赖。命令走普通的 write path，幂等规则不变。
 - 营业日取自文件内容，由命令显式给出，不按 `occurred_at` 计算。一个文件只能包含一个营业日。
 - 出现未知 `item_code` 时**整份拒绝**（`400 UNKNOWN_ITEM_CODE`），列出未知编码。前厅现做、不经后厨的商品由「忽略编码清单」过滤，计入 `ignored_rows`。
 - **同一营业日可以重复导入**：每个营业日一个 `SALES_DAY` 聚合，由投影 `sales_days` 映射。第一次导入时生成 UUIDv7，之后每次 version +1；`daily_sales` 以最新版本为准。不需要冲销。
