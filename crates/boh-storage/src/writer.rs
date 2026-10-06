@@ -61,6 +61,10 @@ fn run(mut conn: Connection, mut rx: mpsc::Receiver<Msg>) -> Result<(), StorageE
 }
 
 impl Writer {
+    pub async fn rebuild_projections(&self) -> Result<u64, StorageError> {
+        self.call(crate::projections::rebuild).await
+    }
+
     /// 在写入线程上用 `BEGIN IMMEDIATE` 事务执行 `f`。
     /// `f` 返回 `Ok` 时提交，返回 `Err` 时回滚。
     ///

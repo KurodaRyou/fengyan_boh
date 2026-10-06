@@ -20,6 +20,8 @@ pub(crate) struct Config {
     pub business_day_cutoff: BusinessDayCutoff,
     #[serde(default = "default_reader_pool_size")]
     pub reader_pool_size: NonZeroUsize,
+    #[serde(default)]
+    pub dev_actor_stub: bool,
 }
 
 fn default_reader_pool_size() -> NonZeroUsize {
@@ -37,7 +39,13 @@ fn business_day_cutoff<'de, D: Deserializer<'de>>(de: D) -> Result<BusinessDayCu
 }
 
 pub(crate) fn parse_config(text: &str) -> Result<Config, toml::de::Error> {
-    toml::from_str(text)
+    let config: Config = toml::from_str(text)?;
+    if config.dev_actor_stub && !cfg!(debug_assertions) {
+        return Err(<toml::de::Error as serde::de::Error>::custom(
+            "dev_actor_stub is unavailable in release builds",
+        ));
+    }
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -101,5 +109,14 @@ business_day_cutoff = "04:00"
     #[test]
     fn rejects_unknown_fields() {
         assert!(parse_config(&format!("{VALID}\nunknown = true")).is_err());
+    }
+
+    #[test]
+    fn dev_actor_stub_defaults_to_disabled_and_is_debug_only() {
+        assert!(!parse_config(VALID).unwrap().dev_actor_stub);
+        assert_eq!(
+            parse_config(&format!("{VALID}\ndev_actor_stub = true")).is_ok(),
+            cfg!(debug_assertions)
+        );
     }
 }

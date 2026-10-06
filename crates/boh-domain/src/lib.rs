@@ -7,12 +7,15 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub mod equipment;
 pub mod time;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DomainError {
     #[error("invalid UUIDv7: {0}")]
     InvalidId(String),
+    #[error("invalid value for {0}")]
+    InvalidField(&'static str),
 }
 
 /// UTC Unix 毫秒时间戳。
@@ -29,8 +32,19 @@ macro_rules! uuid_v7_id {
         pub struct $name(Uuid);
 
         impl $name {
+            /// Pure UUIDv7 construction: the caller supplies time and entropy.
+            pub fn from_parts(time: UnixMillis, entropy: [u8; 10]) -> Result<Self, DomainError> {
+                // UUID timestamps are unsigned; pre-epoch clocks use epoch for the ID only.
+                let millis = u64::try_from(time.0.max(0))
+                    .map_err(|_| DomainError::InvalidField("id_timestamp"))?;
+                if millis > 0xffff_ffff_ffff {
+                    return Err(DomainError::InvalidField("id_timestamp"));
+                }
+                Ok(Self(uuid::Builder::from_unix_timestamp_millis(millis, &entropy).into_uuid()))
+            }
+
             pub fn from_uuid(id: Uuid) -> Result<Self, DomainError> {
-                if id.get_version_num() == 7 {
+                if id.get_version_num() == 7 && id.get_variant() == uuid::Variant::RFC4122 {
                     Ok(Self(id))
                 } else {
                     Err(DomainError::InvalidId(id.to_string()))
@@ -103,6 +117,22 @@ mod tests {
     fn rejects_non_v7_and_garbage() {
         assert!(CommandId::parse(V4).is_err());
         assert!(CommandId::parse("not-a-uuid").is_err());
+        assert!(CommandId::parse("01890a5d-ac96-774b-0cce-b302099a8057").is_err());
+    }
+
+    #[test]
+    fn builds_ids_from_explicit_time_and_entropy() {
+        let first = EventId::from_parts(UnixMillis(1_791_248_400_000), [1; 10]).unwrap();
+        let second = EventId::from_parts(UnixMillis(1_791_248_400_000), [2; 10]).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(first.as_uuid().get_version_num(), 7);
+        assert_eq!(first.as_uuid().get_variant(), uuid::Variant::RFC4122);
+        assert_eq!(
+            first.as_uuid().get_timestamp().unwrap().to_unix().0,
+            1_791_248_400
+        );
+        assert!(EventId::from_parts(UnixMillis(-1), [0; 10]).is_ok());
+        assert!(EventId::from_parts(UnixMillis(i64::MAX), [0; 10]).is_err());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! 阶段 0.4：锁定终版第 5 节的 001；每项测试注明对应的设计条款。
+//! 锁定迁移 001、002 的表结构；每项测试注明对应的规则（AGENTS.md / docs/domain.md）或迁移文件。
 
 use std::fmt::Debug;
 
@@ -9,6 +9,8 @@ use tempfile::TempDir;
 
 const MIGRATION_001: &str = include_str!("../../../migrations/001_initial_schema.sql");
 const MIGRATION_001_FNV1A_64: u64 = 0xfdd0_ce57_922a_6b5f;
+const MIGRATION_002: &str = include_str!("../../../migrations/002_equipment.sql");
+const MIGRATION_002_FNV1A_64: u64 = 0x5b5d_70a4_7c72_9418;
 const STORE: &str = "01890a5d-ac96-774b-bcce-b302099a8050";
 const ACTOR: &str = "01890a5d-ac96-774b-bcce-b302099a8051";
 const CMD: &str = "01890a5d-ac96-774b-bcce-b302099a8057";
@@ -16,6 +18,15 @@ const EVT: &str = "01890a5d-ac96-774b-bcce-b302099a8058";
 const EVT2: &str = "01890a5d-ac96-774b-bcce-b302099a8059";
 const EVT3: &str = "01890a5d-ac96-774b-bcce-b302099a805a";
 const TS: i64 = 1_791_158_400_000;
+const EQUIPMENT_TYPES: [&str; 7] = [
+    "FRIDGE",
+    "FREEZER",
+    "BLAST_FREEZER",
+    "OVEN",
+    "PROOFER",
+    "MIXER",
+    "OTHER",
+];
 const INVALID_IDS: [&str; 4] = [
     "01890a5d-ac96-474b-bcce-b302099a8057",  // v4
     "01890A5D-AC96-774B-BCCE-B302099A8057",  // 大写
@@ -131,18 +142,31 @@ fn assert_trigger_reject<T: Debug>(result: rusqlite::Result<T>, message: &str) {
     );
 }
 
-// 4.2「迁移不可修改」：按 UTF-8 原始字节锁定第 5 节完整 SQL（包括注释）。
-#[test]
-fn migration_001_matches_frozen_checksum() {
-    let hash = MIGRATION_001
-        .bytes()
-        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
-        });
-    assert_eq!(hash, MIGRATION_001_FNV1A_64);
+fn fnv1a_64(text: &str) -> u64 {
+    text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
-// 5 + 保留的迁移契约：重复执行迁移不改变版本，也不丢失已有数据。
+// AGENTS「迁移」不可修改：按 UTF-8 原始字节锁定 001 完整 SQL（包括注释）。
+#[test]
+fn migration_001_matches_frozen_checksum() {
+    assert_eq!(fnv1a_64(MIGRATION_001), MIGRATION_001_FNV1A_64);
+}
+
+// AGENTS「迁移」不可修改：按 UTF-8 原始字节锁定 002 完整 SQL（包括注释）。
+#[test]
+fn migration_002_matches_frozen_checksum() {
+    assert_eq!(fnv1a_64(MIGRATION_002), MIGRATION_002_FNV1A_64);
+}
+
+// AGENTS「迁移」：程序支持的版本就是已锁定迁移文件的个数。
+#[test]
+fn latest_schema_version_counts_locked_migrations() {
+    assert_eq!(LATEST_SCHEMA_VERSION, 2);
+}
+
+// AGENTS「迁移」：重复执行迁移不改变版本，也不丢失已有数据。
 #[test]
 #[allow(clippy::disallowed_methods)] // 锁定测试经 boh_storage::testing 取得原始连接。
 fn migrate_reaches_latest_and_is_idempotent() {
@@ -165,7 +189,7 @@ fn migrate_reaches_latest_and_is_idempotent() {
     assert_eq!(event_seqs(&conn).unwrap(), [1]);
 }
 
-// 5 + 保留的迁移契约：未知的新版本必须拒绝，不能向下覆盖。
+// AGENTS「迁移」：数据库版本高于程序支持的版本时拒绝，不能向下覆盖。
 #[test]
 #[allow(clippy::disallowed_methods)] // 锁定测试经 boh_storage::testing 取得原始连接。
 fn refuses_schema_newer_than_binary() {
@@ -180,7 +204,7 @@ fn refuses_schema_newer_than_binary() {
     assert_eq!(schema_version(&conn).unwrap(), future);
 }
 
-// 4.2「禁止用 REPLACE 绕过触发器」：写、读连接都启用 recursive_triggers。
+// AGENTS「SQLite」：写、读连接都设置规定的 PRAGMA；recursive_triggers 防止 REPLACE 绕过触发器。
 #[test]
 #[allow(clippy::disallowed_methods)] // 锁定测试经 boh_storage::testing 取得原始连接。
 fn writer_and_reader_apply_required_pragmas() {
@@ -206,7 +230,7 @@ fn writer_and_reader_apply_required_pragmas() {
     }
 }
 
-// 5「门店身份（单行）」：唯一可用的 id 为 1。
+// 001「门店身份（单行）」：唯一可用的 id 为 1。
 #[test]
 fn store_meta_accepts_only_id_one() {
     let (_dir, conn) = fresh_db();
@@ -216,7 +240,7 @@ fn store_meta_accepts_only_id_one() {
     insert_meta(&conn, 1, STORE).unwrap();
 }
 
-// 5 + 附录「store_meta 写入第二行」：显式重复键和自动分配第二行都被拒绝。
+// 001「门店身份（单行）」：显式重复键和自动分配第二行都被拒绝。
 #[test]
 fn store_meta_rejects_a_second_row() {
     let (_dir, conn) = fresh_db();
@@ -238,7 +262,7 @@ fn store_meta_rejects_a_second_row() {
     assert_eq!(count, 1);
 }
 
-// 5 的 store_meta 保护触发器；4.2 和附录的 REPLACE 防绕过要求。
+// AGENTS「只追加」：store_meta 禁止修改和删除，REPLACE / UPSERT 也被触发器拒绝。
 #[test]
 fn store_meta_is_immutable() {
     let (_dir, conn) = fresh_db();
@@ -260,7 +284,7 @@ fn store_meta_is_immutable() {
     }
 }
 
-// 5 的 store_id UUIDv7 CHECK。
+// AGENTS「ID 与时间」：store_id 是 UUIDv7。
 #[test]
 fn store_id_rejects_v4_uppercase_and_wrong_length() {
     let (_dir, conn) = fresh_db();
@@ -270,7 +294,7 @@ fn store_id_rejects_v4_uppercase_and_wrong_length() {
     insert_meta(&conn, 1, STORE).unwrap();
 }
 
-// 5 的 processed_commands.command_id UUIDv7 CHECK。
+// AGENTS「ID 与时间」：processed_commands.command_id 是 UUIDv7。
 #[test]
 fn command_id_rejects_v4_uppercase_and_wrong_length() {
     let (_dir, conn) = fresh_db();
@@ -283,7 +307,7 @@ fn command_id_rejects_v4_uppercase_and_wrong_length() {
     insert_command(&conn, CMD, "{}").unwrap();
 }
 
-// 5 的 store_events.id / aggregate_id / actor_id UUIDv7 CHECK。
+// AGENTS「ID 与时间」：store_events.id / aggregate_id / actor_id 是 UUIDv7。
 #[test]
 fn event_uuid_columns_reject_v4_uppercase_and_wrong_length() {
     let (_dir, conn) = fresh_db();
@@ -303,7 +327,7 @@ fn event_uuid_columns_reject_v4_uppercase_and_wrong_length() {
     Event::new(EVT).insert(&conn).unwrap();
 }
 
-// 5：事件的 command_id 通过延迟外键引用已经校验 UUIDv7 的命令键。
+// 001：事件的 command_id 通过延迟外键引用已经校验 UUIDv7 的命令键。
 #[test]
 fn event_command_id_cannot_reference_an_invalid_uuid() {
     let (_dir, mut conn) = fresh_db();
@@ -319,7 +343,7 @@ fn event_command_id_cannot_reference_an_invalid_uuid() {
     assert!(event_seqs(&conn).unwrap().is_empty());
 }
 
-// 5：request 必须是 JSON 对象，数组、标量和非法 JSON 都不能成为规范化请求。
+// AGENTS「幂等」：规范化请求必须是 JSON 对象，数组、标量和非法 JSON 都被拒绝。
 #[test]
 fn request_must_be_a_json_object() {
     let (_dir, conn) = fresh_db();
@@ -333,7 +357,7 @@ fn request_must_be_a_json_object() {
     insert_command(&conn, CMD, r#"{"lines":[]}"#).unwrap();
 }
 
-// 5：payload 必须是 JSON 对象；附录记录数组 payload 被拒绝。
+// 001：payload 必须是 JSON 对象，数组、标量和非法 JSON 都被拒绝。
 #[test]
 fn payload_must_be_a_json_object() {
     let (_dir, conn) = fresh_db();
@@ -349,7 +373,7 @@ fn payload_must_be_a_json_object() {
     event.insert(&conn).unwrap();
 }
 
-// 5：response 的 JSON 有效性约束。
+// 001：response 必须是有效 JSON。
 #[test]
 fn response_must_be_valid_json() {
     let (_dir, conn) = fresh_db();
@@ -360,7 +384,7 @@ fn response_must_be_valid_json() {
     ), ffi::SQLITE_CONSTRAINT_CHECK);
 }
 
-// 5 + 附录：营业日必须格式正确且真实存在；非法日期不能因 NULL 而绕过 CHECK。
+// AGENTS「ID 与时间」：营业日是 'YYYY-MM-DD' 且真实存在；非法日期不能因 NULL 而绕过 CHECK。
 #[test]
 fn business_date_must_be_a_real_iso_date() {
     let (_dir, conn) = fresh_db();
@@ -380,7 +404,7 @@ fn business_date_must_be_a_real_iso_date() {
     event.insert(&conn).unwrap();
 }
 
-// 5「DEFERRABLE INITIALLY DEFERRED」：同一事务允许先事件、后命令。
+// 001「DEFERRABLE INITIALLY DEFERRED」：同一事务允许先事件、后命令。
 #[test]
 fn deferred_command_fk_allows_event_before_command() {
     let (_dir, mut conn) = fresh_db();
@@ -393,7 +417,7 @@ fn deferred_command_fk_allows_event_before_command() {
     assert_eq!(event_seqs(&conn).unwrap(), [1]);
 }
 
-// 5 + 附录：命令始终不存在时在提交阶段拒绝，并回滚事件。
+// 001：命令始终不存在时在提交阶段拒绝，并回滚事件。
 #[test]
 fn deferred_command_fk_rejects_missing_command_at_commit() {
     let (_dir, mut conn) = fresh_db();
@@ -408,7 +432,7 @@ fn deferred_command_fk_rejects_missing_command_at_commit() {
     assert_eq!(event_seqs(&conn).unwrap(), [1]);
 }
 
-// 3.1 + 5：省略 seq，由 SQLite 从 1 连续分配。
+// AGENTS「只追加」：省略 seq，由 SQLite 从 1 连续分配。
 #[test]
 fn automatically_assigned_seq_is_contiguous() {
     let (_dir, conn) = fresh_db();
@@ -419,7 +443,7 @@ fn automatically_assigned_seq_is_contiguous() {
     assert_eq!(event_seqs(&conn).unwrap(), [1, 2, 3]);
 }
 
-// 3.1 + 附录：包含多个事件的事务回滚后，下一个 seq 仍是已提交的 max + 1。
+// AGENTS「只追加」：包含多个事件的事务回滚后，下一个 seq 仍是已提交的 max + 1。
 #[test]
 fn rolled_back_events_do_not_leave_seq_gaps() {
     let (_dir, mut conn) = fresh_db();
@@ -438,7 +462,7 @@ fn rolled_back_events_do_not_leave_seq_gaps() {
     assert_eq!(event_seqs(&conn).unwrap(), [1, 2, 3]);
 }
 
-// 3.1 + 5 的连续性触发器 + 附录显式 seq = 10 的反例。
+// AGENTS「只追加」：连续性触发器拒绝跳号的显式 seq（含 seq = 10）。
 #[test]
 fn explicit_seq_cannot_skip_numbers() {
     let (_dir, conn) = fresh_db();
@@ -461,7 +485,7 @@ fn explicit_seq_cannot_skip_numbers() {
     assert_eq!(event_seqs(&conn).unwrap(), [1, 2]);
 }
 
-// 5：command_id 主键唯一。
+// AGENTS「幂等」：command_id 主键唯一。
 #[test]
 fn duplicate_command_id_is_rejected() {
     let (_dir, conn) = fresh_db();
@@ -472,7 +496,7 @@ fn duplicate_command_id_is_rejected() {
     );
 }
 
-// 5：外部事件 id 唯一，不能因采用 seq 主键而失去 UUID 去重约束。
+// 001：外部事件 id 唯一，不能因采用 seq 主键而失去 UUID 去重约束。
 #[test]
 fn duplicate_event_id_is_rejected() {
     let (_dir, conn) = fresh_db();
@@ -483,7 +507,7 @@ fn duplicate_event_id_is_rejected() {
     assert_sqlite_error(duplicate.insert(&conn), ffi::SQLITE_CONSTRAINT_UNIQUE);
 }
 
-// 5：UNIQUE(aggregate_type, aggregate_id, aggregate_version) 三列共同生效。
+// 001：UNIQUE(aggregate_type, aggregate_id, aggregate_version) 三列共同生效。
 #[test]
 fn duplicate_aggregate_version_is_rejected() {
     let (_dir, conn) = fresh_db();
@@ -501,7 +525,7 @@ fn duplicate_aggregate_version_is_rejected() {
     assert_eq!(event_seqs(&conn).unwrap(), [1, 2, 3]);
 }
 
-// 5：schema_version 和 aggregate_version 都从 1 开始。
+// 001：schema_version 和 aggregate_version 都从 1 开始。
 #[test]
 fn event_versions_must_be_positive() {
     let (_dir, conn) = fresh_db();
@@ -516,7 +540,7 @@ fn event_versions_must_be_positive() {
     }
 }
 
-// 5 的三张 STRICT 表：非数字文本不能存入各自的 INTEGER 时间列。
+// AGENTS「SQLite」所有表用 STRICT：非数字文本不能存入 001 三张表的 INTEGER 时间列。
 #[test]
 fn strict_tables_reject_text_in_integer_columns() {
     let (_dir, conn) = fresh_db();
@@ -562,7 +586,7 @@ fn strict_tables_reject_text_in_integer_columns() {
     }
 }
 
-// 4.2 + 5 + 附录：UPDATE / DELETE / REPLACE / UPSERT 都必须由账本触发器拒绝。
+// AGENTS「只追加」：UPDATE / DELETE / REPLACE / UPSERT 都必须由触发器拒绝。
 #[test]
 fn processed_commands_are_append_only() {
     let (_dir, conn) = fresh_db();
@@ -591,7 +615,7 @@ fn processed_commands_are_append_only() {
     }
 }
 
-// 4.2 + 5 + 附录：覆盖 seq、事件 id 和聚合版本三个冲突入口，避免只测到唯一约束。
+// AGENTS「只追加」：覆盖 seq、事件 id 和聚合版本三个冲突入口，避免只测到唯一约束。
 #[test]
 fn store_events_are_append_only() {
     let (_dir, conn) = fresh_db();
@@ -645,4 +669,162 @@ fn store_events_are_append_only() {
         .unwrap();
     assert_eq!(stored, (EVT.into(), r#"{"lines":[]}"#.into()));
     assert_eq!(event_seqs(&conn).unwrap(), [1]);
+}
+
+fn insert_equipment(
+    conn: &Connection,
+    id: &str,
+    code: &str,
+    name: &str,
+    equipment_type: &str,
+    active: i64,
+    revision: i64,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "INSERT INTO equipment (id, code, name, equipment_type, active, revision)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![id, code, name, equipment_type, active, revision],
+    )
+}
+
+// AGENTS「迁移」：已有 001 数据的库升级到最新版本，数据不丢失，新表为空。
+#[test]
+#[allow(clippy::disallowed_methods)] // 锁定测试经 boh_storage::testing 取得原始连接。
+fn upgrades_a_version_1_database_without_losing_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut conn = open_writer(&dir.path().join("boh.db")).unwrap();
+    conn.execute_batch(MIGRATION_001).unwrap();
+    conn.pragma_update(None, "user_version", 1).unwrap();
+    insert_meta(&conn, 1, STORE).unwrap();
+    insert_command(&conn, CMD, "{}").unwrap();
+    Event::new(EVT).insert(&conn).unwrap();
+
+    migrate(&mut conn).unwrap();
+
+    assert_eq!(schema_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
+    assert_eq!(event_seqs(&conn).unwrap(), [1]);
+    let counts: (i64, i64, i64) = conn
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM store_meta), (SELECT COUNT(*) FROM processed_commands),
+                    (SELECT COUNT(*) FROM equipment)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(counts, (1, 1, 0));
+}
+
+// 002 + AGENTS「ID 与时间」：设备主键是 UUIDv7。
+#[test]
+fn equipment_id_rejects_v4_uppercase_and_wrong_length() {
+    let (_dir, conn) = fresh_db();
+    for invalid in INVALID_IDS {
+        assert_sqlite_error(
+            insert_equipment(&conn, invalid, "F1", "Walk-in", "FRIDGE", 1, 1),
+            ffi::SQLITE_CONSTRAINT_CHECK,
+        );
+    }
+    insert_equipment(&conn, EVT, "F1", "Walk-in", "FRIDGE", 1, 1).unwrap();
+}
+
+// domain「主数据」：code 在同一实体内唯一，停用的设备也占用 code。
+#[test]
+fn equipment_code_is_unique() {
+    let (_dir, conn) = fresh_db();
+    insert_equipment(&conn, EVT, "F1", "Walk-in", "FRIDGE", 0, 1).unwrap();
+    assert_sqlite_error(
+        insert_equipment(&conn, EVT2, "F1", "Reach-in", "FREEZER", 1, 1),
+        ffi::SQLITE_CONSTRAINT_UNIQUE,
+    );
+    insert_equipment(&conn, EVT2, "F2", "Reach-in", "FREEZER", 1, 1).unwrap();
+}
+
+// domain「主数据」：code、name 非空。
+#[test]
+fn equipment_code_and_name_must_be_non_empty() {
+    let (_dir, conn) = fresh_db();
+    assert_sqlite_error(
+        insert_equipment(&conn, EVT, "", "Walk-in", "FRIDGE", 1, 1),
+        ffi::SQLITE_CONSTRAINT_CHECK,
+    );
+    assert_sqlite_error(
+        insert_equipment(&conn, EVT, "F1", "", "FRIDGE", 1, 1),
+        ffi::SQLITE_CONSTRAINT_CHECK,
+    );
+    insert_equipment(&conn, EVT, "F1", "Walk-in", "FRIDGE", 1, 1).unwrap();
+}
+
+// domain「主数据」EQUIPMENT 的 equipment_type 枚举：全部取值可用，其他取值（含小写）被拒绝。
+#[test]
+fn equipment_type_must_be_a_known_value() {
+    let (_dir, conn) = fresh_db();
+    for invalid in ["fridge", "COOLER", ""] {
+        assert_sqlite_error(
+            insert_equipment(&conn, EVT, "X", "X", invalid, 1, 1),
+            ffi::SQLITE_CONSTRAINT_CHECK,
+        );
+    }
+    let ids = [
+        "01890a5d-ac96-774b-bcce-b302099a8060",
+        "01890a5d-ac96-774b-bcce-b302099a8061",
+        "01890a5d-ac96-774b-bcce-b302099a8062",
+        "01890a5d-ac96-774b-bcce-b302099a8063",
+        "01890a5d-ac96-774b-bcce-b302099a8064",
+        "01890a5d-ac96-774b-bcce-b302099a8065",
+        "01890a5d-ac96-774b-bcce-b302099a8066",
+    ];
+    for (id, equipment_type) in ids.into_iter().zip(EQUIPMENT_TYPES) {
+        insert_equipment(&conn, id, equipment_type, "X", equipment_type, 1, 1).unwrap();
+    }
+}
+
+// domain「主数据」：active 是布尔值（0 / 1），revision 从 1 开始。
+#[test]
+fn equipment_active_is_boolean_and_revision_is_positive() {
+    let (_dir, conn) = fresh_db();
+    for active in [-1, 2] {
+        assert_sqlite_error(
+            insert_equipment(&conn, EVT, "F1", "Walk-in", "FRIDGE", active, 1),
+            ffi::SQLITE_CONSTRAINT_CHECK,
+        );
+    }
+    for revision in [-1, 0] {
+        assert_sqlite_error(
+            insert_equipment(&conn, EVT, "F1", "Walk-in", "FRIDGE", 1, revision),
+            ffi::SQLITE_CONSTRAINT_CHECK,
+        );
+    }
+    insert_equipment(&conn, EVT, "F1", "Walk-in", "FRIDGE", 0, 1).unwrap();
+}
+
+// AGENTS「SQLite」所有表用 STRICT：equipment 的 INTEGER 列不接受文本。
+#[test]
+fn equipment_is_strict() {
+    let (_dir, conn) = fresh_db();
+    for (active, revision) in [("'true'", "1"), ("1", "'one'")] {
+        assert_sqlite_error(
+            conn.execute(
+                &format!(
+                    "INSERT INTO equipment (id, code, name, equipment_type, active, revision)
+                     VALUES (?1, 'F1', 'Walk-in', 'FRIDGE', {active}, {revision})"
+                ),
+                params![EVT],
+            ),
+            ffi::SQLITE_CONSTRAINT_DATATYPE,
+        );
+    }
+}
+
+// AGENTS「只追加」：equipment 是投影，不是账本；重建时必须能清空并重写，所以没有只追加触发器。
+#[test]
+fn equipment_projection_can_be_cleared_and_rewritten() {
+    let (_dir, conn) = fresh_db();
+    insert_equipment(&conn, EVT, "F1", "Walk-in", "FRIDGE", 1, 1).unwrap();
+    conn.execute(
+        "UPDATE equipment SET name = 'Walk-in 2', revision = 2 WHERE id = ?1",
+        params![EVT],
+    )
+    .unwrap();
+    assert_eq!(conn.execute("DELETE FROM equipment", []).unwrap(), 1);
+    insert_equipment(&conn, EVT, "F1", "Walk-in", "FRIDGE", 1, 1).unwrap();
 }

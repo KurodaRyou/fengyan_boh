@@ -4,7 +4,10 @@ use crate::StorageError;
 
 /// 按顺序排列的迁移，下标 + 1 即 schema 版本（`PRAGMA user_version`）。
 /// 已发布的迁移禁止修改，只能在末尾追加。
-const MIGRATIONS: &[&str] = &[include_str!("../../../migrations/001_initial_schema.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../../../migrations/001_initial_schema.sql"),
+    include_str!("../../../migrations/002_equipment.sql"),
+];
 
 pub const LATEST_SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 

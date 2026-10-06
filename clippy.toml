@@ -16,5 +16,7 @@ disallowed-methods = [
     { path = "boh_storage::testing::open_writer", reason = "Raw SQLite connections are for locked tests only; use boh_storage::open()." },
     { path = "boh_storage::testing::open_reader", reason = "Raw SQLite connections are for locked tests only; use boh_storage::open()." },
     { path = "boh_storage::testing::migrate", reason = "Raw SQLite connections are for locked tests only; use boh_storage::open()." },
+    { path = "boh_storage::testing::rebuild_projections", reason = "Raw SQLite connections are for locked tests only; use Writer::rebuild_projections()." },
+    { path = "boh_app::test_router", reason = "The fixed test configuration and dev actor stub are for locked tests only." },
     { path = "std::thread::sleep", reason = "Blocking sleeps can stall the only SQLite writer thread or an async executor thread." },
 ]

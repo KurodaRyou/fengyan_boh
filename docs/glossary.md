@@ -8,7 +8,7 @@
 | 规范名 | 中文用词 | 定义 | 详见 |
 |---|---|---|---|
 | Vertical slice | 纵向切片，简称切片 | 一次交付的完整功能增量，贯穿迁移、事件、校验、投影、HTTP 接口和锁定测试。它是开发的拆分方式，不是代码架构：本项目不采用 Vertical Slice Architecture，crate 仍按层横向划分 | AGENTS「开发顺序」 |
-| Walking skeleton | — | 第一个 vertical slice（温度记录）。业务最简单，用来让一条真实命令完整走通 write path、幂等、重放和 golden payload；之后的切片照它的模式写 | AGENTS「路线图」 |
+| Walking skeleton | — | 第一个 vertical slice（设备主数据）。业务最简单，用来让一条真实命令完整走通 write path、幂等、重放和 golden payload；之后的切片照它的模式写 | AGENTS「路线图」 |
 | Locked test | 锁定测试 | 由 Claude 编写、人确认预期值的测试，实现 agent 不得修改或使其失效 | AGENTS「测试分工」 |
 | Locked path | 锁定路径 | `.github/CODEOWNERS` 列出的路径，只能出现在 `spec:` / `docs:` 提交中 | AGENTS「协作分工」 |
 | Review baseline | 比对基准 | 切片分支开头连续的 `spec:` / `docs:` 提交中的最后一个；review 时锁定路径相对它的 diff 必须为空 | AGENTS「测试分工」 |
