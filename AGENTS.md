@@ -112,7 +112,7 @@ crates/
   boh-domain/   纯类型与校验不变量、相对校准与营业日纯函数。只允许依赖 serde / uuid / thiserror / jiff。禁止数据库、HTTP、系统 I/O（包括读系统时钟）。
   boh-storage/  SQLite：连接初始化、迁移、写入线程、读连接池、ledger（唯一写事件入口）、projections、备份、时钟模块（可注入）、原生 SQL。
   boh-app/      http（路由、响应信封）、service（命令编排）、sync（同步 worker，待实现）。
-  boh-server/   main：加载配置、启动、信号处理、优雅关闭；子命令 init、rebuild-projections；认证切片加设备管理子命令 enroll-code、unlock-device、reset-unlock-code、revoke-device。
+  boh-server/   main：加载配置、启动、信号处理、优雅关闭；子命令 init、rebuild-projections；认证切片加子命令 enroll-code、unlock-device、reset-unlock-code、revoke-device、reset-pin。
 migrations/     编号 SQL 文件，001_xxx.sql、002_xxx.sql……
 deploy/         systemd unit、示例配置。
 scripts/        CI 扫描脚本。
@@ -176,7 +176,7 @@ scripts/        CI 扫描脚本。
 - **事件间顺序只看 `seq`**：重放、同步按 `seq`；FIFO 先扣盘盈批次，再按来源事件的 `seq` 升序，同一来源事件内按原 payload 的行序（`source_line_no`）升序。不按任何时间戳。
 - `recorded_at` 取系统时钟原值，**不做单调钳制**。
   - 顺序已由 `seq` 保证；钳制会让一次跳到未来的时钟把之后的时间全部卡在未来。
-- `occurred_at` 由相对校准计算（或补录时显式给出），`business_date` 由 `occurred_at` 计算。规则见 `docs/domain.md`「时间」。
+- `occurred_at` 由相对校准计算（或补录时显式给出），`business_date` 由 `occurred_at` 计算（`SALES_IMPORTED` 例外，由命令显式给出）。规则见 `docs/domain.md`「时间」。
 - 系统时间只通过时钟模块读取，业务代码显式接收时间。
 
 ### 只追加（Append-only）
