@@ -174,6 +174,8 @@ scripts/        CI 扫描脚本。
 - 所有实体 / 事件主键用 **UUIDv7**（`TEXT`，小写带连字符）。禁止自增整数 ID。
   唯一例外：`store_events.seq`（门店内提交顺序，由 SQLite 分配）。投影表中的 `line_no`、`source_line_no` 是行号，不是自增键。
 - 客户端提交的 ID（如 `command_id`）在 `boh-domain` 中校验必须是 v7。
+- 服务端生成的 UUIDv7 在写事务内构造：时间部分取该命令的 `recorded_at`（负值按 0），随机部分取 SQLite `randomblob(10)`，由 `boh-domain` 的纯函数拼装。不用 `Uuid::now_v7()`。
+  - `now_v7()` 在 uuid crate 内部读系统时钟，绕过时钟模块，`disallowed-methods` 也拦不住。
 - 时间戳一律 `INTEGER`，UTC Unix **毫秒**。禁止存格式化的日期时间字符串。
   例外：表示门店当地日期的业务字段——`business_date`（营业日）和采购单的 `deliver_on`（要求到货日），格式 `'YYYY-MM-DD'`，它们是业务概念而不是时间点。
 - **事件间顺序只看 `seq`**：重放、同步按 `seq`；FIFO 先扣盘盈批次，再按来源事件的 `seq` 升序，同一来源事件内按原 payload 的行序（`source_line_no`）升序。不按任何时间戳。
@@ -314,7 +316,9 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 scripts/ci-scan.sh
+cargo run -p boh-server -- init deploy/config.dev.toml   # 新数据库先初始化，只写 store_meta；已初始化时拒绝
 cargo run -p boh-server -- deploy/config.dev.toml
+cargo run -p boh-server -- rebuild-projections deploy/config.dev.toml   # 只在服务停止时运行
 ```
 
 生产构建（在 macOS 上交叉编译 Linux 静态二进制，需要 `cargo-zigbuild` 和 `zig`）：
