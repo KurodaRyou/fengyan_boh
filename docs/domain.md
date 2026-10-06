@@ -69,13 +69,13 @@ occurred_at = recorded_at − lag
 |---|---|---|
 | `ITEM` | 物料，**含单位换算** | `code`, `name`, `base_unit`（`g` / `ml` / `pcs`）, `category`（`RAW` / `SEMI` / `FINISHED`）, `default_shelf_life_ms?`, `units[{unit_code, base_qty_per_unit}]`, `active` |
 | `RECIPE` | 配方，**含全部版本**；版本只增不改 | `code`, `name`, `output_item_id`, `versions[{version, output_qty_per_batch, lines[{item_id, qty_per_batch}]}]`, `active` |
-| `SUPPLIER` | 供应商 | `code`, `name`, `active` |
-| `EMPLOYEE` | 员工，**不含凭据** | `name`, `role`（`STAFF` / `MANAGER`）, `active` |
+| `SUPPLIER` | 供应商 | `code`, `name`, `contact_phone?`, `active` |
+| `EMPLOYEE` | 员工，**不含凭据** | `code`, `name`, `role`（`STAFF` / `MANAGER`）, `active` |
 | `WASTE_REASON` | 报损原因；初始化时预置 `EXPIRED`、`DAMAGED`、`PRODUCTION_DEFECT`、`TASTING`、`OTHER` | `code`, `name`, `active` |
-| `EQUIPMENT` | 需要记录温度的设备 | `name`, `equipment_type`（`FRIDGE` / `FREEZER` / `OVEN` / `PROOFER` / `OTHER`）, `active` |
+| `EQUIPMENT` | 设备 | `code`, `name`, `equipment_type`（`FRIDGE` / `FREEZER` / `BLAST_FREEZER` / `OVEN` / `PROOFER` / `MIXER` / `OTHER`）, `active` |
 
 - 快照是该行变更后的完整内容，不是差量。行的主键是事件的 `aggregate_id`，`revision` 是 `aggregate_version`，都不重复写进快照。`active` 是布尔值。
-- `name` 非空；`code` 非空，在同一实体内唯一。`MANAGER` 是店长，`STAFF` 是普通员工。
+- `name` 非空；`code` 非空，在同一实体内唯一。`contact_phone` 是原样保存的文本，不做格式校验。`MANAGER` 是店长，`STAFF` 是普通员工。
 - `units` 不含基本单位：`unit_code` 等于 `base_unit` 时系数恒为 1。`units` 中的 `unit_code` 在同一物料内唯一、不等于 `base_unit`，按 `unit_code` 升序；系数规则见「单位」。
 - `versions` 按 `version` 升序，从 1 连续编号；`output_qty_per_batch`、`qty_per_batch` 是正整数基本单位；同一版本的 `lines` 中 `item_id` 不重复，顺序为录入顺序。
 - 快照字段与枚举随 `MASTER_DATA_CHANGED@1` 冻结，改动按 AGENTS.md「只追加」升 `schema_version`。
