@@ -1,5 +1,10 @@
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
+    #[error("I/O: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("backup: {0}")]
+    Backup(String),
     #[error("domain: {0}")]
     Domain(#[from] boh_domain::DomainError),
 
@@ -35,8 +40,8 @@ pub enum StorageError {
     #[error("WAL checkpoint could not truncate because the database is busy")]
     CheckpointBusy,
 
-    #[error("reader pool is closed")]
-    ReadersClosed,
+    #[error("reader pool invariant violated: {0}")]
+    ReaderPoolInvariant(&'static str),
 
     #[error("failed to spawn writer thread: {0}")]
     Spawn(#[source] std::io::Error),

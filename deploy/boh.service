@@ -13,9 +13,9 @@ Environment=RUST_LOG=info
 Restart=always
 RestartSec=2
 
-# 优雅关闭：SIGTERM → 停 HTTP → 排空写队列 → WAL checkpoint
+# 优雅关闭：SIGTERM → 停 HTTP → 排空备份 → 排空写队列 → WAL checkpoint
 KillSignal=SIGTERM
-TimeoutStopSec=30
+TimeoutStopSec=120
 
 # 数据目录 /var/lib/boh，无需手动创建用户
 DynamicUser=yes

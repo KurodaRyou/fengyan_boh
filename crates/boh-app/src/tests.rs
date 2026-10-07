@@ -40,6 +40,8 @@ async fn node(dev_actor_stub: bool) -> Node {
         timezone: parse_timezone("Asia/Shanghai").unwrap(),
         business_day_cutoff: parse_business_day_cutoff("04:00").unwrap(),
         dev_actor_stub,
+        db_path: dir.path().join("boh.db"),
+        backup_health: Default::default(),
     });
     Node {
         _dir: dir,
@@ -530,5 +532,41 @@ async fn temperature_projection_and_receipt_failures_rollback_and_allow_original
     assert_eq!(status, 200);
     assert_eq!(logged["warnings"][0]["code"], "CAPTURE_TIME_ADJUSTED");
     assert_eq!(temperature_counts(&node).await, (2, 2, 1, 2));
+    node.storage.writer_handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn health_reports_wal_io_failure_and_missing_wal_without_exposing_paths() {
+    let node = node(true).await;
+    let parent = node._dir.path().join("plain-file");
+    std::fs::write(&parent, "file").unwrap();
+    for (path, expected_status) in [
+        (parent.join("boh.db"), 500),
+        (node._dir.path().join("missing.db"), 200),
+    ] {
+        let router = http::router(AppState {
+            writer: node.storage.writer.clone(),
+            readers: node.storage.readers.clone(),
+            clock: node.clock.clock(),
+            timezone: parse_timezone("Asia/Shanghai").unwrap(),
+            business_day_cutoff: parse_business_day_cutoff("04:00").unwrap(),
+            dev_actor_stub: false,
+            db_path: path,
+            backup_health: Default::default(),
+        });
+        let (status, body) = send(router, Method::GET, "/health", json!({})).await;
+        assert_eq!(status, expected_status);
+        if status == 500 {
+            assert_eq!(
+                body,
+                json!({
+                    "success": false, "data": null, "warnings": [],
+                    "error": {"code": "INTERNAL_ERROR", "message": "internal error", "details": {}}
+                })
+            );
+        } else {
+            assert_eq!(body["data"]["wal_size_bytes"], json!(0));
+        }
+    }
     node.storage.writer_handle.shutdown().await.unwrap();
 }

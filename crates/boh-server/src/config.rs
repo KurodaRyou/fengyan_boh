@@ -1,16 +1,17 @@
 use std::net::SocketAddr;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 
 use boh_domain::StoreId;
 use boh_domain::time::{
-    BusinessDayCutoff, StoreTimeZone, parse_business_day_cutoff, parse_timezone,
+    BusinessDayCutoff, ClosingBackupTime, StoreTimeZone, parse_business_day_cutoff,
+    parse_closing_backup_time, parse_timezone,
 };
 use serde::{Deserialize, Deserializer};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Config {
+pub struct Config {
     pub store_id: StoreId,
     pub db_path: PathBuf,
     pub listen_addr: SocketAddr,
@@ -22,6 +23,20 @@ pub(crate) struct Config {
     pub reader_pool_size: NonZeroUsize,
     #[serde(default)]
     pub dev_actor_stub: bool,
+    pub backup_dir: PathBuf,
+    #[serde(default = "default_backup_keep_count")]
+    pub backup_keep_count: NonZeroU32,
+    #[serde(default, deserialize_with = "closing_backup_time")]
+    pub closing_backup_time: ClosingBackupTime,
+}
+
+fn default_backup_keep_count() -> NonZeroU32 {
+    NonZeroU32::new(168).unwrap_or(NonZeroU32::MIN)
+}
+
+fn closing_backup_time<'de, D: Deserializer<'de>>(de: D) -> Result<ClosingBackupTime, D::Error> {
+    let value = String::deserialize(de)?;
+    parse_closing_backup_time(&value).map_err(serde::de::Error::custom)
 }
 
 fn default_reader_pool_size() -> NonZeroUsize {
@@ -38,7 +53,7 @@ fn business_day_cutoff<'de, D: Deserializer<'de>>(de: D) -> Result<BusinessDayCu
     parse_business_day_cutoff(&value).map_err(serde::de::Error::custom)
 }
 
-pub(crate) fn parse_config(text: &str) -> Result<Config, toml::de::Error> {
+pub fn parse_config(text: &str) -> Result<Config, toml::de::Error> {
     let config: Config = toml::from_str(text)?;
     if config.dev_actor_stub && !cfg!(debug_assertions) {
         return Err(<toml::de::Error as serde::de::Error>::custom(
@@ -58,6 +73,7 @@ db_path = "boh.db"
 listen_addr = "127.0.0.1:8080"
 timezone = "Asia/Shanghai"
 business_day_cutoff = "04:00"
+backup_dir = "backups"
 "#;
 
     #[test]

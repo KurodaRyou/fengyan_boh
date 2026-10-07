@@ -59,6 +59,7 @@ pub use rusqlite;
   - 投影表 = `sqlite_master` 中除 `sqlite_` 开头的内部表、`store_meta`、`processed_commands`、`store_events` 和认证状态表以外的全部表。
   - `boh-server rebuild-projections <配置文件>` 经 `boh_storage::open()` 调用它，只在服务停止时运行。
 - `WriterHandle::shutdown`：处理完已入队的任务后停止写线程，在写连接上执行 `wal_checkpoint(TRUNCATE)`，然后关闭写连接。
+  - 有读事务未结束、等满 `busy_timeout` 仍无法截断 WAL 时，记 `warn` 并返回 `Ok`；之后重新 `open` 能读到全部已提交的数据。其他错误照常返回 `Err`。
 - `Readers::call`：借出一个只读连接，在一个 DEFERRED 读事务中执行 `f`，`f` 内的读取看到同一个快照；在 `spawn_blocking` 上运行。
 - `StorageError` 的变体由实现决定；锁定测试只依赖 `UnsupportedSchemaVersion { found: i64, supported: i64 }`。
 - `open_writer`、`open_reader`、`migrate`、`spawn_writer`、`checkpoint_truncate`、`Readers::open` 都是 `pub(crate)`。
@@ -109,9 +110,9 @@ impl ManualClock {
 - `sleep_until`：`now() >= deadline` 时才返回，`deadline` 已过时立即返回；系统时间回拨时随之推迟。必须在 tokio 运行时内调用。
 - `ManualClock` 供测试使用：由它得到的 `Clock` 共享同一个时间，不随真实时间流动。`set` 可以回拨，`advance` 只向前；时间到达 `deadline` 后，正在等待的 `sleep_until` 立即返回。
 - HTTP 黑盒测试：把 `ManualClock::clock()` 交给 `test_router`，服务端读到的当前时间（如 `recorded_at`）就是 `ManualClock` 设定的值。
-- 备份触发测试：调度任务用 `now()` 算出下一个触发时刻（整点或 `closing_backup_time`），再 `sleep_until`。
+- 备份触发测试经 `boh_app::test_node` 进行：调度任务按 `now()` 算出下一个触发时刻（UTC 整点或 `closing_backup_time`），时钟回拨后重算（AGENTS.md「备份」触发）。
   - 测试把时间设到触发前 1ms，断言未触发；推进 1ms，断言触发。
-  - 排队用例：在备份执行期间推进到下一个触发时刻。
+  - 排队用例：用 `TestNode::hold_backups` 让备份停在执行中，再推进到下一个触发时刻。
 
 ## boh-domain：时间（`boh_domain::time`）
 
@@ -184,6 +185,29 @@ pub fn business_date(
   - 不用 `jiff::tz::db()`：它优先读门店机的 zoneinfo，开发机和门店机可能得到不同的结果。
 - `parse_business_day_cutoff`：只接受 `HH:MM`，两位小时 `00`–`23`、两位分钟 `00`–`59`，其他一律为 `InvalidBusinessDayCutoff`。
 
+### 闭店备份时刻
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClosingBackupTime { /* 私有 */ }  // Display 输出 'HH:MM'
+
+// ConfigError 增加变体：
+//     InvalidClosingBackupTime(String),
+
+pub fn parse_closing_backup_time(value: &str) -> Result<ClosingBackupTime, ConfigError>;
+pub fn next_closing_backup(
+    after: UnixMillis,
+    timezone: &StoreTimeZone,
+    time: ClosingBackupTime,
+) -> Result<UnixMillis, TimeError>;
+```
+
+- `parse_closing_backup_time`：格式规则同 `parse_business_day_cutoff`，非法时为 `InvalidClosingBackupTime`（携带原值）。
+- `next_closing_backup`：返回严格晚于 `after` 的第一个「`timezone` 当地日期 + `time`」时刻。
+  - 当地不存在的时刻（夏令时跳过）按跳过之前的偏移换算，即顺延跳过的时长（跳过 02:00–03:00 时，02:30 为 03:30）。
+  - 当地重复的时刻只取第一次（较早的那个）；同一天的第二次不算触发时刻。
+  - 结果或换算超出可表示范围：`OutOfRange`。
+
 ## boh-app：Router 测试入口
 
 ```rust
@@ -203,4 +227,72 @@ pub fn test_router(db_path: &Path, clock: Clock) -> Result<Router, StorageError>
 
 - `store_meta` 为空时，用与 `boh-server init` 相同的代码写入上表的 `store_id`，`created_at` 取 `clock.now()`；已存在且 `store_id` 不同时返回 `Err`。
 - 写线程不经 `shutdown`：`Router` 及其全部克隆释放后，写线程自行退出。
+- 不启动备份调度等后台任务：`/health` 的备份字段一直为 `null`。
 - 两份 `clippy.toml` 禁用 `test_router`，只有锁定测试及 `spec_support/` 可以 `#[allow]`。
+
+## boh-app：带后台任务的测试节点
+
+```rust
+#[doc(hidden)]
+pub struct TestNodeConfig {
+    pub backup_dir: PathBuf,
+    pub backup_keep_count: NonZeroU32,
+    pub timezone: String,             // IANA 时区名
+    pub closing_backup_time: String,  // 'HH:MM'
+}
+
+#[doc(hidden)]
+pub async fn test_node(db_path: &Path, clock: Clock, config: TestNodeConfig) -> Result<TestNode, StorageError>;
+
+#[doc(hidden)]
+pub struct TestNode {
+    pub router: Router,
+    /* 私有 */
+}
+impl TestNode {
+    pub fn hold_backups(&self) -> BackupHold;
+    pub async fn shutdown(self) -> Result<(), StorageError>;
+}
+
+#[doc(hidden)]
+pub struct BackupHold { /* 私有 */ }
+impl BackupHold {
+    pub async fn started(&self);
+}
+```
+
+- 在 tokio 运行时内调用。与生产启动相同：`boh_storage::open()`；`store_meta` 处理同 `test_router`；创建 `backup_dir`（含上级目录），失败或不是目录时返回 `Err`；启动备份调度。
+  - 配置：`store_id`、`business_day_cutoff`、开发桩同 `test_router`；`timezone` 同时用于营业日和闭店备份；时区或 `closing_backup_time` 非法时返回 `Err`。
+  - 返回时，调度任务已按 `clock` 当时的时间算好第一个触发时刻。
+- `router`：与生产入口相同的路由；`/health` 反映本节点的备份结果。
+- `hold_backups`：返回的句柄存在期间，每次开始的备份在取得开始时间（文件名中的时间）之后、读取 `seq_before` 之前等待；所有句柄释放后继续。
+  - `started()`：有备份正在等待该句柄时返回（已在等待则立即返回）。
+  - 句柄不借用 `TestNode`：持有句柄时也可以调用 `shutdown`，`shutdown` 会等到句柄释放、队列执行完。
+- `shutdown`：不再接受新的触发，执行完正在进行和已排队的备份，再 `WriterHandle::shutdown()`。返回后不留任何后台任务。
+- 两份 `clippy.toml` 禁用 `test_node`，只有锁定测试及 `spec_support/` 可以 `#[allow]`。
+
+## boh-server：配置
+
+```rust
+// crates/boh-server/src/lib.rs
+pub mod config;
+
+// boh_server::config
+pub struct Config {
+    pub store_id: StoreId,
+    pub db_path: PathBuf,
+    pub listen_addr: SocketAddr,
+    pub timezone: StoreTimeZone,
+    pub business_day_cutoff: BusinessDayCutoff,
+    pub reader_pool_size: NonZeroUsize,
+    pub dev_actor_stub: bool,
+    pub backup_dir: PathBuf,
+    pub backup_keep_count: NonZeroU32,
+    pub closing_backup_time: ClosingBackupTime,
+}
+pub fn parse_config(text: &str) -> Result<Config, impl std::error::Error>;
+```
+
+- 解析 TOML 配置文本，不读文件、不创建目录。错误类型由实现决定，锁定测试只区分 `Ok` / `Err`。
+- `backup_dir` 必填；`backup_keep_count` 缺省为 168，必须是正整数（TOML 整数，`1`–`u32::MAX`）；`closing_backup_time` 缺省为 `"23:30"`，格式见 `parse_closing_backup_time`。
+- `main` 经此函数加载配置。

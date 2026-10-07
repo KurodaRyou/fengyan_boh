@@ -106,6 +106,8 @@ pub enum ConfigError {
     InvalidTimeZone(String),
     #[error("invalid business day cutoff (expected HH:MM): {0}")]
     InvalidBusinessDayCutoff(String),
+    #[error("invalid closing backup time (expected HH:MM): {0}")]
+    InvalidClosingBackupTime(String),
 }
 
 pub fn parse_timezone(value: &str) -> Result<StoreTimeZone, ConfigError> {
@@ -120,6 +122,10 @@ pub fn parse_timezone(value: &str) -> Result<StoreTimeZone, ConfigError> {
 
 pub fn parse_business_day_cutoff(value: &str) -> Result<BusinessDayCutoff, ConfigError> {
     let invalid = || ConfigError::InvalidBusinessDayCutoff(value.to_owned());
+    parse_time(value).map(BusinessDayCutoff).ok_or_else(invalid)
+}
+
+fn parse_time(value: &str) -> Option<Time> {
     let bytes = value.as_bytes();
     if bytes.len() != 5
         || bytes[2] != b':'
@@ -127,13 +133,53 @@ pub fn parse_business_day_cutoff(value: &str) -> Result<BusinessDayCutoff, Confi
             .iter()
             .all(u8::is_ascii_digit)
     {
-        return Err(invalid());
+        return None;
     }
-    let hour = value[..2].parse::<i8>().map_err(|_| invalid())?;
-    let minute = value[3..].parse::<i8>().map_err(|_| invalid())?;
-    Time::new(hour, minute, 0, 0)
-        .map(BusinessDayCutoff)
-        .map_err(|_| invalid())
+    let hour = value[..2].parse::<i8>().ok()?;
+    let minute = value[3..].parse::<i8>().ok()?;
+    Time::new(hour, minute, 0, 0).ok()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClosingBackupTime(Time);
+
+impl Default for ClosingBackupTime {
+    fn default() -> Self {
+        Self(Time::constant(23, 30, 0, 0))
+    }
+}
+
+impl fmt::Display for ClosingBackupTime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:02}:{:02}", self.0.hour(), self.0.minute())
+    }
+}
+
+pub fn parse_closing_backup_time(value: &str) -> Result<ClosingBackupTime, ConfigError> {
+    parse_time(value)
+        .map(ClosingBackupTime)
+        .ok_or_else(|| ConfigError::InvalidClosingBackupTime(value.to_owned()))
+}
+
+pub fn next_closing_backup(
+    after: UnixMillis,
+    timezone: &StoreTimeZone,
+    time: ClosingBackupTime,
+) -> Result<UnixMillis, TimeError> {
+    let timestamp = Timestamp::from_millisecond(after.0).map_err(|_| TimeError::OutOfRange)?;
+    let mut date = timezone.0.to_datetime(timestamp).date();
+    loop {
+        // Compatible: gaps move forward by the gap, folds use the first occurrence.
+        let candidate = timezone
+            .0
+            .to_ambiguous_timestamp(date.to_datetime(time.0))
+            .compatible()
+            .map_err(|_| TimeError::OutOfRange)?;
+        if candidate > timestamp {
+            return Ok(UnixMillis(candidate.as_millisecond()));
+        }
+        date = date.tomorrow().map_err(|_| TimeError::OutOfRange)?;
+    }
 }
 
 pub fn business_date(

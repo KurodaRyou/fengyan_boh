@@ -17,6 +17,17 @@ enum Source {
 }
 
 impl Clock {
+    /// Subscribe before the scheduler reads time so manual-clock updates cannot be lost.
+    pub fn changes(&self) -> ClockChanges {
+        ClockChanges {
+            clock: self.clone(),
+            manual: match &self.source {
+                Source::System => None,
+                Source::Manual(time) => Some(time.subscribe()),
+            },
+        }
+    }
+
     pub fn system() -> Clock {
         Self {
             source: Source::System,
@@ -54,6 +65,35 @@ impl Clock {
                     let _ = changes.changed().await;
                 }
             }
+        }
+    }
+}
+
+pub struct ClockChanges {
+    clock: Clock,
+    manual: Option<watch::Receiver<UnixMillis>>,
+}
+
+impl ClockChanges {
+    /// Manual changes wake immediately. System time is sampled at the deadline or
+    /// after one second, whichever comes first; no deadline means sampling only.
+    pub async fn changed(&mut self, deadline: Option<UnixMillis>) -> UnixMillis {
+        if let Some(time) = &mut self.manual {
+            let _ = time.changed().await;
+            *time.borrow_and_update()
+        } else {
+            let millis = if let Some(deadline) = deadline {
+                let now = self.clock.now();
+                if now >= deadline {
+                    return now;
+                }
+                let remaining = deadline.0.checked_sub(now.0).unwrap_or(i64::MAX);
+                u64::try_from(remaining.min(1000)).unwrap_or(1000)
+            } else {
+                1000
+            };
+            tokio::time::sleep(Duration::from_millis(millis)).await;
+            self.clock.now()
         }
     }
 }
@@ -223,6 +263,25 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), wait)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn change_subscription_reports_rollback_before_a_future_deadline() {
+        let manual = ManualClock::new(UnixMillis(100));
+        let mut changes = manual.clock().changes();
+        // Updates made before the wait begins are retained by the subscription.
+        manual.set(UnixMillis(50));
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                changes.changed(Some(UnixMillis(200))),
+            )
+            .await
+            .unwrap(),
+            UnixMillis(50)
+        );
+        manual.set(UnixMillis(200));
+        assert_eq!(changes.changed(None).await, UnixMillis(200));
     }
 
     #[test]

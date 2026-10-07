@@ -1,14 +1,17 @@
-//! HTTP 锁定测试的辅助代码：只经 `boh_app::test_router` 返回的 `Router`、对已冻结表的只读 SQL
-//! 和 `boh_storage::testing` 访问系统。接口见 docs/interfaces.md。
+//! HTTP 锁定测试的辅助代码：只经 `boh_app::test_router` / `boh_app::test_node` 返回的 `Router`、对已冻结表的只读 SQL、
+//! `boh_storage::testing` 和备份目录中的文件访问系统。接口见 docs/interfaces.md。
 #![allow(dead_code)] // 每个测试文件只用到其中一部分辅助函数。
 
 use std::convert::Infallible;
 use std::error::Error;
+use std::num::NonZeroU32;
 use std::path::Path;
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, Response, StatusCode, header};
+use boh_app::{TestNode, TestNodeConfig};
 use boh_storage::StorageError;
 use boh_storage::clock::Clock;
 use boh_storage::rusqlite::types::Value as SqlValue;
@@ -44,6 +47,30 @@ pub const STAFF: Actor = Actor {
 #[allow(clippy::disallowed_methods)] // 锁定测试经 test_router 构造 Router。
 pub fn router(db_path: &Path, clock: Clock) -> Result<Router, StorageError> {
     boh_app::test_router(db_path, clock)
+}
+
+#[allow(clippy::disallowed_methods)] // 锁定测试经 test_node 构造带后台任务的节点。
+pub async fn node(
+    db_path: &Path,
+    clock: Clock,
+    config: TestNodeConfig,
+) -> Result<TestNode, StorageError> {
+    boh_app::test_node(db_path, clock, config).await
+}
+
+/// `test_node` 的配置；`keep_count` 为 0 时 panic（测试写错）。
+pub fn node_config(
+    backup_dir: &Path,
+    keep_count: u32,
+    timezone: &str,
+    closing_backup_time: &str,
+) -> TestNodeConfig {
+    TestNodeConfig {
+        backup_dir: backup_dir.to_owned(),
+        backup_keep_count: NonZeroU32::new(keep_count).unwrap_or_else(|| panic!("keep_count = 0")),
+        timezone: timezone.to_owned(),
+        closing_backup_time: closing_backup_time.to_owned(),
+    }
 }
 
 #[allow(clippy::disallowed_methods)] // 锁定测试经 boh_storage::testing 取得原始连接。
@@ -245,4 +272,106 @@ pub fn count(conn: &Connection, table: &str) -> rusqlite::Result<i64> {
     conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
         row.get(0)
     })
+}
+
+/// 一个最终备份文件（AGENTS.md「备份」文件名）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupFile {
+    pub name: String,
+    pub time: String,
+    pub number: u64,
+    pub uuid: String,
+}
+
+/// 按 `^boh-<store_id>-[0-9]{8}T[0-9]{6}Z-([1-9][0-9]*)-<UUIDv7>\.db$` 识别本店最终备份文件，序号须能解析为 u64。
+pub fn parse_backup_name(name: &str, store_id: &str) -> Option<BackupFile> {
+    let rest = name
+        .strip_prefix("boh-")?
+        .strip_prefix(store_id)?
+        .strip_prefix('-')?;
+    let rest = rest.strip_suffix(".db")?;
+    let (time, rest) = rest.split_at_checked(16)?;
+    let time_ok = time.bytes().enumerate().all(|(i, b)| match i {
+        8 => b == b'T',
+        15 => b == b'Z',
+        _ => b.is_ascii_digit(),
+    });
+    let rest = rest.strip_prefix('-')?;
+    let (number, uuid) = rest.split_once('-')?;
+    let number_ok = number.starts_with(|c: char| ('1'..='9').contains(&c))
+        && number.bytes().all(|b| b.is_ascii_digit());
+    if !time_ok || !number_ok || !is_uuid_v7(uuid) {
+        return None;
+    }
+    Some(BackupFile {
+        name: name.to_owned(),
+        time: time.to_owned(),
+        number: number.parse().ok()?,
+        uuid: uuid.to_owned(),
+    })
+}
+
+/// 目录中全部文件名，按字节序排列。
+pub fn file_names(dir: &Path) -> std::io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        names.push(entry?.file_name().to_string_lossy().into_owned());
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// 本店（`TEST_STORE_ID`）的最终备份文件，按序号升序。
+pub fn backups(dir: &Path) -> std::io::Result<Vec<BackupFile>> {
+    let mut files: Vec<BackupFile> = file_names(dir)?
+        .iter()
+        .filter_map(|name| parse_backup_name(name, TEST_STORE_ID))
+        .collect();
+    files.sort_by_key(|file| file.number);
+    Ok(files)
+}
+
+pub fn backup_numbers(dir: &Path) -> std::io::Result<Vec<u64>> {
+    Ok(backups(dir)?.iter().map(|file| file.number).collect())
+}
+
+/// 后台任务需要时间：断言「没有发生」之前等待的真实时间。
+pub async fn settle() {
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+/// 每 10ms 检查一次，10 秒内不成立则 panic。
+pub async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+    for _ in 0..1000 {
+        if condition() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+/// `GET /health` 的 `data`；断言成功信封与空 warnings。
+#[allow(clippy::unwrap_used)] // 测试辅助：健康检查请求失败本身就是断言失败。
+pub async fn health(router: &Router) -> Value {
+    let reply = get(router, "/health", None).await.unwrap();
+    let data = assert_success(&reply).clone();
+    assert_eq!(reply.body["warnings"], Value::Array(Vec::new()));
+    data
+}
+
+/// 轮询 `/health`，直到 `data` 满足条件，返回该 `data`；10 秒内不满足则 panic。
+pub async fn wait_for_health(
+    router: &Router,
+    what: &str,
+    condition: impl Fn(&Value) -> bool,
+) -> Value {
+    for _ in 0..1000 {
+        let data = health(router).await;
+        if condition(&data) {
+            return data;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for /health: {what}");
 }

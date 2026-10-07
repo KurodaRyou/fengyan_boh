@@ -1,19 +1,24 @@
 //! 应用层：HTTP 接口与 service 命令编排；sync 上行同步 worker 待实现。
 
 pub mod actor;
+pub mod background;
 pub mod http;
 mod service;
 #[cfg(test)]
 mod tests;
 
-use std::num::NonZeroUsize;
-use std::path::Path;
+use std::num::{NonZeroU32, NonZeroUsize};
+use std::path::{Path, PathBuf};
 
 use axum::Router;
 use boh_domain::StoreId;
 use boh_domain::time::{
-    BusinessDayCutoff, StoreTimeZone, parse_business_day_cutoff, parse_timezone,
+    BusinessDayCutoff, StoreTimeZone, parse_business_day_cutoff, parse_closing_backup_time,
+    parse_timezone,
 };
+#[doc(hidden)]
+pub use boh_storage::backup::BackupHold;
+use boh_storage::backup::{Backup, BackupHealth};
 use boh_storage::clock::Clock;
 use boh_storage::{Readers, StorageError, Writer};
 
@@ -26,6 +31,8 @@ pub struct AppState {
     pub timezone: StoreTimeZone,
     pub business_day_cutoff: BusinessDayCutoff,
     pub dev_actor_stub: bool,
+    pub db_path: PathBuf,
+    pub backup_health: BackupHealth,
 }
 
 /// 构造与生产入口共用路由的 HTTP 黑盒测试入口。
@@ -52,7 +59,96 @@ pub fn test_router(db_path: &Path, clock: Clock) -> Result<Router, StorageError>
         timezone,
         business_day_cutoff,
         dev_actor_stub: true,
+        db_path: db_path.to_owned(),
+        backup_health: BackupHealth::default(),
     }))
+}
+
+#[doc(hidden)]
+pub struct TestNodeConfig {
+    pub backup_dir: PathBuf,
+    pub backup_keep_count: NonZeroU32,
+    pub timezone: String,
+    pub closing_backup_time: String,
+}
+
+#[doc(hidden)]
+pub struct TestNode {
+    pub router: Router,
+    backup: Backup,
+    tasks: background::BackupTasks,
+    writer_handle: boh_storage::WriterHandle,
+}
+
+impl TestNode {
+    pub fn hold_backups(&self) -> BackupHold {
+        self.backup.hold()
+    }
+
+    pub async fn shutdown(self) -> Result<(), StorageError> {
+        drop(self.router);
+        let stopped = self.tasks.shutdown().await;
+        let closed = self.writer_handle.shutdown().await;
+        stopped?;
+        closed
+    }
+}
+
+#[doc(hidden)]
+pub async fn test_node(
+    db_path: &Path,
+    clock: Clock,
+    config: TestNodeConfig,
+) -> Result<TestNode, StorageError> {
+    let store_id = StoreId::parse("01890a5d-ac96-774b-bcce-b302099a8050")?;
+    let timezone = parse_timezone(&config.timezone)?;
+    let closing = parse_closing_backup_time(&config.closing_backup_time)?;
+    let backup = Backup::prepare(
+        db_path,
+        &config.backup_dir,
+        store_id,
+        config.backup_keep_count,
+    )?;
+    let storage = boh_storage::open(db_path, NonZeroUsize::MIN)?;
+    let created_at = clock.now();
+    let initialized = storage
+        .writer
+        .call(move |tx| boh_storage::store::initialize_if_empty(tx, store_id, created_at))
+        .await;
+    if let Err(error) = initialized {
+        storage.writer_handle.shutdown().await?;
+        return Err(error);
+    }
+    let backup_health = BackupHealth::default();
+    let tasks = match background::BackupTasks::start(
+        backup.clone(),
+        clock.clone(),
+        backup_health.clone(),
+        timezone.clone(),
+        closing,
+    ) {
+        Ok(tasks) => tasks,
+        Err(error) => {
+            storage.writer_handle.shutdown().await?;
+            return Err(error);
+        }
+    };
+    let router = http::router(AppState {
+        writer: storage.writer,
+        readers: storage.readers,
+        clock,
+        timezone,
+        business_day_cutoff: parse_business_day_cutoff("04:00")?,
+        dev_actor_stub: true,
+        db_path: db_path.to_owned(),
+        backup_health,
+    });
+    Ok(TestNode {
+        router,
+        backup,
+        tasks,
+        writer_handle: storage.writer_handle,
+    })
 }
 
 fn wait_for<T>(future: impl std::future::Future<Output = T>) -> T {

@@ -78,8 +78,8 @@
 1. **Write path 与基础设施**：时钟模块、相对校准、营业日纯函数；`Readers::call` 包读事务、写线程任务计时；信封加 `warnings`；`boh_storage::open()` 收口。
 2. **Walking skeleton 与首批切片**：
    设备主数据（walking skeleton：`ledger::execute` / `Ledger::append` / `projections::apply` 骨架与 `rebuild-projections`、`Actor` 开发桩、`boh-server init`、`EQUIPMENT` 写接口、迁移 002：`equipment`；打通 write path、幂等、重放、golden payload）
-   → 温度记录（迁移 003：`temperature_readings`）→ 备份模块与恢复演练测试、`/health` 字段 → 004：其余主数据与库存投影表 → 收货 + 报损（FIFO、账外缺口、分配来源、吸收规则、不变量自检）→ 局域网 HTTPS → 员工认证。
-   - 设备主数据切片的 `init` 只写 `store_meta`；第一个店长和预置报损原因随 004 加入，PIN 步骤随认证切片加入。
+   → 温度记录（迁移 003：`temperature_readings`）→ 备份模块与恢复演练测试、`/health` 字段（迁移 004：`store_events(recorded_at)` 索引）→ 005：其余主数据与库存投影表 → 收货 + 报损（FIFO、账外缺口、分配来源、吸收规则、不变量自检）→ 局域网 HTTPS → 员工认证。
+   - 设备主数据切片的 `init` 只写 `store_meta`；第一个店长和预置报损原因随 005 加入，PIN 步骤随认证切片加入。
 3. **扩展**：生产 → 盘点 → 纠错（冲销、数量更正）→ 补录入口 → 销售导入。每一步配对应的验收用例。
 
 ---
@@ -163,6 +163,8 @@ scripts/        CI 扫描脚本。
     `clippy.toml` 的 `disallowed-methods` 禁用 `boh_storage::testing` 中的函数，只有锁定测试及 `spec_support/` 可以 `#[allow]`。
 - 写事务一律 `BEGIN IMMEDIATE`（`Writer::call` 已处理）。
 - 读连接 `query_only = ON`，只通过 `Readers::call` 使用；`Readers::call` 内部包一个 DEFERRED 读事务，读事务保持简短。
+  - 提交或回滚之后连接仍处于事务中（`!is_autocommit()`）时，记 `error` 并 `std::process::abort()`，由 systemd 重启，不归还连接、不让进程带着失效的读池继续运行。
+    普通查询失败、已成功回滚的错误不触发。这是不可恢复故障的路径，不走优雅关闭。
 - **受控例外：备份连接**。只在备份模块中打开，都用 `SQLITE_OPEN_READ_ONLY`，不设 `query_only`，不进读连接池：
   - 源库连接：照常设置上面的 PRAGMA，执行 `VACUUM INTO`。`query_only` 连接上执行 `VACUUM INTO` 会失败，所以不能复用读连接池。
   - 校验连接：打开 `VACUUM INTO` 生成的临时文件，只执行校验查询，**不设置 `journal_mode`**。
@@ -172,25 +174,58 @@ scripts/        CI 扫描脚本。
 - 所有表用 `STRICT`。
 
 ### 备份
-备份目录由必填配置项 `backup_dir` 指定。
+备份目录由必填配置项 `backup_dir` 指定。启动时目录不存在则创建（含上级目录）；创建失败或路径不是目录，拒绝启动。
+- `deploy/boh.service` 的 `ProtectSystem=strict` 只放行 `StateDirectory`：示例配置用 `/var/lib/boh/backups`，放到其他位置要在 unit 中加 `ReadWritePaths`。
 
-1. 先删除备份目录中残留的 `tmp-*.db`；在备份连接上读取 `seq_before = coalesce(max(seq), 0)`，再执行 `VACUUM INTO '<备份目录>/tmp-<UUIDv7>.db'`。
+**文件名**（`<store_id>` 是配置中的门店 ID，`<UUID>` 是本次备份的 UUIDv7，都是小写带连字符）：
+- 临时文件 `tmp-<store_id>-<UUID>.db`；最终文件 `boh-<store_id>-<UTC时间>-<备份序号>-<UUID>.db`，与临时文件同一个 UUID。
+  - 带 `store_id`：几家门店的备份放进同一目录（如 NAS）时，序号、清理互不干扰。
+- UTC 时间是本次备份开始时 `now()` 的 `YYYYMMDDTHHMMSSZ`，年份超出 0000–9999 时写 `00000000T000000Z`。只供人看，不参与排序。
+- 备份序号是十进制 `u64`，不补零。
+- 识别：最终文件匹配 `^boh-<本店 store_id>-[0-9]{8}T[0-9]{6}Z-([1-9][0-9]*)-<UUIDv7>\.db$` 且序号能解析为 `u64`；临时文件匹配 `^tmp-<本店 store_id>-<UUIDv7>\.db$`。
+  其他文件（含其他门店的、格式相近但不匹配的）不计入序号、不清理、不删除。符合最终命名格式的文件都计入序号和保留额度，不检查内容。
+- 本次备份的 UUID 由备份开始时的 `now()` 和源库连接上的 `randomblob(10)` 经 `boh-domain` 的 UUIDv7 拼装函数构造（理由同「ID 与时间」）。
+
+**流程**（在 `spawn_blocking` 上执行，不占写线程）：
+1. 扫描一次备份目录，保存本店最终文件列表并删除本店残留的临时文件，删除失败记日志后继续；在源库连接上读取 `seq_before = coalesce(max(seq), 0)`，再执行 `VACUUM INTO '<备份目录>/tmp-<store_id>-<UUID>.db'`。
    - `VACUUM INTO` 不覆盖已存在的文件；固定文件名在上次中途退出后会让之后每次备份都失败。
 2. 只读打开临时文件，执行 `PRAGMA integrity_check`，并以 `n = coalesce(max(seq), 0)` 校验 `n >= seq_before` 且 `count(*) = n`（空账本时三者都为 0）；校验失败则删除临时文件。
    - 备份期间写入照常提交，备份快照可能包含 `seq_before` 之后的事件，所以只比下界，不比相等。备份自身的 `n` 记为 `last_backup_seq`。
-3. 校验通过后对文件 fsync，原子重命名为 `boh-<UTC时间>-<备份序号>-<UUIDv7>.db`（与临时文件同一个 UUID），再 fsync 备份目录；按保留策略清理旧文件后再 fsync 一次目录。
+3. 校验通过后对文件 fsync；从本次扫描保存的本店最终文件列表中取最大备份序号 `checked_add(1)`（没有则为 1；溢出则本次失败并删除临时文件）；原子重命名为最终文件名，再 fsync 备份目录；按保留策略清理旧文件后再 fsync 一次目录。
    - 只 fsync 文件不能让重命名后的目录项持久化，断电后新备份可能消失。
    - 文件名带 UUID：时钟回拨或同一时刻两次备份时，同名重命名会覆盖已有的备份。
-   - 备份序号从 1 开始，之后取备份目录中最终文件的最大序号，用 `checked_add(1)` 递增；仅用于备份文件的保留顺序，与账本 `seq` 无关。
-   - **保留策略**：配置项 `backup_keep_count`，默认 `168`，必须是正整数，否则拒绝启动。按备份序号从大到小保留最近成功生成的 N 份；每小时和闭店备份共用此额度。只在本次新备份校验、文件 fsync、重命名及目录 fsync 全部成功后清理超出额度的最终备份文件，始终保留本次新备份；备份失败时不清理已有的最终备份。
-   - 清理只处理本节点备份目录中符合最终命名格式的文件，不删除其他文件。删除失败时记日志，保留超出额度的文件，后续成功备份时再次清理。保留顺序由备份序号保证，时钟回拨不改变它。
-4. 触发：定时备份在每个整点一次（全天）；闭店备份在每天门店当地时间 `closing_backup_time` 一次（配置项，`'HH:MM'`，按 `timezone` 换算，默认 `"23:30"`，格式非法拒绝启动）。
-   - 两种触发共用串行的备份任务入口，禁止并发备份。触发时已有备份在执行则排队，同一种触发最多排队一次。
-   - `VACUUM INTO` 期间持有读快照，会推迟 WAL checkpoint。
-5. **恢复演练写成测试**：从备份恢复、清空投影并重建，结果必须和原库一致。只验证备份文件生成了不算数。
-   - 保留策略测试覆盖默认值与非法配置、第 N+1 份成功后清理、失败不清理、重启后序号继续递增、时钟回拨以及定时 / 闭店触发的串行执行。
-   - 触发测试用可注入的时钟覆盖：整点与 `closing_backup_time` 到期、`closing_backup_time` 默认值与非法格式、备份执行中到期的排队。
-6. 异地复制（有公网用对象存储，没有公网用 NAS 或双盘轮换）本期不开发。
+   - 备份序号仅用于备份文件的保留顺序，与账本 `seq` 无关。
+   - **保留策略**：配置项 `backup_keep_count`，默认 `168`，必须是正整数，否则拒绝启动。按备份序号从大到小保留最近的 N 份；每小时和闭店备份共用此额度。只在本次新备份校验、文件 fsync、重命名及目录 fsync 全部成功后清理超出额度的最终备份文件，始终保留本次新备份；备份失败时不清理已有的最终备份。
+   - 删除失败时记日志，保留超出额度的文件，后续成功备份时再次清理。保留顺序由备份序号保证，时钟回拨不改变它。
+   - 新备份校验、文件 fsync、重命名及首次目录 fsync 全部成功后，本次备份即成功。清理旧文件后的目录 fsync 失败只记 `warn`，不改变本次成功结果或 `/health` 的成功状态。
+     新备份已持久化；清理目录 fsync 失败只影响旧文件删除的持久性，断电后旧文件可能重新出现。
+4. 本次备份的结果（成功：完成时的 `now()` 与 `n`；失败：失败时的 `now()`）在保留清理之后交给 `/health`（见「HTTP 约定」）。
+   失败只记日志并反映在 `/health`，不重试、不退出进程，不影响写入；下一次触发照常执行。
+
+**触发**：
+- 定时备份在每个 UTC 整点（Unix 毫秒是 3 600 000 的整数倍）一次。
+  - 按 UTC 而不是当地钟点：避开夏令时不存在或重复的钟点；时区偏移是整小时时两者相同。
+- 闭店备份在每天门店当地时间 `closing_backup_time` 一次（配置项，`'HH:MM'`，按 `timezone` 换算，默认 `"23:30"`，格式非法拒绝启动），由 `boh_domain::time::next_closing_backup` 计算：
+  当地不存在的时刻（夏令时跳过）顺延跳过的时长，重复的时刻只在第一次触发。
+- 等待的触发时刻是当前时间之后（严格大于）的第一个触发时刻。启动时不立即备份。
+  到期时先按当时的时间算出下一个触发时刻，再提交本次备份；时钟一次向前跨过多个触发时刻，每种触发只触发一次，不补跑。
+- 时钟回拨后，按回拨后的时间重新计算等待的触发时刻；回拨跨过已经触发的时刻时，该时刻会再触发一次。
+  - 只靠 `Clock::sleep_until` 会一直等到回拨前算出的时刻：时钟跳到一年后再拨回，备份会停一年。
+- 两种触发共用串行的备份任务入口，禁止并发备份。触发时已有备份在执行则排队，同一种触发最多排队一次；两种触发同时到期时各执行一次。
+- `VACUUM INTO` 期间持有读快照，会推迟 WAL checkpoint。
+
+**关闭**：收到停止信号后不再接受新的触发；先执行完正在进行和已排队的备份（日志提示剩余个数），再关写线程。
+- 不拒绝关闭：SIGTERM 来自 systemd、重启或关机，不响应只会在超时后被 SIGKILL，打断备份和 checkpoint。
+- `deploy/boh.service` 的 `TimeoutStopSec = 120`，给排队的备份留时间；超时被强杀时，残留的临时文件由下一次备份清理。
+
+**测试**：
+- **恢复演练写成测试**：从备份恢复、清空投影并重建，结果必须和原库一致。只验证备份文件生成了不算数。
+  - 比对的是同一份快照：取得备份后原库不再写入。
+- 保留策略测试覆盖默认值与非法配置、第 N+1 份成功后清理、失败不清理、重启后序号继续递增、时钟回拨以及定时 / 闭店触发的串行执行。
+  失败场景必须确定能触发，不依赖目录权限（root 不受权限限制）。
+- 触发测试用可注入的时钟覆盖：整点与 `closing_backup_time` 到期、`closing_backup_time` 默认值与非法格式、启动不备份、跨过多个整点只触发一次、回拨重算、备份执行中到期的排队、关闭时执行完排队的备份。
+
+异地复制（有公网用对象存储，没有公网用 NAS 或双盘轮换）本期不开发。
 
 ### 迁移
 - 迁移文件一旦发布（合并到主干）**禁止修改**，只能新增下一个编号的文件。schema 测试对每个迁移文件做内容校验和。
@@ -259,7 +294,7 @@ scripts/        CI 扫描脚本。
   |---|---|
   | `rusqlite::Connection::open*` | `boh-storage/src/connection.rs`、备份模块 |
   | `boh_storage::testing` 中的函数 | 锁定测试及 `spec_support/` |
-  | `boh_app::test_router` | 锁定测试及 `spec_support/` |
+  | `boh_app::test_router`、`boh_app::test_node` | 锁定测试及 `spec_support/` |
   | `std::time::SystemTime::now`、`jiff::Timestamp::now`、`jiff::Zoned::now`、`jiff::tz::TimeZone::system`、`jiff::tz::TimeZone::try_system` | 时钟模块 |
   | `std::thread::sleep` | 无 |
   | `HashMap` / `HashSet`（`boh-domain`） | 无 |
@@ -267,7 +302,9 @@ scripts/        CI 扫描脚本。
   crate 级 `clippy.toml` 会覆盖根目录的配置，所以根目录的规则要完整复制进去。
 - 禁止在上表以外的位置豁免这些 lint，禁止用 crate 级 `#![allow]` 放宽任何 deny 的 lint。
 - Release 配置 `panic = "abort"`：任何 panic 都直接结束进程，由 systemd 重启。不要用 `catch_unwind` 吞 panic。
-- 优雅关闭顺序：停止接收 HTTP → 停止同步 worker 和定时任务 → `WriterHandle::shutdown()` 处理完已入队的写任务 → `wal_checkpoint(TRUNCATE)` → 退出。
+- 优雅关闭顺序：停止接收 HTTP → 停止同步 worker 和定时任务（执行完正在进行和已排队的备份） → `WriterHandle::shutdown()` 处理完已入队的写任务 → `wal_checkpoint(TRUNCATE)` → 退出。
+  - checkpoint 因读事务未结束而未能截断 WAL（`CheckpointBusy`）时只记 `warn`，正常退出：已提交的事务已持久化在 WAL 中，下次打开时 SQLite 用保留的 WAL 读取并在需要时恢复已提交状态，checkpoint 在之后满足触发条件时执行。
+    只有 `CheckpointBusy` 这样处理；I/O 错误、数据库损坏、关闭连接失败等照常报错。
 
 ### 机器强制
 
@@ -308,8 +345,26 @@ scripts/        CI 扫描脚本。
 - 写命令成功一律 `200`，重试返回的原响应也是 `200`。
 - `409 IDEMPOTENCY_CONFLICT` 的 `details` 是 `{"fields": [...]}`：`command_type` 不同时只列 `"command_type"`；否则列出规范化请求中取值不同或只在一方出现的顶层字段名，按字典序排列。规范化请求包含路径参数（如设备 ID）。
 - 内部错误只记日志，不把 SQL / 内部细节返回给客户端。
-- `/health` 暴露：`clock_regression_ms`（超过 5 分钟为 `degraded`）、`last_backup_ok_at`、`last_backup_seq`、WAL 文件大小、最近一次不变量自检的结果；认证实现后加 `auth_failures_last_hour`；同步实现后加 `max(seq) − acked_seq` 和最后一次成功同步的时间。
-  不变量自检由定时任务在读连接上执行，`/health` 只返回最近一次的结果，不现场计算。
+- `GET /health` 不需要身份。`data` 的字段（时间都是 UTC Unix 毫秒）：
+
+  | 字段 | 取值 |
+  |---|---|
+  | `status` | `"ok"` 或 `"degraded"` |
+  | `schema_version` | 数据库的 `user_version` |
+  | `clock_regression_ms` | `max(0, max(store_events.recorded_at) − now)`，账本为空时为 0；含义见 domain.md「时间」时钟异常 |
+  | `last_backup_ok_at` | 本进程最近一次成功备份完成时的 `now()`；本进程还没有成功过时为 `null` |
+  | `last_backup_seq` | 该次备份的 `n`（见「备份」）；同上为 `null` |
+  | `last_backup_failed_at` | 本进程最近一次备份尝试失败时为该次失败时的 `now()`；最近一次尝试成功或还没有尝试时为 `null` |
+  | `wal_size_bytes` | `<数据库文件>-wal` 的大小；文件不存在时为 0 |
+
+  - `clock_regression_ms > 300000`，或 `last_backup_failed_at` 不是 `null`，`status` 为 `degraded`；否则为 `ok`。
+    `degraded` 只是报告：不阻止任何写入，不让进程退出或重启。
+  - 备份字段只反映本进程：`null` 表示「本进程还不知道」，不表示没有备份；重启会清掉失败状态。`ok` 只表示本进程暂未发现异常，不表示已有一份可用备份。
+    判断备份是否过期、重启前的历史，留到需要「门店当前是否受有效备份保护」时另行设计。
+  - 生成报告成功返回 `200`（含 `degraded`）；查询数据库或读取 WAL 文件失败（文件不存在除外）返回 `500 INTERNAL_ERROR`。监控必须看 `data.status`，不能只看状态码。
+  - 后续加入的字段：认证实现后加 `auth_failures_last_hour`；同步实现后加 `max(seq) − acked_seq` 和最后一次成功同步的时间；
+    库存切片实现不变量自检后加最近一次的结果（检查范围、结果结构、检查任务自身失败与发现不变量被破坏如何分别报告，随该切片定）。
+  - 不变量自检由定时任务在读连接上执行：启动时一次，之后每个 UTC 整点后 30 分一次；`/health` 只返回最近一次的结果，不现场计算。
 
 ---
 

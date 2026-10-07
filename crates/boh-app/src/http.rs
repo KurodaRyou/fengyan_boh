@@ -223,19 +223,74 @@ async fn list_temperature_readings(
 struct Health {
     status: &'static str,
     schema_version: i64,
+    clock_regression_ms: u64,
+    last_backup_ok_at: Option<boh_domain::UnixMillis>,
+    last_backup_seq: Option<i64>,
+    last_backup_failed_at: Option<boh_domain::UnixMillis>,
+    wal_size_bytes: u64,
 }
 
 async fn health(State(state): State<AppState>) -> Result<Json<Envelope<Health>>, ApiError> {
-    let version = state.readers.call(schema_version).await?;
+    let (version, latest) = state
+        .readers
+        .call(|conn| -> Result<_, StorageError> {
+            Ok((
+                schema_version(conn)?,
+                conn.query_row("SELECT max(recorded_at) FROM store_events", [], |r| {
+                    r.get::<_, Option<i64>>(0)
+                })?,
+            ))
+        })
+        .await?;
+    let now = state.clock.now();
+    let clock_regression_ms = clock_regression(latest, now);
+    let mut wal_path = state.db_path.into_os_string();
+    wal_path.push("-wal");
+    let wal_size_bytes = tokio::task::spawn_blocking(move || match std::fs::metadata(wal_path) {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error),
+    })
+    .await
+    .map_err(ApiError::internal)?
+    .map_err(ApiError::internal)?;
+    let backup = state.backup_health.snapshot();
     Ok(ok(Health {
-        status: "ok",
+        status: if clock_regression_ms > 300_000 || backup.last_failed_at.is_some() {
+            "degraded"
+        } else {
+            "ok"
+        },
         schema_version: version,
+        clock_regression_ms,
+        last_backup_ok_at: backup.last_ok_at,
+        last_backup_seq: backup.last_seq,
+        last_backup_failed_at: backup.last_failed_at,
+        wal_size_bytes,
     }))
+}
+
+fn clock_regression(latest: Option<i64>, now: boh_domain::UnixMillis) -> u64 {
+    latest
+        .and_then(|time| i128::from(time).checked_sub(i128::from(now.0)))
+        .and_then(|difference| u64::try_from(difference).ok())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clock_regression_preserves_the_full_timestamp_difference() {
+        use boh_domain::UnixMillis;
+        assert_eq!(clock_regression(None, UnixMillis(i64::MIN)), 0);
+        assert_eq!(
+            clock_regression(Some(i64::MAX), UnixMillis(i64::MIN)),
+            u64::MAX
+        );
+        assert_eq!(clock_regression(Some(i64::MIN), UnixMillis(i64::MAX)), 0);
+    }
 
     #[test]
     fn success_envelope_shape() {

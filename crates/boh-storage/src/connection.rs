@@ -43,7 +43,7 @@ pub(crate) fn checkpoint_truncate(conn: &Connection) -> Result<(), StorageError>
     Ok(())
 }
 
-fn apply_pragmas(conn: &Connection) -> Result<(), StorageError> {
+pub(crate) fn apply_pragmas(conn: &Connection) -> Result<(), StorageError> {
     conn.busy_timeout(BUSY_TIMEOUT)?;
     let mode: String =
         conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
