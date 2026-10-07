@@ -16,7 +16,7 @@
 - 实现 agent **不得**修改 `.github/CODEOWNERS` 列出的任何受保护路径（本文件、`docs/`、迁移、锁定测试、CI 与构建配置等）。
   发现规则不合理或缺失时，停下来在交付说明里提出，不要绕过。
 - 「尚未设计」一节和 `docs/domain.md`「待确认问题」中的内容，在设计落地到文档之前**不要实现**。
-- 交付前必须本地通过：`cargo fmt --all`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`、`scripts/ci-scan.sh`。
+- 交付前必须本地通过：`cargo fmt --all`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`、`scripts/ci-scan.sh`、`scripts/check-locked-paths.sh`。
 - 交付说明写清：改了哪些文件、对应「开发顺序」的哪几步、有哪些未决问题。之后由 Claude 做 code review。
 - 合入：`main` 只接受 PR，CI `check` 必须通过，禁止强推和删除；不要求 PR 批准。
   - 所有提交和 PR 都用同一个 GitHub 账号，作者不能批准自己的 PR。锁定路径由本文件规则、Codex 自动 review、Claude review 把关，人确认后合入。
@@ -43,6 +43,8 @@
 - 实现 agent 认为锁定测试有错时，停下来在交付说明里提出。不得修改，不得加 `#[ignore]`，不得用 `cfg`、feature 或 Cargo 配置让它不编译、不运行。
 - 合入方式：锁定测试以 `spec:` 提交（由人提交）；实现 agent 在其上开发，测试与实现在同一个 PR 合入。
   Review 的比对基准是切片分支开头连续的 `spec:` / `docs:` 提交中的最后一个，`git diff <比对基准> HEAD -- <锁定路径>` 必须为空。PR 打开后又有新提交时，合入前评论 `@codex review` 重新触发 Codex review。
+  - CI 的 `scripts/check-locked-paths.sh` 逐个提交检查：比对基准之后的提交（含合并提交中手工解决的冲突）不得改锁定路径。
+  - 锁定路径与主干冲突时，把开头的 `spec:` / `docs:` 提交 rebase 到新主干上，不在合并提交里解决。
 
 ### 文档分层
 - `AGENTS.md`、`docs/`：只写**当前生效的结论**。不写讨论过程、问答记录、被否决的方案、修改历史。
@@ -256,7 +258,7 @@ scripts/        CI 扫描脚本。
 | 重放结果确定 | 锁定的重放一致性测试 |
 | 防止溢出 | `overflow-checks` + `checked_*` |
 | 业务规则正确 | 锁定的验收用例，预期值由人工确认 |
-| 锁定测试、CI、构建配置不被改动 | 锁定路径清单（`.github/CODEOWNERS`）+ `main` 分支保护（只接受 PR、CI 通过、禁止强推）+ Codex 与 Claude review 比对切片分支开头连续的 `spec:` / `docs:` 提交中的最后一个 |
+| 锁定测试、CI、构建配置不被改动 | 锁定路径清单（`.github/CODEOWNERS`）+ `main` 分支保护（只接受 PR、CI 通过、禁止强推）+ `scripts/check-locked-paths.sh`（CI 逐个提交检查，比对基准之后不得改锁定路径）+ Claude review |
 
 ---
 
@@ -350,6 +352,8 @@ ARM 门店机改用 `aarch64-unknown-linux-musl`。部署文件见 `deploy/`。
 - 修改了 `.github/CODEOWNERS` 列出的锁定路径，而该改动所在提交的信息不以 `spec:` 或 `docs:` 开头。逐个列出这些文件。
 - 在不以 `spec:` / `docs:` 开头的提交中让锁定测试（`crates/*/tests/spec_*.rs`、`spec_support/`、`golden/`、`crates/boh-storage/tests/schema.rs`）失效：
   修改预期值、删除用例、加 `#[ignore]`、用 `cfg` / feature 排除、在 `Cargo.toml` 中设置 `test = false` / `autotests = false`、改 CI 让测试不运行。
+- 以上两条由 CI 的 `scripts/check-locked-paths.sh` 逐个提交检查，Codex 不报；Claude review 照常逐个提交核对。
+  - Codex review 看到的是整个 PR 压成的一个提交（作者为 Codex，提交信息取 PR 标题），分不出改动属于哪个提交，报出的都是误报。
 - 修改已合入 `main` 的迁移文件。
 
 **P1**
