@@ -30,7 +30,9 @@ if (( ${#pathspecs[@]} == 0 )); then
     exit 1
 fi
 
-empty_tree=$(git hash-object -t tree /dev/null)
+empty_blob=$(git hash-object -t blob /dev/null)
+conflict_index=$(mktemp)
+trap 'rm -f "$conflict_index"' EXIT
 failed=0
 leading=1
 baseline=$(git rev-parse --short "$(git merge-base "$base" "$head")")
@@ -53,10 +55,11 @@ while read -r commit; do
         # Any conflict on a locked path fails: some (e.g. modify/delete) leave no markers in the re-created tree.
         conflicted=$(printf '%s\n' "$merged" | sed 1d)
         if [[ -n "$conflicted" ]]; then
-            locked=$(for tree in "$commit^1" "$commit^2" "$recreated"; do
-                git diff --name-only "$empty_tree" "$tree" -- "${pathspecs[@]}"
-            done)
-            changed+=$'\n'$(printf '%s\n' "$conflicted" | grep -Fx -f <(printf '%s\n' "$locked") || true)
+            # Match the reported paths themselves: some (e.g. the source of a rename/rename) exist in no tree here.
+            rm -f "$conflict_index"
+            printf '%s\n' "$conflicted" | sed "s/^/100644 $empty_blob\t/" |
+                GIT_INDEX_FILE=$conflict_index git update-index --index-info
+            changed+=$'\n'$(GIT_INDEX_FILE=$conflict_index git ls-files -- "${pathspecs[@]}")
         fi
         changed=$(printf '%s\n' "$changed" | sed '/^$/d' | sort -u)
     else
