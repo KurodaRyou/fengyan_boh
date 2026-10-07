@@ -8,7 +8,7 @@ use boh_domain::equipment::{
 use boh_domain::temperature::{
     LogTemperature, TemperatureLogged, TemperatureQuery, TemperatureReading,
 };
-use boh_domain::time::{CaptureTimes, TimeError, business_date, calibrate};
+use boh_domain::time::{CaptureTimes, business_date, calibrate};
 use boh_domain::{AggregateId, CommandId, EventId, UnixMillis};
 use boh_storage::StorageError;
 use boh_storage::ledger::{self, Command, Event, ExecuteError, Ledger};
@@ -208,13 +208,13 @@ pub async fn log_temperature(
                         },
                         recorded_at,
                     )
-                    .map_err(capture_time_error)?;
+                    .map_err(ApiError::from)?;
                     let date = business_date(
                         calibrated.occurred_at,
                         &state.timezone,
                         state.business_day_cutoff,
                     )
-                    .map_err(capture_time_error)?;
+                    .map_err(ApiError::from)?;
                     let exists: bool = tx
                         .query_row(
                             "SELECT EXISTS(SELECT 1 FROM equipment WHERE id = ?1)",
@@ -229,7 +229,7 @@ pub async fn log_temperature(
                             "equipment not found",
                         )
                         .with_details(json!({
-                            "entity": "EQUIPMENT", "id": command.equipment_id
+                            "entity": "EQUIPMENT", "id": command.equipment_id.to_string()
                         })));
                     }
                     let id = AggregateId::from_parts(recorded_at, ledger::entropy(tx)?)
@@ -336,22 +336,6 @@ fn read_temperature(row: &Row<'_>) -> boh_storage::rusqlite::Result<TemperatureR
         actor_id: id(7)?,
         device_id: id(8)?,
     })
-}
-
-fn capture_time_error(error: TimeError) -> ApiError {
-    match error {
-        TimeError::CaptureTooOld => ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "CAPTURE_TOO_OLD",
-            "capture is more than 72 hours old",
-        ),
-        TimeError::InvalidProductionTime => ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "INVALID_PRODUCTION_TIME",
-            "production start is after completion",
-        ),
-        TimeError::OutOfRange => ApiError::validation(),
-    }
 }
 
 fn read_equipment(row: &Row<'_>) -> boh_storage::rusqlite::Result<Equipment> {

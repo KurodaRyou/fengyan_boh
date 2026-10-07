@@ -18,6 +18,7 @@ use crate::{
 use boh_domain::AggregateId;
 use boh_domain::equipment::{CreateEquipment, UpdateEquipment};
 use boh_domain::temperature::{LogTemperature, TemperatureQuery};
+use boh_domain::time::TimeError;
 
 /// 所有接口的统一响应格式：`{ "success", "data", "warnings", "error" }`。
 #[derive(Debug, Serialize)]
@@ -114,6 +115,24 @@ impl IntoResponse for ApiError {
 impl From<StorageError> for ApiError {
     fn from(err: StorageError) -> Self {
         Self::internal(err)
+    }
+}
+
+impl From<TimeError> for ApiError {
+    fn from(error: TimeError) -> Self {
+        match error {
+            TimeError::CaptureTooOld => Self::new(
+                StatusCode::BAD_REQUEST,
+                "CAPTURE_TOO_OLD",
+                "capture is more than 72 hours old",
+            ),
+            TimeError::InvalidProductionTime => Self::new(
+                StatusCode::BAD_REQUEST,
+                "INVALID_PRODUCTION_TIME",
+                "production start is after completion",
+            ),
+            TimeError::OutOfRange => Self::validation(),
+        }
     }
 }
 

@@ -27,16 +27,11 @@ impl LogTemperature {
 }
 
 // Field order is part of the published payload's serialized form.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TemperatureLogged {
     pub equipment_id: AggregateId,
     pub celsius_x10: i64,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "present_note"
-    )]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
 
