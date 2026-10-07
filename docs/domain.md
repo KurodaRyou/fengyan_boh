@@ -62,7 +62,9 @@ occurred_at = recorded_at − lag
 - 生产带 `started_at` 时必须满足 `started_at <= occurred_at`（相等允许），相对校准和显式补录都适用。不满足时返回 `400 INVALID_PRODUCTION_TIME`，不写事件或 `processed_commands`；此校验与其他业务校验一样在幂等检查之后执行。
 - **营业日**：配置项 `timezone = "Asia/Shanghai"`（IANA 时区名）、`business_day_cutoff = "04:00"`（`'HH:MM'`），都必填，缺失或非法时拒绝启动。`occurred_at` 换算到门店当地时间，早于日切的算前一营业日。由 `jiff` 纯函数计算。修改日切配置不重算历史事件。
 - **展示与导出**：记录的展示和导出同时给出操作人、设备、`recorded_at` 和 `occurred_at`。不设阈值、不打标签，由复核的人比对两者判断。被纠错的记录与它的更正、冲销按聚合 version 顺序一起展示。
-- **时钟异常**：`recorded_at` 不保证递增，这是预期行为。`/health` 暴露 `clock_regression_ms = max(0, max(recorded_at) − now)`，超过 5 分钟时状态为 `degraded`，**不拒绝写入**。
+- **时钟异常**：`recorded_at` 不保证递增，这是预期行为。`/health` 暴露 `clock_regression_ms = max(0, max(store_events.recorded_at) − now)`，超过 5 分钟时状态为 `degraded`，**不拒绝写入**。
+  - 它表示「账本中最晚的一条记录比当前时钟超前多少」，不是「最近一次回拨了多少」。主要发现当前时钟落后（如断网的门店机断电后主板时钟复位，拿不到 NTP）；只要再写入记录，「最新一条事件的 `recorded_at`」就会跟着落后，发现不了这种情况。
+  - 时钟曾跳到未来、写入记录后又被拨回时，账本只追加，那条记录一直在：指标持续 `degraded`，直到真实时间追上它。两种情况从账本上分不出来，需要结合当前时间判断。
 
 ## 主数据
 
@@ -116,16 +118,16 @@ occurred_at = recorded_at − lag
 
 ### 温度记录接口
 
-| 方法与路径 | `command_type` | 请求体 / 查询参数 | 权限 |
+| 方法与路径 | `command_type` | 请求体 / 查询参数（`boh_domain::temperature`） | 权限 |
 |---|---|---|---|
-| `POST /api/v1/temperature-readings` | `temperature.log` | `command_id`, `equipment_id`, `celsius_x10`, `note?`, `captured_at`, `sent_at` | 已认证员工 |
-| `GET /api/v1/temperature-readings` | — | `business_date`, `equipment_id?` | 已认证员工 |
+| `POST /api/v1/temperature-readings` | `temperature.log` | `LogTemperature` | 已认证员工 |
+| `GET /api/v1/temperature-readings` | — | `TemperatureQuery` | 已认证员工 |
 
-- 行为 `{temperature_reading_id, equipment_id, celsius_x10, note?, business_date, occurred_at, recorded_at, actor_id, device_id}`，`note` 缺省时省略该键。写命令成功的 `data` 是 `{"temperature_reading": 行}`，查询的 `data` 是 `{"temperature_readings": [行…]}`。
+- 写命令成功的 `data` 是 `{"temperature_reading": 行}`，查询的 `data` 是 `{"temperature_readings": [行…]}`；行为 `boh_domain::temperature::TemperatureReading`。
 - **取值**：不满足时 `400 VALIDATION_FAILED`。
   - `celsius_x10` 是 0.1 °C 的整数，`-500`～`5000`（-50.0～500.0 °C），两端可取。它只拦截单位或数量级录错，不是食安阈值，不产生警告。
   - `note` 可以省略；出现时非空、首尾不能有空白字符、最多 200 个字符（按 Unicode 字符计），不接受 `null`。首尾以外的空白和换行原样保存。
-  - `equipment_id` 是 UUIDv7；`captured_at`、`sent_at` 是整数毫秒。请求体不接受 `occurred_at`（补录入口见「时间」）。
+  - 请求体不接受 `occurred_at`（补录入口见「时间」）。
 - **新建**：服务端生成 UUIDv7 作为读数 ID（聚合 ID），写一条 `aggregate_version = 1` 的 `TEMPERATURE_LOGGED`。
   - `occurred_at`、`business_date` 按「时间」的相对校准计算。相对校准和营业日计算属于业务校验，在幂等检查之后执行。
     - 理由：`recorded_at` 在写事务内才确定，`sent_at` 不在规范化请求中。重试即使带着会超限或溢出的新 `sent_at`，也返回首次响应，不重新校准。
@@ -213,7 +215,7 @@ occurred_at = recorded_at − lag
 | `STOCK_COUNT_SUBMITTED` | `STOCK_COUNT` | `purpose`（`CLOSING` / `AUDIT`）, `lines[{item_id, lot_id?, counted_qty}]` | 无 |
 | `STOCK_ADJUSTED` | `STOCK_COUNT` | `lines[{item_id, lot_id?, book_qty, counted_qty, delta}]`, `new_lots[{lot_id, item_id, qty}]` | 批次和账外缺口按 delta 变化；新建盘盈批次；写 `inventory_counts` |
 | `PURCHASE_ORDER_SUBMITTED` | `PURCHASE_ORDER` | `supplier_id`, `lines[{item_id, qty, input}]`, `deliver_on`（门店当地日期 `'YYYY-MM-DD'`） | 无 |
-| `TEMPERATURE_LOGGED` | `TEMPERATURE_READING` | `equipment_id`, `celsius_x10`, `note?` | 写 `temperature_readings` |
+| `TEMPERATURE_LOGGED` | `TEMPERATURE_READING` | `boh_domain::temperature::TemperatureLogged`；样本 `crates/boh-app/tests/golden/TEMPERATURE_LOGGED@1/` | 写 `temperature_readings` |
 | `QUANTITY_CORRECTED` | 与原事件相同 | `corrected_event_id`, `reason`, `lines[{line_ref, item_id, physical_at, old_qty, new_qty, delta, input?, line_cost_cents?, alloc \| absorbed_by_event_id}]` | 按差额调整（或被吸收），见「纠错」 |
 | `EVENT_REVERSED` | 与原事件相同 | `reversed_event_id`, `reason`, `lines[{line_ref, item_id, physical_at, qty, alloc \| absorbed_by_event_id}]` | 精确取反（或被吸收），见「纠错」 |
 | `SALES_IMPORTED` | `SALES_DAY` | `source`（`CSV` / `XLSX`）, `file_name`, `lines[{item_id, qty, amount_cents}]`, `ignored_rows`（整数） | 覆盖 `daily_sales` 中该营业日；**不写库存流水** |
@@ -378,7 +380,7 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 
 ## 投影表
 
-表结构随库存切片进入 004，下面的 SQL 是设计意图，**不冻结**：
+表结构随库存切片进入 005，下面的 SQL 是设计意图，**不冻结**：
 
 ```sql
 CREATE TABLE inventory_lots (
@@ -442,7 +444,7 @@ CREATE INDEX idx_inventory_counts_item ON inventory_counts(item_id, observed_at)
 - **批次追溯是账面推定**。员工实际拿的批次和系统推定的不一致时，批次余量会偏离实物，直到下一次盘点。
 - **被吸收的收货不建批次**。那批货在批次层面的来源由盘点产生的 `COUNT_GAIN` 批次代替。被吸收的冲销也不会把错误收货建出的批次扣掉，这些批次按 FIFO 自然消耗。
 - **盘点期间的实物变动**：系统不检测，靠操作规范禁止，违反时由重盘纠正。
-- **时钟**：系统时钟跳到未来再拨回时，期间事件的 `business_date` 是错的，不能自动修正；`/health` 会暴露这种情况。
+- **时钟**：系统时钟跳到未来再拨回时，期间事件的 `business_date` 是错的，不能自动修正；`/health` 会暴露这种情况，并持续 `degraded` 到真实时间追上那些记录（见「时间」时钟异常）。
 - **发生时间由员工声明**：`captured_at`、`sent_at`、生产的 `started_captured_at` 和补录的 `occurred_at` 都由客户端提交，已认证员工可以伪造；HTTPS、设备令牌和 PIN 不能证明真实录入时间。伪造会改变记录归属的营业日、盘点窗口和吸收判定。温度记录的时间就是记录内容，伪造即记录造假。系统只保证留痕（见「时间」展示与导出），防伪造靠 [SOP](sop.md) 与店长复核。实时录入不受 Q6 锁账日约束。
 - **门店节点长时间宕机**时没有离线写入能力，改用纸质登记，恢复后走补录入口，见 [SOP](sop.md)。
 - **客户端暂存**：普通命令只承诺页面不刷新期间，命令进入 `IndexedDB` 队列，界面显示「待提交 N 条」。盘点草稿是例外，可跨刷新、休眠恢复，规则见「盘点」第 1 条。客户端不维护库存镜像，不做批次分配。排队命令补交被拒时，界面列出命令和原因，由人工处理。
