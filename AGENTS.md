@@ -21,6 +21,7 @@
 - 合入：`main` 只接受 PR，CI `check` 必须通过，禁止强推和删除；不要求 PR 批准。
   - 所有提交和 PR 都用同一个 GitHub 账号，作者不能批准自己的 PR。锁定路径由本文件规则、Codex 自动 review、Claude review 把关，人确认后合入。
 - 锁定路径（`.github/CODEOWNERS` 列出的路径）的改动只能出现在人或 Claude 提交、提交信息以 `spec:`（锁定测试）或 `docs:`（规则、设计、迁移、CI 与构建配置）开头的提交中。
+  - 实现 agent 的提交不得以 `spec:` / `docs:` 开头。
 - 切片需要的依赖、构建或 CI 改动用 `docs:` 提交，放在 `spec:` 提交之前。
 
 ### 测试分工
@@ -43,6 +44,8 @@
 - 实现 agent 认为锁定测试有错时，停下来在交付说明里提出。不得修改，不得加 `#[ignore]`，不得用 `cfg`、feature 或 Cargo 配置让它不编译、不运行。
 - 合入方式：锁定测试以 `spec:` 提交（由人提交）；实现 agent 在其上开发，测试与实现在同一个 PR 合入。
   Review 的比对基准是切片分支开头连续的 `spec:` / `docs:` 提交中的最后一个，`git diff <比对基准> HEAD -- <锁定路径>` 必须为空。PR 打开后又有新提交时，合入前评论 `@codex review` 重新触发 Codex review。
+  - 把分支交给实现 agent 时，人或 Claude 在交接说明中写明比对基准（交接时的分支 HEAD）。Review 时 `scripts/check-locked-paths.sh` 输出的 baseline 必须与之相同。
+    - 所有提交用同一身份，脚本分不出提交者；agent 在交接后加的 `spec:` / `docs:` 提交会被当作分支开头的一部分，只能靠比对基准发现。
   - CI 的 `scripts/check-locked-paths.sh` 逐个提交检查：比对基准之后的提交不得改锁定路径；合并提交的锁定路径必须与 Git 自动合并的结果一致。
   - 锁定路径与主干冲突时，把开头的 `spec:` / `docs:` 提交 rebase 到新主干上，不在合并提交里解决。
 
@@ -354,6 +357,7 @@ ARM 门店机改用 `aarch64-unknown-linux-musl`。部署文件见 `deploy/`。
   修改预期值、删除用例、加 `#[ignore]`、用 `cfg` / feature 排除、在 `Cargo.toml` 中设置 `test = false` / `autotests = false`、改 CI 让测试不运行。
 - 以上两条由 CI 的 `scripts/check-locked-paths.sh` 逐个提交检查，Codex 不报；Claude review 照常逐个提交核对。
   - Codex review 看到的是整个 PR 压成的一个提交（作者为 Codex，提交信息取 PR 标题），分不出改动属于哪个提交，报出的都是误报。
+  - Claude review 另须核对：脚本输出的 baseline 与交接时写明的比对基准相同，否则按 P0 处理。
 - 修改已合入 `main` 的迁移文件。
 
 **P1**
