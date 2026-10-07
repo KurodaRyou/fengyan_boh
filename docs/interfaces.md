@@ -266,7 +266,7 @@ impl BackupHold {
   - 配置：`store_id`、`business_day_cutoff`、开发桩同 `test_router`；`timezone` 同时用于营业日和闭店备份；时区或 `closing_backup_time` 非法时返回 `Err`。
   - 返回时，调度任务已按 `clock` 当时的时间算好第一个触发时刻。
 - `router`：与生产入口相同的路由；`/health` 反映本节点的备份结果。
-- `hold_backups`：返回的句柄存在期间，每次开始的备份在取得开始时间（文件名中的时间）之后、读取 `seq_before` 之前等待；所有句柄释放后继续。
+- `hold_backups`：返回的句柄存在期间，每次开始的备份在取得开始时间（文件名中的时间）并读取 `seq_before` 之后、执行 `VACUUM INTO` 之前等待；所有句柄释放后继续。
   - `started()`：有备份正在等待该句柄时返回（已在等待则立即返回）。
   - 句柄不借用 `TestNode`：持有句柄时也可以调用 `shutdown`，`shutdown` 会等到句柄释放、队列执行完。
 - `shutdown`：不再接受新的触发，执行完正在进行和已排队的备份，再 `WriterHandle::shutdown()`。返回后不留任何后台任务。
