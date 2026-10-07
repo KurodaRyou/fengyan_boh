@@ -7,6 +7,7 @@ use crate::StorageError;
 const MIGRATIONS: &[&str] = &[
     include_str!("../../../migrations/001_initial_schema.sql"),
     include_str!("../../../migrations/002_equipment.sql"),
+    include_str!("../../../migrations/003_temperature_readings.sql"),
 ];
 
 pub const LATEST_SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;

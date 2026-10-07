@@ -114,6 +114,28 @@ occurred_at = recorded_at − lag
 - **修改**：请求体不含 `code`，快照中的 `code` 取当前值。设备不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": "EQUIPMENT", "id"}`。`base_revision` 规则见上。
   - 新快照与当前快照相同时不写事件，命令照常成功并写入 `processed_commands`，响应为当前行。
 
+### 温度记录接口
+
+| 方法与路径 | `command_type` | 请求体 / 查询参数 | 权限 |
+|---|---|---|---|
+| `POST /api/v1/temperature-readings` | `temperature.log` | `command_id`, `equipment_id`, `celsius_x10`, `note?`, `captured_at`, `sent_at` | 已认证员工 |
+| `GET /api/v1/temperature-readings` | — | `business_date`, `equipment_id?` | 已认证员工 |
+
+- 行为 `{temperature_reading_id, equipment_id, celsius_x10, note?, business_date, occurred_at, recorded_at, actor_id, device_id}`，`note` 缺省时省略该键。写命令成功的 `data` 是 `{"temperature_reading": 行}`，查询的 `data` 是 `{"temperature_readings": [行…]}`。
+- **取值**：不满足时 `400 VALIDATION_FAILED`。
+  - `celsius_x10` 是 0.1 °C 的整数，`-500`～`5000`（-50.0～500.0 °C），两端可取。它只拦截单位或数量级录错，不是食安阈值，不产生警告。
+  - `note` 可以省略；出现时非空、首尾不能有空白字符、最多 200 个字符（按 Unicode 字符计），不接受 `null`。首尾以外的空白和换行原样保存。
+  - `equipment_id` 是 UUIDv7；`captured_at`、`sent_at` 是整数毫秒。请求体不接受 `occurred_at`（补录入口见「时间」）。
+- **新建**：服务端生成 UUIDv7 作为读数 ID（聚合 ID），写一条 `aggregate_version = 1` 的 `TEMPERATURE_LOGGED`。
+  - `occurred_at`、`business_date` 按「时间」的相对校准计算。相对校准和营业日计算属于业务校验，在幂等检查之后执行。
+    - 理由：`recorded_at` 在写事务内才确定，`sent_at` 不在规范化请求中。重试即使带着会超限或溢出的新 `sent_at`，也返回首次响应，不重新校准。
+  - `CAPTURE_TOO_OLD`、时间溢出的 `VALIDATION_FAILED` 以及警告 `CAPTURE_TIME_ADJUSTED` 的 `details` 都是 `{}`。
+  - 设备不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": "EQUIPMENT", "id"}`。停用的设备照常受理；不限制 `equipment_type`。
+  - 同时命中多个业务错误时，返回哪一个不作规定。
+- **查询**：`business_date`（`'YYYY-MM-DD'`，真实日期）必填，`equipment_id` 可选；不分页。按 `occurred_at` 升序，相同时按 `seq` 升序；含停用设备的读数。
+  - 参数缺失、取值非法、未知或重复的参数：`400 VALIDATION_FAILED`。`equipment_id` 合法但不存在时返回空数组。
+- 投影 `temperature_readings` 每条读数一行，字段以迁移 003 为准。冲销在投影和查询中的体现随纠错切片设计。
+
 ### 员工认证
 
 - **设备注册**（平板安装时做一次）：在节点上运行 `boh-server enroll-code` 生成一次性注册码。新平板提交注册码和设备名，服务端签发设备令牌，作为 `device_id` 的来源，同时生成这台设备的解锁码。
@@ -191,7 +213,7 @@ occurred_at = recorded_at − lag
 | `STOCK_COUNT_SUBMITTED` | `STOCK_COUNT` | `purpose`（`CLOSING` / `AUDIT`）, `lines[{item_id, lot_id?, counted_qty}]` | 无 |
 | `STOCK_ADJUSTED` | `STOCK_COUNT` | `lines[{item_id, lot_id?, book_qty, counted_qty, delta}]`, `new_lots[{lot_id, item_id, qty}]` | 批次和账外缺口按 delta 变化；新建盘盈批次；写 `inventory_counts` |
 | `PURCHASE_ORDER_SUBMITTED` | `PURCHASE_ORDER` | `supplier_id`, `lines[{item_id, qty, input}]`, `deliver_on`（门店当地日期 `'YYYY-MM-DD'`） | 无 |
-| `TEMPERATURE_LOGGED` | `TEMPERATURE_READING` | `equipment_id`, `celsius_x10`, `note?` | 食安记录 |
+| `TEMPERATURE_LOGGED` | `TEMPERATURE_READING` | `equipment_id`, `celsius_x10`, `note?` | 写 `temperature_readings` |
 | `QUANTITY_CORRECTED` | 与原事件相同 | `corrected_event_id`, `reason`, `lines[{line_ref, item_id, physical_at, old_qty, new_qty, delta, input?, line_cost_cents?, alloc \| absorbed_by_event_id}]` | 按差额调整（或被吸收），见「纠错」 |
 | `EVENT_REVERSED` | 与原事件相同 | `reversed_event_id`, `reason`, `lines[{line_ref, item_id, physical_at, qty, alloc \| absorbed_by_event_id}]` | 精确取反（或被吸收），见「纠错」 |
 | `SALES_IMPORTED` | `SALES_DAY` | `source`（`CSV` / `XLSX`）, `file_name`, `lines[{item_id, qty, amount_cents}]`, `ignored_rows`（整数） | 覆盖 `daily_sales` 中该营业日；**不写库存流水** |
@@ -356,7 +378,7 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 
 ## 投影表
 
-表结构随库存切片进入 003，下面的 SQL 是设计意图，**不冻结**：
+表结构随库存切片进入 004，下面的 SQL 是设计意图，**不冻结**：
 
 ```sql
 CREATE TABLE inventory_lots (

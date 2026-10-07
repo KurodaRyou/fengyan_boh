@@ -8,7 +8,7 @@ use crate::StorageError;
 use crate::ledger::Event;
 
 // The schema comparison test must cover every projection introduced by a migration.
-const PROJECTION_TABLES: &[&str] = &["equipment"];
+const PROJECTION_TABLES: &[&str] = &["equipment", "temperature_readings"];
 
 pub(crate) fn apply(tx: &Transaction<'_>, event: &Event) -> Result<(), StorageError> {
     if event.event_type != "MASTER_DATA_CHANGED"
