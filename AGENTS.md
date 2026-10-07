@@ -47,7 +47,7 @@
   - 把分支交给实现 agent 时，人或 Claude 在交接说明中写明比对基准（交接时的分支 HEAD）。Review 时 `scripts/check-locked-paths.sh` 输出的 baseline 必须与之相同。
     - 所有提交用同一身份，脚本分不出提交者；agent 在交接后加的 `spec:` / `docs:` 提交会被当作分支开头的一部分，只能靠比对基准发现。
   - CI 的 `locked-paths`（`scripts/check-locked-paths.sh`）逐个提交检查：比对基准之后的提交不得改锁定路径；合并提交的锁定路径必须与 Git 自动合并的结果一致，且锁定路径上不得有冲突。
-    - 它用 `pull_request_target` 从基础分支运行 workflow 和脚本，PR 改不了判它的检查；对检查本身的修改合入后才生效。
+    - 它用 `pull_request_target` 从 `main` 运行 workflow 和脚本，PR 改不了判它的检查；对检查本身的修改合入 `main` 后才生效。
   - 锁定路径与主干冲突时，把开头的 `spec:` / `docs:` 提交 rebase 到新主干上，不在合并提交里解决。
 
 ### 文档分层
@@ -262,7 +262,7 @@ scripts/        CI 扫描脚本。
 | 重放结果确定 | 锁定的重放一致性测试 |
 | 防止溢出 | `overflow-checks` + `checked_*` |
 | 业务规则正确 | 锁定的验收用例，预期值由人工确认 |
-| 锁定测试、CI、构建配置不被改动 | 锁定路径清单（`.github/CODEOWNERS`）+ `main` 分支保护（只接受 PR、CI 通过、禁止强推）+ CI `locked-paths`（从基础分支运行 `scripts/check-locked-paths.sh`，逐个提交检查，比对基准之后不得改锁定路径）+ Claude review |
+| 锁定测试、CI、构建配置不被改动 | 锁定路径清单（`.github/CODEOWNERS`）+ `main` 分支保护（只接受 PR、CI 通过、禁止强推）+ CI `locked-paths`（从 `main` 运行 `scripts/check-locked-paths.sh`，逐个提交检查，比对基准之后不得改锁定路径）+ Claude review |
 
 ---
 

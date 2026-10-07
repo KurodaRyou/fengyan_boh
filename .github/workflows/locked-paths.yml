@@ -1,9 +1,11 @@
 name: Locked paths
 
-# pull_request_target runs this file and the checker from the base branch, so a PR cannot change the check that
-# judges it. PR commits are fetched only as Git data: never check them out or execute anything from them here.
+# pull_request_target runs this file from the default branch, and the checker is checked out from there too, so a PR
+# cannot change the check that judges it. PR commits are fetched only as Git data: never check them out or execute
+# anything from them here.
 on:
   pull_request_target:
+    branches: [main]
 
 permissions:
   contents: read
@@ -14,7 +16,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
           fetch-depth: 0
           persist-credentials: false
       - env:
