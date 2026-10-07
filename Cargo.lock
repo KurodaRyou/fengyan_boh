@@ -122,6 +122,8 @@ dependencies = [
  "boh-domain",
  "boh-storage",
  "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
  "toml",
  "tracing",

@@ -78,14 +78,14 @@ occurred_at = recorded_at − lag
 | `EQUIPMENT` | 设备 | `boh_domain::equipment::EquipmentSnapshot`；样本 `crates/boh-app/tests/golden/MASTER_DATA_CHANGED@1/EQUIPMENT.json` |
 
 - 快照是该行变更后的完整内容，不是差量。行的主键是事件的 `aggregate_id`，`revision` 是 `aggregate_version`，都不重复写进快照。`active` 是布尔值。
-- `name` 非空；`code` 非空，在同一实体内唯一。`contact_phone` 是原样保存的文本，不做格式校验。`MANAGER` 是店长，`STAFF` 是普通员工。
+- `name` 非空；`code` 非空，在同一实体内唯一。`contact_phone` 不做格式校验。`MANAGER` 是店长，`STAFF` 是普通员工。
 - `units` 不含基本单位：`unit_code` 等于 `base_unit` 时系数恒为 1。`units` 中的 `unit_code` 在同一物料内唯一、不等于 `base_unit`，按 `unit_code` 升序；系数规则见「单位」。
 - `versions` 按 `version` 升序，从 1 连续编号；`output_qty_per_batch`、`qty_per_batch` 是正整数基本单位；同一版本的 `lines` 中 `item_id` 不重复，顺序为录入顺序。
 - 快照字段与枚举随 `MASTER_DATA_CHANGED@1` 冻结，改动按 AGENTS.md「只追加」升 `schema_version`。
 
 - 主键一律 UUIDv7。`code` 人可读、各门店统一（物料的 `code` 用于销售导入）。
-- `code` 和 `ITEM` 的 `base_unit` 创建后不可修改。
-  理由：账本数量按基本单位存。
+- `code`、`ITEM` 的 `base_unit` 和 `RECIPE` 的 `output_item_id` 创建后不可修改；配方已有的版本不可修改，只能追加新版本。
+  理由：账本数量按基本单位存；配方版本中的产出数量是产出物料的基本单位。
 - 每行带 `revision`，每次变更 +1。主数据只停用（`active = 0`），不删除。
 - HTTP 修改命令携带客户端看到的 `base_revision`，与当前 `revision` 不等时返回 `409 REVISION_CONFLICT`（`details` 为 `{"current_revision": n}`），不写事件或 `processed_commands`。新建命令不带 `base_revision`；主数据包导入按快照逐行比对，不适用此规则。
 - 命令引用已停用的主数据照常受理，停用只在界面上隐藏。
@@ -99,22 +99,70 @@ occurred_at = recorded_at − lag
 - **系统操作人**：初始化和主数据包导入在没有登录员工时，`actor_id` 使用保留 ID `00000000-0000-7000-8000-000000000000`。
 - **系统设备**：初始化和没有登录平板的主数据包导入，`device_id` 使用保留 ID `00000000-0000-7000-8000-000000000001`，表示产生事件的本门店节点。该身份不需要设备注册、设备令牌、解锁码或员工会话，不写入设备注册表；事件的 `device_id` 仍为非空 UUIDv7。
 - 两个保留 ID 不得分配给真实员工或注册平板。系统身份只由节点内部的初始化和主数据包导入入口填写，表示事件来源，不授予 HTTP 访问权限。
-- **初始化**：`boh-server init` 写入 `store_meta`，再创建第一个店长账号（在终端输入两次 PIN）和预置主数据；产生的每条 `MASTER_DATA_CHANGED` 都使用上述系统 `actor_id` 和系统 `device_id`，`source = LOCAL`。没有登录平板的总部包导入同样使用这两个系统 ID，`source = HQ_PACKAGE`。启动时 `store_meta` 为空（未初始化）或与配置里的 `store_id` 不一致，拒绝启动。`store_meta` 已存在时 `init` 拒绝执行，不改动任何数据。
+- **初始化**：`boh-server init` 在一个写事务中写入 `store_meta`、预置主数据和第一个店长账号（在终端输入两次 PIN），任一步失败则全部回滚，可以重新执行。第一个店长随认证切片加入（见 AGENTS.md「路线图」）。
+  - 初始化是一个命令：`command_type` 为 `store.init`，`command_id` 由服务端按 AGENTS.md「ID 与时间」生成；`processed_commands` 中的规范化请求为 `{"store_id": <配置的 store_id>}`，响应为 `{}`。
+  - `store_meta.created_at`、`processed_commands.recorded_at` 和每条事件的 `recorded_at` 都是同一个 `now()`；事件的 `occurred_at = recorded_at`，`business_date` 由它计算。
+  - 产生的每条 `MASTER_DATA_CHANGED` 都使用上述系统 `actor_id` 和系统 `device_id`，`source = LOCAL`，`aggregate_version = 1`。
+  - 预置报损原因按下表顺序写入，全部启用：
 
-### 设备接口
+    | `code` | `name` |
+    |---|---|
+    | `EXPIRED` | 过期 |
+    | `DAMAGED` | 损坏 |
+    | `PRODUCTION_DEFECT` | 生产不良 |
+    | `TASTING` | 试吃 |
+    | `OTHER` | 其他 |
 
-| 方法与路径 | `command_type` | 请求体（`boh_domain::equipment`） | 权限 |
-|---|---|---|---|
-| `POST /api/v1/equipment` | `equipment.create` | `CreateEquipment` | `MANAGER` |
-| `PUT /api/v1/equipment/{equipment_id}` | `equipment.update` | `UpdateEquipment` | `MANAGER` |
-| `GET /api/v1/equipment` | — | — | 已认证员工 |
+  - 没有登录平板的总部包导入同样使用这两个系统 ID，`source = HQ_PACKAGE`。启动时 `store_meta` 为空（未初始化）或与配置里的 `store_id` 不一致，拒绝启动。`store_meta` 已存在时 `init` 拒绝执行，不改动任何数据，以非 0 退出码结束。
 
-- 写命令成功的 `data` 是 `{"equipment": 行}`，行为该命令执行后的设备（`boh_domain::equipment::Equipment`）。查询的 `data` 是 `{"equipment": [行…]}`，含停用的设备，按 `code` 的字节序升序。
-- 取值：`code`、`name` 非空，首尾不能有空白字符；`base_revision` 是正整数；其余字段的类型与枚举见上述结构体。不满足时 `400 VALIDATION_FAILED`。
+### 主数据接口
+
+| 实体 | 路径 | `command_type` 前缀 | 行的 ID 字段 | 单行键 / 列表键 |
+|---|---|---|---|---|
+| `EQUIPMENT` | `/api/v1/equipment` | `equipment` | `equipment_id` | `equipment` / `equipment` |
+| `ITEM` | `/api/v1/items` | `item` | `item_id` | `item` / `items` |
+| `RECIPE` | `/api/v1/recipes` | `recipe` | `recipe_id` | `recipe` / `recipes` |
+| `SUPPLIER` | `/api/v1/suppliers` | `supplier` | `supplier_id` | `supplier` / `suppliers` |
+| `WASTE_REASON` | `/api/v1/waste-reasons` | `waste_reason` | `waste_reason_id` | `waste_reason` / `waste_reasons` |
+
+- 每个实体有三个接口：`POST <路径>` 新建（`<前缀>.create`）、`PUT <路径>/{<ID 字段>}` 修改（`<前缀>.update`）、`GET <路径>` 查询。配方另有追加版本的接口。写接口只允许 `MANAGER`，查询允许已认证员工。
+- 新建请求体：`command_id` 加快照的全部字段（配方例外，见下文）。修改请求体：`command_id`、`base_revision` 加快照中可修改的字段；不可修改的字段不在请求体中，取当前值。各实体的字段见下文。
+- 写命令成功的 `data` 是 `{<单行键>: 行}`，行为该命令执行后的实体：`<ID 字段>`、快照的全部字段、`revision`，可选字段缺省时省略该键。查询的 `data` 是 `{<列表键>: [行…]}`，含停用的，按 `code` 的字节序升序。
+- 取值：`code`、`name` 非空，首尾不能有空白字符；`base_revision` 是正整数；其余字段见下文。不满足时 `400 VALIDATION_FAILED`。
 - 不带 `captured_at` / `sent_at`：`occurred_at = recorded_at`，`business_date` 由它计算。
-- **新建**：服务端生成 UUIDv7 作为设备 ID，写一条 `aggregate_version = 1` 的 `MASTER_DATA_CHANGED`。`code` 已被其他设备使用（含停用的）：`409 CODE_ALREADY_EXISTS`，`details` 为 `{"code", "equipment_id"}`（已占用该 `code` 的设备）。
-- **修改**：请求体不含 `code`，快照中的 `code` 取当前值。设备不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": "EQUIPMENT", "id"}`。`base_revision` 规则见上。
+- **新建**：服务端生成 UUIDv7 作为 ID，写一条 `aggregate_version = 1` 的 `MASTER_DATA_CHANGED`。`code` 已被同一实体的其他行使用（含停用的）：`409 CODE_ALREADY_EXISTS`，`details` 为 `{"code", <ID 字段>}`（已占用该 `code` 的行）。
+- **修改**：行不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": <实体>, "id"}`。`base_revision` 规则见上。
   - 新快照与当前快照相同时不写事件，命令照常成功并写入 `processed_commands`，响应为当前行。
+- **引用**：引用其他主数据的字段必须指向已有的行（含停用的），否则 `404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": <被引用的实体>, "id"}`。
+- 同时命中多个业务错误时，返回哪一个不作规定。
+
+**设备**：请求体与行见 `boh_domain::equipment` 的 `CreateEquipment`、`UpdateEquipment`、`Equipment`。
+
+**物料**：新建 `code`、`name`、`base_unit`、`category`、`default_shelf_life_ms?`、`units`、`active`；修改 `name`、`category`、`default_shelf_life_ms?`、`units`、`active`。
+
+- `default_shelf_life_ms` 可以省略，出现时是正整数，不接受 `null`。修改时省略表示没有默认保质期。
+- `units` 是数组，可以为空，不接受 `null`。每项 `{unit_code, base_qty_per_unit}`：`unit_code` 非空、首尾不能有空白字符、不等于 `base_unit`；`base_qty_per_unit` 是正整数。
+- `units` 必须按 `unit_code` 的字节序严格升序（因此不重复），服务端不重新排序。
+- 修改换算系数、增删单位照常受理，不影响已入账的事件；离线录入的命令按「单位」核对。
+
+**配方**：
+
+| 方法与路径 | `command_type` | 请求体（另含 `command_id`） |
+|---|---|---|
+| `POST /api/v1/recipes` | `recipe.create` | `code`, `name`, `output_item_id`, `active`, `output_qty_per_batch`, `lines` |
+| `PUT /api/v1/recipes/{recipe_id}` | `recipe.update` | `base_revision`, `name`, `active` |
+| `POST /api/v1/recipes/{recipe_id}/versions` | `recipe.add_version` | `base_revision`, `output_qty_per_batch`, `lines` |
+
+- 新建时 `output_qty_per_batch` 和 `lines` 构成版本 1。
+- **追加版本**：新版本号是当前最大版本 + 1，写一条 `MASTER_DATA_CHANGED`，`revision` + 1；与最新版本内容相同也照常追加。权限、`base_revision`、配方不存在和成功的 `data` 同「修改」。
+- `output_qty_per_batch`、`qty_per_batch` 是正整数。`lines` 非空，每项 `{item_id, qty_per_batch}`，同一版本内 `item_id` 不重复，按提交顺序保存。
+- `output_item_id` 和每个 `lines[].item_id` 引用 `ITEM`（规则见「引用」）。不限制物料的 `category`，不检查产出物料是否出现在自己的 `lines` 中。
+
+**供应商**：新建 `code`、`name`、`contact_phone?`、`active`；修改 `name`、`contact_phone?`、`active`。
+
+- `contact_phone` 可以省略，出现时非空、首尾不能有空白字符，不接受 `null`。修改时省略表示删除联系电话。
+
+**报损原因**：新建 `code`、`name`、`active`；修改 `name`、`active`。预置的报损原因同样可以修改和停用。
 
 ### 温度记录接口
 
@@ -380,63 +428,28 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 
 ## 投影表
 
-表结构随库存切片进入 005，下面的 SQL 是设计意图，**不冻结**：
+库存投影由迁移 005 定义，字段与约束以迁移为准：
 
-```sql
-CREATE TABLE inventory_lots (
-    lot_id          TEXT PRIMARY KEY,
-    item_id         TEXT NOT NULL,
-    origin          TEXT NOT NULL CHECK (origin IN ('RECEIPT', 'PRODUCTION', 'COUNT_GAIN')),
-    source_seq      INTEGER NOT NULL REFERENCES store_events(seq),  -- FIFO 的事件顺序
-    source_line_no  INTEGER NOT NULL CHECK (source_line_no >= 0),    -- 原 payload 下标；output 为 0
-    remaining_qty   INTEGER NOT NULL CHECK (remaining_qty >= 0),
-    expires_at      INTEGER,
-    supplier_lot_no TEXT,
-    UNIQUE (source_seq, source_line_no)
-) STRICT;
+| 表 / 视图 | 内容 |
+|---|---|
+| `inventory_lots` | 每个批次一行，余量为 0 的批次保留；`source_seq`、`source_line_no` 见「批次」 |
+| `inventory_unallocated` | 账外缺口，每个物料至多一行 |
+| `inventory_movements` | 每条库存影响按批次展开，一行一条 |
+| `inventory_counts` | 每次盘点的每个被盘物料一行，零差异也写；`observed_at` 是盘点事件的 `occurred_at` |
+| 视图 `inventory_on_hand` | 每个物料的账面数，没有库存时为 0 |
 
-CREATE TABLE inventory_unallocated (                -- 账外缺口
-    item_id TEXT PRIMARY KEY,
-    qty     INTEGER NOT NULL CHECK (qty <= 0)
-) STRICT;
-
-CREATE TABLE inventory_movements (                  -- 每条库存影响按批次展开，一行一条
-    event_seq       INTEGER NOT NULL REFERENCES store_events(seq),
-    line_no         INTEGER NOT NULL,
-    item_id         TEXT NOT NULL,
-    lot_id          TEXT,                            -- NULL：账外缺口，或被吸收
-    kind            TEXT NOT NULL CHECK (kind IN ('RECEIPT', 'PRODUCE', 'CONSUME', 'WASTE', 'ADJUST')),
-    alloc_source    TEXT NOT NULL CHECK (alloc_source IN
-                    ('NEW_LOT', 'SPECIFIED', 'FIFO', 'SHORTFALL', 'COUNT', 'CORRECTION', 'REVERSAL', 'ABSORBED')),
-    nominal_qty     INTEGER NOT NULL,                -- 按申报内容应有的变动量
-    qty_delta       INTEGER NOT NULL,                -- 实际作用于账面的变动量
-    absorbed_by_event_id TEXT REFERENCES store_events(id), -- 直接取自 payload，重放不查其他事件
-    physical_at     INTEGER NOT NULL,                -- 实物时点 t(e)
-    business_date   TEXT NOT NULL,
-    PRIMARY KEY (event_seq, line_no),
-    CHECK ((absorbed_by_event_id IS NULL AND qty_delta = nominal_qty)
-        OR (absorbed_by_event_id IS NOT NULL AND qty_delta = 0 AND lot_id IS NULL))
-) STRICT;
-
-CREATE TABLE inventory_counts (                     -- 每次盘点的每个物料一行，零差异也写
-    event_seq   INTEGER NOT NULL REFERENCES store_events(seq),
-    item_id     TEXT NOT NULL,
-    observed_at INTEGER NOT NULL,                    -- 盘点事件的 occurred_at
-    book_qty    INTEGER NOT NULL,
-    counted_qty INTEGER NOT NULL,
-    PRIMARY KEY (event_seq, item_id)
-) STRICT;
-CREATE INDEX idx_inventory_counts_item ON inventory_counts(item_id, observed_at);
-```
-
+- `inventory_movements` 的数量带符号，增加为正：`nominal_qty` 是按申报内容应有的变动量，`qty_delta` 是实际作用于账面的变动量。
+  - 未被吸收的行两者相等。被吸收的行 `qty_delta = 0`、`lot_id` 为 `NULL`；`absorbed_by_event_id` 直接取自 payload，重放时不查其他事件。
+  - 未被吸收且 `lot_id` 为 `NULL` 的行作用于账外缺口。
+- `kind`：收货 `RECEIPT`，生产产出 `PRODUCE`，生产用料 `CONSUME`，报损 `WASTE`，盘点调整 `ADJUST`；纠错行沿用原行的 `kind`（见「纠错」）。
 - `alloc_source`：新建批次（含盘盈批次）`NEW_LOT`；盘点对已有批次和账外缺口的调整 `COUNT`；被吸收 `ABSORBED`；其余直接取 payload 中 `alloc` 的 `source`。
 - **不变量**（测试和定时自检都检查）：
   - 批次余量 `remaining_qty` = 该批次所有流水的 `qty_delta` 之和；
   - 账外缺口 = 该物料 `lot_id IS NULL` 的流水 `qty_delta` 之和，且 `<= 0`；
   - 账面数（视图 `inventory_on_hand`）= 批次余量之和 + 账外缺口。
-- **日报**：视图，按 `business_date, item_id, kind` 聚合流水。收货、产出、用料、报损按 `nominal_qty`（申报值，含被吸收的行），盘点调整按 `qty_delta`。不维护增量日结表。
-- `sales_days(business_date PRIMARY KEY, aggregate_id, version, source_event_id)`；`daily_sales(business_date, item_id, qty, amount_cents, source_event_id)`。
-- 主数据表（`items`、`recipes`、`suppliers`、`employees`、`waste_reasons`、`equipment`）也是投影。
+- **日报**：视图（随报表需要定义），按 `business_date, item_id, kind` 聚合流水。收货、产出、用料、报损按 `nominal_qty`（申报值，含被吸收的行），盘点调整按 `qty_delta`。不维护增量日结表。
+- 销售导入切片新增 `sales_days(business_date PRIMARY KEY, aggregate_id, version, source_event_id)`、`daily_sales(business_date, item_id, qty, amount_cents, source_event_id)`，表结构随该切片定。
+- 主数据表也是投影：`equipment`（迁移 002），`items`、`item_units`、`recipes`、`recipe_versions`、`recipe_lines`、`suppliers`、`waste_reasons`（迁移 005）；`employees` 随认证切片加入。
 - 所有投影都必须能通过 `boh-server rebuild-projections` 从 `store_events` **按 `seq`** 完整重建，结果与在线写入逐行一致。
 
 ## 已知限制

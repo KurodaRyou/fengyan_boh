@@ -225,7 +225,8 @@ pub fn test_router(db_path: &Path, clock: Clock) -> Result<Router, StorageError>
   | `business_day_cutoff` | `04:00` |
   | `dev_actor_stub` | `true`（身份由请求头提供，见 domain.md「员工认证」开发桩） |
 
-- `store_meta` 为空时，用与 `boh-server init` 相同的代码写入上表的 `store_id`，`created_at` 取 `clock.now()`；已存在且 `store_id` 不同时返回 `Err`。
+- `store_meta` 为空时，用与 `boh-server init` 写 `store_meta` 相同的代码写入上表的 `store_id`，`created_at` 取 `clock.now()`；已存在且 `store_id` 不同时返回 `Err`。
+  - 不写预置主数据（报损原因），也不写 `processed_commands`：测试节点的账本从空开始。
 - 写线程不经 `shutdown`：`Router` 及其全部克隆释放后，写线程自行退出。
 - 不启动备份调度等后台任务：`/health` 的备份字段一直为 `null`。
 - 两份 `clippy.toml` 禁用 `test_router`，只有锁定测试及 `spec_support/` 可以 `#[allow]`。
@@ -296,3 +297,12 @@ pub fn parse_config(text: &str) -> Result<Config, impl std::error::Error>;
 - 解析 TOML 配置文本，不读文件、不创建目录。错误类型由实现决定，锁定测试只区分 `Ok` / `Err`。
 - `backup_dir` 必填；`backup_keep_count` 缺省为 168，必须是正整数（TOML 整数，`1`–`u32::MAX`）；`closing_backup_time` 缺省为 `"23:30"`，格式见 `parse_closing_backup_time`。
 - `main` 经此函数加载配置。
+
+## boh-server：`init` 子命令
+
+锁定测试以子进程运行 `boh-server` 二进制（`env!("CARGO_BIN_EXE_boh-server")`）：`boh-server init <配置文件>`。
+
+- 退出码 0 表示成功，非 0 表示失败；测试不依赖输出文本。
+- 读取配置中的 `db_path`、`store_id`、`timezone`、`business_day_cutoff`；不创建 `backup_dir`，不监听端口，不启动后台任务。
+- 时间取系统时钟：测试只断言时间落在调用前后读取的系统时间之间，营业日按 `boh_domain::time::business_date` 由事件的 `occurred_at` 核对。
+- 写入内容见 domain.md「主数据」初始化；测试经 `boh_storage::testing::open_reader` 读取数据库。
