@@ -73,7 +73,7 @@ occurred_at = recorded_at − lag
 | `SUPPLIER` | 供应商 | `code`, `name`, `contact_phone?`, `active` |
 | `EMPLOYEE` | 员工，**不含凭据** | `code`, `name`, `role`（`STAFF` / `MANAGER`）, `active` |
 | `WASTE_REASON` | 报损原因；初始化时预置 `EXPIRED`、`DAMAGED`、`PRODUCTION_DEFECT`、`TASTING`、`OTHER` | `code`, `name`, `active` |
-| `EQUIPMENT` | 设备 | `code`, `name`, `equipment_type`（`FRIDGE` / `FREEZER` / `BLAST_FREEZER` / `OVEN` / `PROOFER` / `MIXER` / `OTHER`）, `active` |
+| `EQUIPMENT` | 设备 | `boh_domain::equipment::EquipmentSnapshot`；样本 `crates/boh-app/tests/golden/MASTER_DATA_CHANGED@1/EQUIPMENT.json` |
 
 - 快照是该行变更后的完整内容，不是差量。行的主键是事件的 `aggregate_id`，`revision` 是 `aggregate_version`，都不重复写进快照。`active` 是布尔值。
 - `name` 非空；`code` 非空，在同一实体内唯一。`contact_phone` 是原样保存的文本，不做格式校验。`MANAGER` 是店长，`STAFF` 是普通员工。
@@ -101,14 +101,14 @@ occurred_at = recorded_at − lag
 
 ### 设备接口
 
-| 方法与路径 | `command_type` | 请求体 | 权限 |
+| 方法与路径 | `command_type` | 请求体（`boh_domain::equipment`） | 权限 |
 |---|---|---|---|
-| `POST /api/v1/equipment` | `equipment.create` | `command_id`, `code`, `name`, `equipment_type`, `active` | `MANAGER` |
-| `PUT /api/v1/equipment/{equipment_id}` | `equipment.update` | `command_id`, `base_revision`, `name`, `equipment_type`, `active` | `MANAGER` |
+| `POST /api/v1/equipment` | `equipment.create` | `CreateEquipment` | `MANAGER` |
+| `PUT /api/v1/equipment/{equipment_id}` | `equipment.update` | `UpdateEquipment` | `MANAGER` |
 | `GET /api/v1/equipment` | — | — | 已认证员工 |
 
-- 写命令成功的 `data` 是 `{"equipment": 行}`，行为该命令执行后的 `{equipment_id, code, name, equipment_type, active, revision}`。查询的 `data` 是 `{"equipment": [行…]}`，含停用的设备，按 `code` 的字节序升序。
-- 取值：`code`、`name` 非空，首尾不能有空白字符；`equipment_type` 取「主数据」中的枚举值；`active` 是布尔值；`base_revision` 是正整数。不满足时 `400 VALIDATION_FAILED`。
+- 写命令成功的 `data` 是 `{"equipment": 行}`，行为该命令执行后的设备（`boh_domain::equipment::Equipment`）。查询的 `data` 是 `{"equipment": [行…]}`，含停用的设备，按 `code` 的字节序升序。
+- 取值：`code`、`name` 非空，首尾不能有空白字符；`base_revision` 是正整数；其余字段的类型与枚举见上述结构体。不满足时 `400 VALIDATION_FAILED`。
 - 不带 `captured_at` / `sent_at`：`occurred_at = recorded_at`，`business_date` 由它计算。
 - **新建**：服务端生成 UUIDv7 作为设备 ID，写一条 `aggregate_version = 1` 的 `MASTER_DATA_CHANGED`。`code` 已被其他设备使用（含停用的）：`409 CODE_ALREADY_EXISTS`，`details` 为 `{"code", "equipment_id"}`（已占用该 `code` 的设备）。
 - **修改**：请求体不含 `code`，快照中的 `code` 取当前值。设备不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": "EQUIPMENT", "id"}`。`base_revision` 规则见上。
