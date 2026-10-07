@@ -18,7 +18,8 @@
 - 「尚未设计」一节和 `docs/domain.md`「待确认问题」中的内容，在设计落地到文档之前**不要实现**。
 - 交付前必须本地通过：`cargo fmt --all`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`、`scripts/ci-scan.sh`、`scripts/check-locked-paths.sh`。
 - 交付说明写清：改了哪些文件、对应「开发顺序」的哪几步、有哪些未决问题。之后由 Claude 做 code review。
-- 合入：`main` 只接受 PR，CI `check` 与 `locked-paths` 必须通过，禁止强推和删除；不要求 PR 批准。
+- 合入：`main` 只接受 PR，CI `check` 与 `locked-paths` 必须通过，禁止强推和删除；不要求 PR 批准。PR 用 Create a merge commit 合入，不用 Squash 或 Rebase。
+  - Squash 会把 `docs:`、`spec:`、实现提交压成一个，丢掉锁定路径检查依赖的提交边界。`main` 不开 Require linear history，它会禁止这种合并提交。
   - 所有提交和 PR 都用同一个 GitHub 账号，作者不能批准自己的 PR。锁定路径由本文件规则、Codex 自动 review、Claude review 把关，人确认后合入。
 - 锁定路径（`.github/CODEOWNERS` 列出的路径）的改动只能出现在人或 Claude 提交、提交信息以 `spec:`（锁定测试）或 `docs:`（规则、设计、迁移、CI 与构建配置）开头的提交中。
   - 实现 agent 的提交不得以 `spec:` / `docs:` 开头。
@@ -46,9 +47,13 @@
   Review 的比对基准是切片分支开头连续的 `spec:` / `docs:` 提交中的最后一个，`git diff <比对基准> HEAD -- <锁定路径>` 必须为空。PR 打开后又有新提交时，合入前评论 `@codex review` 重新触发 Codex review。
   - 把分支交给实现 agent 时，人或 Claude 在交接说明中写明比对基准（交接时的分支 HEAD）。Review 时 `scripts/check-locked-paths.sh` 输出的 baseline 必须与之相同。
     - 所有提交用同一身份，脚本分不出提交者；agent 在交接后加的 `spec:` / `docs:` 提交会被当作分支开头的一部分，只能靠比对基准发现。
-  - CI 的 `locked-paths`（`scripts/check-locked-paths.sh`）逐个提交检查：比对基准之后的提交不得改锁定路径；合并提交的锁定路径必须与 Git 自动合并的结果一致，且锁定路径上不得有冲突。
+  - CI 的 `locked-paths`（`scripts/check-locked-paths.sh`）逐个提交检查：比对基准之后的提交不得改锁定路径；切片分支自身的提交（`base..head`）中不得有合并提交。
     - 它用 `pull_request_target` 从 `main` 运行 workflow 和脚本，PR 改不了判它的检查；对检查本身的修改合入 `main` 后才生效。
-  - 锁定路径与主干冲突时，把开头的 `spec:` / `docs:` 提交 rebase 到新主干上，不在合并提交里解决。
+- 切片分支的提交保持线性：同步 `main` 一律 rebase，不 merge。
+  - 允许合并就得判断合并提交在锁定路径上自己改了什么；Git 的冲突形态多（选一方、修改 / 删除、重命名……），检查无法可靠覆盖。
+  - rebase 由人或 Claude 执行：锁定路径的冲突在重写开头的 `spec:` / `docs:` 提交时解决；用 `git range-diff <旧基点>..<旧 HEAD> <新基点>..<新 HEAD>` 核对前后提交；记录新的比对基准（SHA 已改变）；重新跑 CI 和 review。
+    实现 agent 需要 `main` 的新提交时，停下来在交付说明里提出，不自行 rebase 或 merge。
+  - rebase 后用 `git push --force-with-lease=<分支>:<预期远端 SHA>` 更新切片分支；`main` 禁止强推。先完成交接再 rebase，不在别人仍在提交的分支上改写历史。
 
 ### 文档分层
 - `AGENTS.md`、`docs/`：只写**当前生效的结论**。不写讨论过程、问答记录、被否决的方案、修改历史。
@@ -262,7 +267,7 @@ scripts/        CI 扫描脚本。
 | 重放结果确定 | 锁定的重放一致性测试 |
 | 防止溢出 | `overflow-checks` + `checked_*` |
 | 业务规则正确 | 锁定的验收用例，预期值由人工确认 |
-| 锁定测试、CI、构建配置不被改动 | 锁定路径清单（`.github/CODEOWNERS`）+ `main` 分支保护（只接受 PR、CI 通过、禁止强推）+ CI `locked-paths`（从 `main` 运行 `scripts/check-locked-paths.sh`，逐个提交检查，比对基准之后不得改锁定路径）+ Claude review |
+| 锁定测试、CI、构建配置不被改动 | 锁定路径清单（`.github/CODEOWNERS`）+ `main` 分支保护（只接受 PR、CI 通过、禁止强推）+ CI `locked-paths`（从 `main` 运行 `scripts/check-locked-paths.sh`，逐个提交检查，比对基准之后不得改锁定路径，切片提交不得含合并）+ Claude review |
 
 ---
 
