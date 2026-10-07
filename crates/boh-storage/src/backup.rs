@@ -83,6 +83,14 @@ impl Backup {
 
     /// Called only on spawn_blocking. The source never opens a write connection.
     pub fn run(&self, clock: &Clock) -> Result<i64, StorageError> {
+        self.run_with_directory_sync(clock, sync_directory)
+    }
+
+    fn run_with_directory_sync(
+        &self,
+        clock: &Clock,
+        mut sync: impl FnMut(&Path) -> Result<(), StorageError>,
+    ) -> Result<i64, StorageError> {
         let started = clock.now();
         self.gate.wait();
         let source = open_source(&self.db_path)?;
@@ -92,9 +100,12 @@ impl Backup {
             .directory
             .join(format!("tmp-{}-{id}.db", self.store_id));
         let result = (|| {
+            let mut files = Vec::new();
             for name in self.names()? {
                 if self.temporary_name(&name) {
                     remove_logged(&self.directory.join(name));
+                } else if let Some(number) = final_number(&name, self.store_id) {
+                    files.push((number, self.directory.join(name)));
                 }
             }
             let before = max_seq(&source)?;
@@ -104,7 +115,6 @@ impl Backup {
             source.execute("VACUUM INTO ?1", [path])?;
             let n = verify(&temporary, before)?;
             File::open(&temporary)?.sync_all()?;
-            let mut files = self.final_files()?;
             let number = files
                 .iter()
                 .map(|(n, _)| *n)
@@ -118,7 +128,7 @@ impl Backup {
                 utc_label(started)
             ));
             fs::rename(&temporary, &final_path)?;
-            sync_directory(&self.directory)?;
+            sync(&self.directory)?;
             // Cleanup starts only after the new file and its directory entry are durable.
             files.push((number, final_path.clone()));
             files.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
@@ -127,7 +137,9 @@ impl Backup {
                     remove_logged(&path);
                 }
             }
-            sync_directory(&self.directory)?;
+            if let Err(error) = sync(&self.directory) {
+                tracing::warn!(%error, "could not persist old backup cleanup; new backup is durable");
+            }
             Ok(n)
         })();
         if result.is_err() && temporary.exists() {
@@ -150,16 +162,6 @@ impl Backup {
         name.strip_prefix(&format!("tmp-{}-", self.store_id))
             .and_then(|s| s.strip_suffix(".db"))
             .is_some_and(canonical_v7)
-    }
-
-    fn final_files(&self) -> Result<Vec<(u64, PathBuf)>, StorageError> {
-        Ok(self
-            .names()?
-            .into_iter()
-            .filter_map(|name| {
-                final_number(&name, self.store_id).map(|number| (number, self.directory.join(name)))
-            })
-            .collect())
     }
 }
 
@@ -335,7 +337,63 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::ManualClock;
     use std::num::NonZeroUsize;
+
+    #[tokio::test]
+    async fn publication_sync_failure_fails_but_cleanup_sync_failure_keeps_success() {
+        for failed_sync in [1, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("boh.db");
+            let directory = dir.path().join("backups");
+            let storage = crate::open(&db, NonZeroUsize::MIN).unwrap();
+            let clock = ManualClock::new(UnixMillis(1_791_261_000_000)).clock();
+            let backup = Backup::prepare(
+                &db,
+                &directory,
+                StoreId::parse("01890a5d-ac96-774b-bcce-b302099a8050").unwrap(),
+                NonZeroU32::MIN,
+            )
+            .unwrap();
+            assert_eq!(backup.run(&clock).unwrap(), 0);
+            let old = directory.join(backup.names().unwrap().pop().unwrap());
+            let health = BackupHealth::default();
+            health.record(&Ok(0), UnixMillis(1));
+            let mut calls = 0;
+            let result = backup.run_with_directory_sync(&clock, |path| {
+                calls += 1;
+                if calls == failed_sync {
+                    Err(std::io::Error::other("injected directory fsync failure").into())
+                } else {
+                    sync_directory(path)
+                }
+            });
+            health.record(&result, UnixMillis(2));
+            let status = health.snapshot();
+            if failed_sync == 1 {
+                assert!(matches!(result, Err(StorageError::Io(_))));
+                assert_eq!(calls, 1);
+                assert!(
+                    old.exists(),
+                    "publication failure must not prune old backups"
+                );
+                assert_eq!(backup.names().unwrap().len(), 2);
+                assert_eq!(status.last_ok_at, Some(UnixMillis(1)));
+                assert_eq!(status.last_failed_at, Some(UnixMillis(2)));
+            } else {
+                assert_eq!(result.unwrap(), 0);
+                assert_eq!(calls, 2);
+                assert!(!old.exists());
+                let names = backup.names().unwrap();
+                assert_eq!(names.len(), 1);
+                assert_eq!(verify(&directory.join(&names[0]), 0).unwrap(), 0);
+                assert_eq!(status.last_ok_at, Some(UnixMillis(2)));
+                assert_eq!(status.last_seq, Some(0));
+                assert_eq!(status.last_failed_at, None);
+            }
+            storage.writer_handle.shutdown().await.unwrap();
+        }
+    }
 
     #[test]
     fn file_label_handles_year_boundaries_and_unrepresentable_time() {

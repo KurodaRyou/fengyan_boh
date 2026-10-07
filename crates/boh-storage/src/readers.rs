@@ -42,11 +42,15 @@ impl Readers {
         let permit = Arc::clone(&self.inner.permits)
             .acquire_owned()
             .await
-            .map_err(|_| E::from(StorageError::ReadersClosed))?;
+            .map_err(|_| E::from(StorageError::ReaderPoolInvariant("semaphore closed")))?;
         let inner = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || -> Result<T, E> {
             let _permit = permit;
-            let mut conn = lock(&inner.idle).pop().ok_or(StorageError::ReadersClosed)?;
+            let mut conn = lock(&inner.idle)
+                .pop()
+                .ok_or(StorageError::ReaderPoolInvariant(
+                    "permit without connection",
+                ))?;
             let result = (|| {
                 let tx = conn
                     .transaction_with_behavior(TransactionBehavior::Deferred)
@@ -135,7 +139,7 @@ mod tests {
                 .call(move |conn| -> Result<(), StorageError> {
                     conn.execute_batch(sql)?;
                     if sql == "ROLLBACK" {
-                        Err(StorageError::ReadersClosed)
+                        Err(StorageError::InvalidEvent("query failed".into()))
                     } else {
                         Ok(())
                     }

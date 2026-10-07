@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use boh_app::background::BackupTasks;
 use boh_app::{AppState, http};
-use boh_server::config::parse_config;
+use boh_server::config::{Config, parse_config};
 use boh_storage::backup::{Backup, BackupHealth};
 use boh_storage::clock::Clock;
 use tokio::signal::unix::{SignalKind, signal};
@@ -38,32 +38,49 @@ async fn main() -> anyhow::Result<()> {
 
     let storage =
         boh_storage::open(&config.db_path, config.reader_pool_size).context("open storage")?;
+    let result = run(operation, config, storage.writer, storage.readers).await;
+    let closed = storage
+        .writer_handle
+        .shutdown()
+        .await
+        .context("close storage");
+    match &closed {
+        Ok(()) => tracing::info!("storage closed"),
+        Err(error) => tracing::error!(%error, "storage shutdown failed"),
+    }
+    // Preserve the original startup/serve error even if shutdown also fails.
+    result?;
+    closed?;
+    Ok(())
+}
+
+async fn run(
+    operation: Operation,
+    config: Config,
+    writer: boh_storage::Writer,
+    readers: boh_storage::Readers,
+) -> anyhow::Result<()> {
     let clock = Clock::system();
     let store_id = config.store_id;
     if operation == Operation::Init {
         let now = clock.now();
-        let result = storage
-            .writer
+        writer
             .call(move |tx| boh_storage::store::initialize(tx, store_id, now))
-            .await;
-        storage.writer_handle.shutdown().await?;
-        result.context("initialize store")?;
+            .await
+            .context("initialize store")?;
         tracing::info!(store_id = %store_id, "store initialized");
         return Ok(());
     }
-    let verified = storage
-        .writer
+    writer
         .call(move |tx| boh_storage::store::verify(tx, store_id))
-        .await;
-    if let Err(error) = verified {
-        storage.writer_handle.shutdown().await?;
-        return Err(error).context("verify store identity; run init for a new node");
-    }
+        .await
+        .context("verify store identity; run init for a new node")?;
     if operation == Operation::Rebuild {
-        let result = storage.writer.rebuild_projections().await;
-        storage.writer_handle.shutdown().await?;
         tracing::info!(
-            replayed = result.context("rebuild projections")?,
+            replayed = writer
+                .rebuild_projections()
+                .await
+                .context("rebuild projections")?,
             "projections rebuilt"
         );
         return Ok(());
@@ -76,7 +93,8 @@ async fn main() -> anyhow::Result<()> {
         &config.backup_dir,
         store_id,
         config.backup_keep_count,
-    )?;
+    )
+    .context("prepare backup directory")?;
     let backup_health = BackupHealth::default();
     let listener = tokio::net::TcpListener::bind(config.listen_addr)
         .await
@@ -98,8 +116,8 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("shutdown signal received");
     };
     let app = http::router(AppState {
-        writer: storage.writer,
-        readers: storage.readers,
+        writer,
+        readers,
         clock,
         timezone: config.timezone,
         business_day_cutoff: config.business_day_cutoff,
@@ -116,11 +134,8 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("http stopped, draining backups");
     let stopped = tasks.shutdown().await;
     tracing::info!("backups stopped, draining writer");
-    let closed = storage.writer_handle.shutdown().await;
     served?;
     stopped?;
-    closed?;
-    tracing::info!("shutdown complete");
     Ok(())
 }
 

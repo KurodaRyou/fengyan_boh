@@ -59,23 +59,30 @@ impl Schedule {
         now: UnixMillis,
         queue: &mut VecDeque<Trigger>,
     ) -> Result<(), StorageError> {
-        if now < self.observed {
-            self.hourly = next_hour(now)?;
-            self.closing = next_closing_backup(now, &self.timezone, self.closing_time)
-                .map_err(schedule_error)?;
+        let rolled_back = now < self.observed;
+        let hourly_due = !rolled_back && now >= self.hourly;
+        let closing_due = !rolled_back && now >= self.closing;
+        // Calculate both deadlines before changing state, so a failed calculation
+        // cannot leave a future deadline behind after the clock returns to range.
+        let hourly = if rolled_back || hourly_due {
+            next_hour(now)?
         } else {
-            if now >= self.hourly {
-                // Advance first: a jump over multiple hours produces only one trigger.
-                self.hourly = next_hour(now)?;
-                enqueue(queue, Trigger::Hourly);
-            }
-            if now >= self.closing {
-                self.closing = next_closing_backup(now, &self.timezone, self.closing_time)
-                    .map_err(schedule_error)?;
-                enqueue(queue, Trigger::Closing);
-            }
-        }
+            self.hourly
+        };
+        let closing = if rolled_back || closing_due {
+            next_closing_backup(now, &self.timezone, self.closing_time).map_err(schedule_error)?
+        } else {
+            self.closing
+        };
+        self.hourly = hourly;
+        self.closing = closing;
         self.observed = now;
+        if hourly_due {
+            enqueue(queue, Trigger::Hourly);
+        }
+        if closing_due {
+            enqueue(queue, Trigger::Closing);
+        }
         Ok(())
     }
 
@@ -116,7 +123,15 @@ impl BackupTasks {
         let changes = clock.changes();
         let schedule = Schedule::new(clock.now(), timezone, closing_time)?;
         let (stop, stopping) = watch::channel(false);
-        let task = tokio::spawn(run(backup, clock, health, schedule, changes, stopping));
+        let task = tokio::spawn(run(
+            backup,
+            clock,
+            health,
+            schedule,
+            changes,
+            stopping,
+            VecDeque::new(),
+        ));
         Ok(Self {
             stop: BackupStop(stop),
             task,
@@ -142,8 +157,8 @@ async fn run(
     mut schedule: Schedule,
     mut changes: boh_storage::clock::ClockChanges,
     mut stop: watch::Receiver<bool>,
+    mut queue: VecDeque<Trigger>,
 ) {
-    let mut queue = VecDeque::new();
     let mut active: Option<JoinHandle<()>> = None;
     let mut stopping = false;
     loop {
@@ -154,16 +169,18 @@ async fn run(
                 "draining backups"
             );
         }
-        if !stopping && let Err(error) = schedule.observe(clock.now(), &mut queue) {
-            tracing::error!(%error, "cannot calculate backup trigger");
-            // Await clock changes rather than spin on a deadline that cannot be advanced.
-            tokio::select! {
-                biased;
-                _ = stop.changed() => {},
-                _ = changes.changed() => {}
+        let deadline = if stopping {
+            None
+        } else {
+            match schedule.observe(clock.now(), &mut queue) {
+                Ok(()) => Some(schedule.deadline()),
+                Err(error) => {
+                    tracing::error!(%error, "cannot calculate backup trigger");
+                    // Keep draining accepted work, but do not spin on a stale deadline.
+                    None
+                }
             }
-            continue;
-        }
+        };
         if active.is_none() && queue.pop_front().is_some() {
             let backup = backup.clone();
             let clock = clock.clone();
@@ -190,8 +207,7 @@ async fn run(
                     health.record(&Err(StorageError::Join(error.to_string())), clock.now());
                 }
             }
-            _ = changes.changed(), if !stopping => {}
-            _ = clock.sleep_until(schedule.deadline()), if !stopping => {}
+            _ = changes.changed(deadline), if !stopping => {}
         }
     }
 }
@@ -204,6 +220,68 @@ mod tests {
     use boh_storage::clock::ManualClock;
     use std::num::{NonZeroU32, NonZeroUsize};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn scheduling_error_drains_accepted_backups_and_recovers_with_the_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("boh.db");
+        let directory = dir.path().join("backups");
+        let storage = boh_storage::open(&db, NonZeroUsize::MIN).unwrap();
+        let initial = UnixMillis(1_791_261_000_000); // 12:30 Shanghai
+        let schedule = Schedule::new(
+            initial,
+            parse_timezone("Asia/Shanghai").unwrap(),
+            parse_closing_backup_time("23:30").unwrap(),
+        )
+        .unwrap();
+        let clock = ManualClock::new(UnixMillis(253_402_400_000_000)); // Beyond jiff's range.
+        let backup = Backup::prepare(
+            &db,
+            &directory,
+            StoreId::parse("01890a5d-ac96-774b-bcce-b302099a8050").unwrap(),
+            NonZeroU32::new(3).unwrap(),
+        )
+        .unwrap();
+        let hold = backup.hold();
+        let health = BackupHealth::default();
+        let (stop, stopping) = watch::channel(false);
+        let task = tokio::spawn(run(
+            backup,
+            clock.clock(),
+            health.clone(),
+            schedule,
+            clock.clock().changes(),
+            stopping,
+            VecDeque::from([Trigger::Hourly, Trigger::Closing]),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), hold.started())
+            .await
+            .expect("a scheduling failure must not prevent accepted work from starting");
+        drop(hold);
+        for count in [2, 3] {
+            if count == 3 {
+                clock.set(UnixMillis(initial.0 + 30 * 60 * 1000));
+            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let published = std::fs::read_dir(&directory)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().file_name())
+                        .filter(|name| name.to_string_lossy().starts_with("boh-"))
+                        .count();
+                    if published == count && health.snapshot().last_seq == Some(0) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        stop.send_replace(true);
+        task.await.unwrap();
+        storage.writer_handle.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn stop_signal_rejects_triggers_while_a_backup_is_still_running() {
