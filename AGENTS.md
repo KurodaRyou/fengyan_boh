@@ -350,6 +350,8 @@ ARM 门店机改用 `aarch64-unknown-linux-musl`。部署文件见 `deploy/`。
 - 修改了 `.github/CODEOWNERS` 列出的锁定路径，而该改动所在提交的信息不以 `spec:` 或 `docs:` 开头。逐个列出这些文件。
 - 在不以 `spec:` / `docs:` 开头的提交中让锁定测试（`crates/*/tests/spec_*.rs`、`spec_support/`、`golden/`、`crates/boh-storage/tests/schema.rs`）失效：
   修改预期值、删除用例、加 `#[ignore]`、用 `cfg` / feature 排除、在 `Cargo.toml` 中设置 `test = false` / `autotests = false`、改 CI 让测试不运行。
+- 以上两条由 Claude review 逐个提交核对，Codex 不报。
+  - Codex review 看到的是整个 PR 压成的一个提交（作者为 Codex，提交信息取 PR 标题），分不出改动属于哪个提交，报出的都是误报。
 - 修改已合入 `main` 的迁移文件。
 
 **P1**
