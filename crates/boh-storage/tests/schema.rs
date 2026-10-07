@@ -1,4 +1,4 @@
-//! 锁定迁移 001、002、003 的表结构；每项测试注明对应的规则（AGENTS.md / docs/domain.md）或迁移文件。
+//! 锁定迁移 001、002、003、004 的表结构；每项测试注明对应的规则（AGENTS.md / docs/domain.md）或迁移文件。
 
 use std::fmt::Debug;
 
@@ -13,6 +13,8 @@ const MIGRATION_002: &str = include_str!("../../../migrations/002_equipment.sql"
 const MIGRATION_002_FNV1A_64: u64 = 0x5b5d_70a4_7c72_9418;
 const MIGRATION_003: &str = include_str!("../../../migrations/003_temperature_readings.sql");
 const MIGRATION_003_FNV1A_64: u64 = 0x68f1_2381_a56a_04c3;
+const MIGRATION_004: &str = include_str!("../../../migrations/004_store_events_recorded_at.sql");
+const MIGRATION_004_FNV1A_64: u64 = 0x401b_6d6e_ba06_70d2;
 const STORE: &str = "01890a5d-ac96-774b-bcce-b302099a8050";
 const ACTOR: &str = "01890a5d-ac96-774b-bcce-b302099a8051";
 const CMD: &str = "01890a5d-ac96-774b-bcce-b302099a8057";
@@ -168,10 +170,16 @@ fn migration_003_matches_frozen_checksum() {
     assert_eq!(fnv1a_64(MIGRATION_003), MIGRATION_003_FNV1A_64);
 }
 
+// AGENTS「迁移」不可修改：按 UTF-8 原始字节锁定 004 完整 SQL（包括注释）。
+#[test]
+fn migration_004_matches_frozen_checksum() {
+    assert_eq!(fnv1a_64(MIGRATION_004), MIGRATION_004_FNV1A_64);
+}
+
 // AGENTS「迁移」：程序支持的版本就是已锁定迁移文件的个数。
 #[test]
 fn latest_schema_version_counts_locked_migrations() {
-    assert_eq!(LATEST_SCHEMA_VERSION, 3);
+    assert_eq!(LATEST_SCHEMA_VERSION, 4);
 }
 
 // AGENTS「迁移」：重复执行迁移不改变版本，也不丢失已有数据。
@@ -952,7 +960,7 @@ fn upgrades_a_version_2_database_without_losing_data() {
 
     migrate(&mut conn).unwrap();
 
-    assert_eq!(schema_version(&conn).unwrap(), 3);
+    assert_eq!(schema_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
     let after: Vec<_> = tables
         .iter()
         .map(|t| table_rows(&conn, t).unwrap())
@@ -1173,4 +1181,86 @@ fn temperature_readings_is_strict() {
         }
     }
     assert!(reading_ids(&conn).unwrap().is_empty());
+}
+
+// 004 + AGENTS「HTTP 约定」/health：clock_regression_ms 每次请求取 max(store_events.recorded_at)，
+// 索引只建在 recorded_at 一列上，SQLite 用它的 min/max 优化直接取最大值，不扫描账本。
+#[test]
+fn recorded_at_index_serves_the_clock_regression_query() {
+    let (_dir, conn) = fresh_db();
+    let columns: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_index_info('idx_store_events_recorded_at')")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(columns, ["recorded_at"]);
+    let (table, unique): (String, i64) = conn
+        .query_row(
+            "SELECT tbl_name, (SELECT \"unique\" FROM pragma_index_list('store_events')
+                               WHERE name = 'idx_store_events_recorded_at')
+             FROM sqlite_master WHERE type = 'index' AND name = 'idx_store_events_recorded_at'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((table.as_str(), unique), ("store_events", 0));
+    let plan: Vec<String> = conn
+        .prepare("EXPLAIN QUERY PLAN SELECT max(recorded_at) FROM store_events")
+        .unwrap()
+        .query_map([], |r| r.get(3))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        plan,
+        ["SEARCH store_events USING COVERING INDEX idx_store_events_recorded_at"]
+    );
+}
+
+// AGENTS「迁移」：已有 003 数据的库升级到 004，原有表逐行不变；同一 recorded_at 可以出现在多个事件上（索引不唯一）。
+#[test]
+#[allow(clippy::disallowed_methods)] // 锁定测试经 boh_storage::testing 取得原始连接。
+fn upgrades_a_version_3_database_without_losing_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut conn = open_writer(&dir.path().join("boh.db")).unwrap();
+    conn.execute_batch(MIGRATION_001).unwrap();
+    conn.execute_batch(MIGRATION_002).unwrap();
+    conn.execute_batch(MIGRATION_003).unwrap();
+    conn.pragma_update(None, "user_version", 3).unwrap();
+    insert_meta(&conn, 1, STORE).unwrap();
+    insert_command(&conn, CMD, "{}").unwrap();
+    Event::new(EVT).insert(&conn).unwrap();
+    insert_equipment(&conn, EQUIPMENT, "F1", "Walk-in", "FREEZER", 1, 1).unwrap();
+    Reading::new(READING, 1).insert(&conn).unwrap();
+    let tables = [
+        "store_meta",
+        "processed_commands",
+        "store_events",
+        "equipment",
+        "temperature_readings",
+    ];
+    let before: Vec<_> = tables
+        .iter()
+        .map(|t| table_rows(&conn, t).unwrap())
+        .collect();
+
+    migrate(&mut conn).unwrap();
+
+    assert_eq!(schema_version(&conn).unwrap(), 4);
+    let after: Vec<_> = tables
+        .iter()
+        .map(|t| table_rows(&conn, t).unwrap())
+        .collect();
+    assert_eq!(after, before);
+    Event::new(EVT2).insert(&conn).unwrap();
+    let recorded: Vec<i64> = conn
+        .prepare("SELECT recorded_at FROM store_events ORDER BY seq")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(recorded, [TS, TS]);
 }
