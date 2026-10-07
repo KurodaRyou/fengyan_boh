@@ -428,3 +428,107 @@ async fn clock_regression_keeps_raw_time_and_does_not_break_retries() {
         .unwrap();
     node.storage.writer_handle.shutdown().await.unwrap();
 }
+
+fn temperature(n: u16, equipment_id: &str) -> Value {
+    json!({
+        "command_id": format!("01890a5d-ac96-774b-bcce-b30209ab{n:04x}"),
+        "equipment_id": equipment_id, "celsius_x10": 38,
+        "captured_at": 1_791_248_460_000_i64, "sent_at": 1_791_248_400_000_i64
+    })
+}
+
+async fn temperature_counts(node: &Node) -> (i64, i64, i64, i64) {
+    node.storage
+        .readers
+        .call(|conn| -> Result<_, StorageError> {
+            Ok(conn.query_row(
+                "SELECT (SELECT count(*) FROM store_events),
+                        (SELECT count(*) FROM processed_commands),
+                        (SELECT count(*) FROM temperature_readings),
+                        (SELECT coalesce(max(seq), 0) FROM store_events)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?)
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn concurrent_temperature_retries_share_one_reading_and_saved_warning() {
+    let node = node(true).await;
+    let (status, equipment) = send(
+        node.router.clone(),
+        Method::POST,
+        "/api/v1/equipment",
+        create(1, "F1"),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let id = equipment["data"]["equipment"]["equipment_id"]
+        .as_str()
+        .unwrap();
+    let request = temperature(2, id);
+    let path = "/api/v1/temperature-readings";
+    let (first, second) = tokio::join!(
+        send(node.router.clone(), Method::POST, path, request.clone()),
+        send(node.router.clone(), Method::POST, path, request.clone()),
+    );
+    assert_eq!(first, second);
+    assert_eq!(first.0, 200);
+    assert_eq!(first.1["warnings"][0]["code"], "CAPTURE_TIME_ADJUSTED");
+    assert_eq!(temperature_counts(&node).await, (2, 2, 1, 2));
+    node.clock.set(UnixMillis(i64::MAX));
+    assert_eq!(
+        send(node.router.clone(), Method::POST, path, request).await,
+        first
+    );
+    assert_eq!(temperature_counts(&node).await, (2, 2, 1, 2));
+    node.storage.writer_handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn temperature_projection_and_receipt_failures_rollback_and_allow_original_retry() {
+    let node = node(true).await;
+    let (status, equipment) = send(
+        node.router.clone(),
+        Method::POST,
+        "/api/v1/equipment",
+        create(1, "F1"),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let id = equipment["data"]["equipment"]["equipment_id"]
+        .as_str()
+        .unwrap();
+    let request = temperature(2, id);
+    let path = "/api/v1/temperature-readings";
+    for table in ["temperature_readings", "processed_commands"] {
+        node.storage
+            .writer
+            .call(move |tx| -> Result<(), StorageError> {
+                tx.execute_batch(&format!(
+                    "CREATE TRIGGER injected_temperature_failure BEFORE INSERT ON {table}
+                     BEGIN SELECT RAISE(ABORT, 'private temperature failure'); END;"
+                ))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_internal_error(send(node.router.clone(), Method::POST, path, request.clone()).await);
+        assert_eq!(temperature_counts(&node).await, (1, 1, 0, 1));
+        node.storage
+            .writer
+            .call(|tx| -> Result<(), StorageError> {
+                tx.execute_batch("DROP TRIGGER injected_temperature_failure")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+    let (status, logged) = send(node.router.clone(), Method::POST, path, request).await;
+    assert_eq!(status, 200);
+    assert_eq!(logged["warnings"][0]["code"], "CAPTURE_TIME_ADJUSTED");
+    assert_eq!(temperature_counts(&node).await, (2, 2, 1, 2));
+    node.storage.writer_handle.shutdown().await.unwrap();
+}

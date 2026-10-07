@@ -1,6 +1,7 @@
 //! Event-only projections shared by online appends and replay.
 
 use boh_domain::equipment::EquipmentType;
+use boh_domain::temperature::TemperatureLogged;
 use boh_domain::{AggregateId, CommandId, EventId, UnixMillis};
 use rusqlite::{Transaction, params};
 
@@ -11,14 +12,20 @@ use crate::ledger::Event;
 const PROJECTION_TABLES: &[&str] = &["equipment", "temperature_readings"];
 
 pub(crate) fn apply(tx: &Transaction<'_>, event: &Event) -> Result<(), StorageError> {
-    if event.event_type != "MASTER_DATA_CHANGED"
-        || event.schema_version != 1
-        || event.aggregate_type != "EQUIPMENT"
-    {
-        return Err(StorageError::InvalidEvent(
+    match (
+        event.event_type.as_str(),
+        event.schema_version,
+        event.aggregate_type.as_str(),
+    ) {
+        ("MASTER_DATA_CHANGED", 1, "EQUIPMENT") => apply_equipment(tx, event),
+        ("TEMPERATURE_LOGGED", 1, "TEMPERATURE_READING") => apply_temperature(tx, event),
+        _ => Err(StorageError::InvalidEvent(
             "unsupported event type or version".into(),
-        ));
+        )),
     }
+}
+
+fn apply_equipment(tx: &Transaction<'_>, event: &Event) -> Result<(), StorageError> {
     // Decode only the event JSON, without consulting current master data or making decisions.
     let valid: bool = tx.query_row(
         "SELECT json_type(?1) = 'object'
@@ -66,6 +73,67 @@ pub(crate) fn apply(tx: &Transaction<'_>, event: &Event) -> Result<(), StorageEr
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             values,
         )?;
+    }
+    Ok(())
+}
+
+fn apply_temperature(tx: &Transaction<'_>, event: &Event) -> Result<(), StorageError> {
+    if event.aggregate_version != 1 {
+        return Err(StorageError::InvalidEvent(
+            "unsupported temperature aggregate version".into(),
+        ));
+    }
+    let valid: bool = tx.query_row(
+        "SELECT json_type(?1) = 'object'
+          AND (SELECT count(*) FROM json_each(?1)) =
+              CASE WHEN json_type(?1, '$.note') IS NULL THEN 2 ELSE 3 END
+          AND NOT EXISTS (SELECT 1 FROM json_each(?1)
+                          WHERE key NOT IN ('equipment_id', 'celsius_x10', 'note'))
+          AND json_type(?1, '$.equipment_id') = 'text'
+          AND json_type(?1, '$.celsius_x10') = 'integer'
+          AND (json_type(?1, '$.note') IS NULL OR json_type(?1, '$.note') = 'text')",
+        [&event.payload],
+        |row| Ok(row.get::<_, Option<bool>>(0)?.unwrap_or(false)),
+    )?;
+    if !valid {
+        return Err(StorageError::InvalidEvent(
+            "invalid temperature payload".into(),
+        ));
+    }
+    let (equipment_id, celsius_x10, note): (String, i64, Option<String>) = tx.query_row(
+        "SELECT json_extract(?1, '$.equipment_id'), json_extract(?1, '$.celsius_x10'),
+                json_extract(?1, '$.note')",
+        [&event.payload],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let payload = TemperatureLogged {
+        equipment_id: AggregateId::parse(&equipment_id)?,
+        celsius_x10,
+        note,
+    };
+    payload.validate()?;
+    // The stored event supplies seq in both the online and replay paths.
+    let inserted = tx.execute(
+        "INSERT INTO temperature_readings (id, event_seq, equipment_id, celsius_x10, note,
+             actor_id, device_id, business_date, occurred_at, recorded_at)
+         SELECT ?1, seq, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9 FROM store_events WHERE id = ?10",
+        params![
+            event.aggregate_id.to_string(),
+            payload.equipment_id.to_string(),
+            payload.celsius_x10,
+            payload.note,
+            event.actor_id.to_string(),
+            event.device_id.to_string(),
+            event.business_date,
+            event.occurred_at.0,
+            event.recorded_at.0,
+            event.id.to_string()
+        ],
+    )?;
+    if inserted != 1 {
+        return Err(StorageError::InvalidEvent(
+            "temperature event not found".into(),
+        ));
     }
     Ok(())
 }

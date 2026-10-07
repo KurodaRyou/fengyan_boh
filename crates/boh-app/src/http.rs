@@ -1,7 +1,7 @@
 //! 路由与统一响应信封。
 
-use axum::extract::rejection::{JsonRejection, PathRejection};
-use axum::extract::{Path, State};
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
@@ -17,6 +17,7 @@ use crate::{
 };
 use boh_domain::AggregateId;
 use boh_domain::equipment::{CreateEquipment, UpdateEquipment};
+use boh_domain::temperature::{LogTemperature, TemperatureQuery};
 
 /// 所有接口的统一响应格式：`{ "success", "data", "warnings", "error" }`。
 #[derive(Debug, Serialize)]
@@ -124,6 +125,10 @@ pub fn router(state: AppState) -> Router {
             get(list_equipment).post(create_equipment),
         )
         .route("/api/v1/equipment/{equipment_id}", put(update_equipment))
+        .route(
+            "/api/v1/temperature-readings",
+            get(list_temperature_readings).post(log_temperature),
+        )
         .fallback(route_not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(state)
@@ -171,6 +176,28 @@ async fn update_equipment(
     let Json(command) = body.map_err(|_| ApiError::validation())?;
     command.validate().map_err(|_| ApiError::validation())?;
     Ok(Json(service::update(state, actor, id, command).await?))
+}
+
+async fn log_temperature(
+    State(state): State<AppState>,
+    actor: Actor,
+    body: Result<Json<LogTemperature>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Json(command) = body.map_err(|_| ApiError::validation())?;
+    command.validate().map_err(|_| ApiError::validation())?;
+    Ok(Json(service::log_temperature(state, actor, command).await?))
+}
+
+async fn list_temperature_readings(
+    State(state): State<AppState>,
+    _actor: Actor,
+    query: Result<Query<TemperatureQuery>, QueryRejection>,
+) -> Result<Json<Envelope<Value>>, ApiError> {
+    let Query(query) = query.map_err(|_| ApiError::validation())?;
+    query.validate().map_err(|_| ApiError::validation())?;
+    Ok(ok(serde_json::json!({
+        "temperature_readings": service::list_temperature_readings(state, query).await?
+    })))
 }
 
 #[derive(Debug, Serialize)]
