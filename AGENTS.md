@@ -17,7 +17,7 @@
   发现规则不合理或缺失时，停下来在交付说明里提出，不要绕过。
 - 「尚未设计」一节和 `docs/domain.md`「待确认问题」中的内容，在设计落地到文档之前**不要实现**。
 - 交付前必须本地通过：`cargo fmt --all`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`、`scripts/ci-scan.sh`。
-- 交付说明写清：改了哪些文件、对应「开发顺序」的哪几步、有哪些未决问题。之后由 Claude 做 code review。
+- 交付说明写清：改了哪些文件、对应「开发顺序」的哪几步、有哪些未决问题。之后由 Claude 在本地 review，通过后再提 PR（见「开发顺序」第 9、10 步）。
 - 合入：`main` 只接受 PR，CI `check` 必须通过，禁止强推和删除；不要求 PR 批准。
   - 所有提交和 PR 都用同一个 GitHub 账号，作者不能批准自己的 PR。锁定路径由本文件规则、Codex 自动 review、Claude review 把关，人确认后合入。
 - 锁定路径（`.github/CODEOWNERS` 列出的路径）的改动只能出现在人或 Claude 提交、提交信息以 `spec:`（锁定测试）或 `docs:`（规则、设计、迁移、CI 与构建配置）开头的提交中。
@@ -54,6 +54,33 @@
     仍有未写回结论的文档不删；`workdocs/` 中只应留下进行中的工作。
 - 实现落地后，字段与表结构以代码为唯一来源（`boh-domain` 结构体、迁移 SQL）：`docs/domain.md` 中对应的字段清单改为指向代码（时机见「开发顺序」第 1 步），
   只保留语义与不变量；文档中的算例写成集成测试后，只留一个帮助理解的例子。
+
+---
+
+## 开发顺序（每个新功能）
+
+1. **人 + Claude**：在切片分支开头的 `docs:` 提交中，先按「文档分层」整理上一个已合入切片在 `docs/` 中的字段清单（改为指向代码），再在 `docs/domain.md` 中定义本切片的事件类型、payload 字段、投影影响、错误码和警告码。
+   - 整理不放在本切片的实现提交之后：实现之后的 `docs:` 提交不在分支开头，会让 `git diff <比对基准> HEAD -- <锁定路径>` 非空。
+2. **Claude**：写迁移 SQL（如需新表 / 投影表）。
+3. **Claude**：写 schema 测试，跑通后表结构锁定。
+4. **Claude**：写锁定测试（golden payload、HTTP 契约、验收用例、重放一致性）和接口说明；**人确认预期值**后作为 `spec:` 提交。
+5. **实现 agent**：`boh-domain` 命令 / 事件结构体 + 校验。
+6. **实现 agent**：`boh-app::service` 中经 `ledger::execute` 组装一个事务；`projections::apply` 增加该事件的投影。
+7. **实现 agent**：`boh-app::http` handler + 路由。
+8. **实现 agent**：全部锁定测试通过，补自己的单元测试，提交交付说明。
+9. **Claude** 在本地 review 切片分支：按「不可违反的规则」逐条核对，逐个提交核对锁定路径，`git diff <比对基准> HEAD -- <锁定路径>` 为空。
+   有问题退回实现 agent 修改后重新 review；通过后 Claude 给出可以提 PR 的结论。
+10. **提 PR**，GitHub 上自动运行 **Codex** review（只在 PR 打开后运行，本地不跑）。Codex 的发现由 Claude 判断是否采纳，需要修改的退回实现 agent；
+    PR 打开后又有新提交时，合入前评论 `@codex review` 重新触发。CI `check` 通过后人合入。
+
+### 路线图
+
+1. **Write path 与基础设施**：时钟模块、相对校准、营业日纯函数；`Readers::call` 包读事务、写线程任务计时；信封加 `warnings`；`boh_storage::open()` 收口。
+2. **Walking skeleton 与首批切片**：
+   设备主数据（walking skeleton：`ledger::execute` / `Ledger::append` / `projections::apply` 骨架与 `rebuild-projections`、`Actor` 开发桩、`boh-server init`、`EQUIPMENT` 写接口、迁移 002：`equipment`；打通 write path、幂等、重放、golden payload）
+   → 温度记录（迁移 003：`temperature_readings`）→ 备份模块与恢复演练测试、`/health` 字段 → 004：其余主数据与库存投影表 → 收货 + 报损（FIFO、账外缺口、分配来源、吸收规则、不变量自检）→ 局域网 HTTPS → 员工认证。
+   - 设备主数据切片的 `init` 只写 `store_meta`；第一个店长和预置报损原因随 004 加入，PIN 步骤随认证切片加入。
+3. **扩展**：生产 → 盘点 → 纠错（冲销、数量更正）→ 补录入口 → 销售导入。每一步配对应的验收用例。
 
 ---
 
@@ -283,30 +310,6 @@ scripts/        CI 扫描脚本。
 - 内部错误只记日志，不把 SQL / 内部细节返回给客户端。
 - `/health` 暴露：`clock_regression_ms`（超过 5 分钟为 `degraded`）、`last_backup_ok_at`、`last_backup_seq`、WAL 文件大小、最近一次不变量自检的结果；认证实现后加 `auth_failures_last_hour`；同步实现后加 `max(seq) − acked_seq` 和最后一次成功同步的时间。
   不变量自检由定时任务在读连接上执行，`/health` 只返回最近一次的结果，不现场计算。
-
----
-
-## 开发顺序（每个新功能）
-
-1. **人 + Claude**：在切片分支开头的 `docs:` 提交中，先按「文档分层」整理上一个已合入切片在 `docs/` 中的字段清单（改为指向代码），再在 `docs/domain.md` 中定义本切片的事件类型、payload 字段、投影影响、错误码和警告码。
-   - 整理不放在本切片的实现提交之后：实现之后的 `docs:` 提交不在分支开头，会让 `git diff <比对基准> HEAD -- <锁定路径>` 非空。
-2. **Claude**：写迁移 SQL（如需新表 / 投影表）。
-3. **Claude**：写 schema 测试，跑通后表结构锁定。
-4. **Claude**：写锁定测试（golden payload、HTTP 契约、验收用例、重放一致性）和接口说明；**人确认预期值**后作为 `spec:` 提交。
-5. **实现 agent**：`boh-domain` 命令 / 事件结构体 + 校验。
-6. **实现 agent**：`boh-app::service` 中经 `ledger::execute` 组装一个事务；`projections::apply` 增加该事件的投影。
-7. **实现 agent**：`boh-app::http` handler + 路由。
-8. **实现 agent**：全部锁定测试通过，补自己的单元测试，提交交付说明。
-9. **Codex** 自动 review + **Claude** review（按「不可违反的规则」逐条核对，锁定路径 diff 为空），人合入。
-
-### 路线图
-
-1. **Write path 与基础设施**：时钟模块、相对校准、营业日纯函数；`Readers::call` 包读事务、写线程任务计时；信封加 `warnings`；`boh_storage::open()` 收口。
-2. **Walking skeleton 与首批切片**：
-   设备主数据（walking skeleton：`ledger::execute` / `Ledger::append` / `projections::apply` 骨架与 `rebuild-projections`、`Actor` 开发桩、`boh-server init`、`EQUIPMENT` 写接口、迁移 002：`equipment`；打通 write path、幂等、重放、golden payload）
-   → 温度记录（迁移 003：`temperature_readings`）→ 备份模块与恢复演练测试、`/health` 字段 → 004：其余主数据与库存投影表 → 收货 + 报损（FIFO、账外缺口、分配来源、吸收规则、不变量自检）→ 局域网 HTTPS → 员工认证。
-   - 设备主数据切片的 `init` 只写 `store_meta`；第一个店长和预置报损原因随 004 加入，PIN 步骤随认证切片加入。
-3. **扩展**：生产 → 盘点 → 纠错（冲销、数量更正）→ 补录入口 → 销售导入。每一步配对应的验收用例。
 
 ---
 
