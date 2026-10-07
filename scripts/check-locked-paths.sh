@@ -42,9 +42,18 @@ baseline=$(git rev-parse --short "$(git merge-base "$base" "$head")")
 while read -r commit; do
     subject=$(git log -1 --format=%s "$commit")
     parents=$(git rev-list --parents -n 1 "$commit" | wc -w)
-    if (( parents > 2 )); then
-        # A merge counts only for what it changes beyond its parents, i.e. conflict resolutions.
-        changed=$(git diff-tree --cc --no-commit-id --name-only -r "$commit" -- "${pathspecs[@]}")
+    if (( parents > 3 )); then
+        changed='(octopus merge)'
+    elif (( parents == 3 )); then
+        # Compare with the merge Git would produce: a combined diff (--cc) hides resolutions that take one
+        # parent's version, and `-s ours`. Conflicted files keep their markers there, so conflicts show up too.
+        status=0
+        recreated=$(git merge-tree --write-tree --no-messages "$commit^1" "$commit^2" | sed -n 1p) || status=$?
+        if (( status > 1 )) || [[ -z "$recreated" ]]; then
+            printf 'git merge-tree failed for %s\n' "$commit" >&2
+            exit 2
+        fi
+        changed=$(git diff --name-only "$recreated" "$commit" -- "${pathspecs[@]}")
     else
         changed=$(git diff-tree --no-commit-id --name-only -r "$commit" -- "${pathspecs[@]}")
     fi

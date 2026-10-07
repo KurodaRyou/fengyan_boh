@@ -43,7 +43,7 @@
 - 实现 agent 认为锁定测试有错时，停下来在交付说明里提出。不得修改，不得加 `#[ignore]`，不得用 `cfg`、feature 或 Cargo 配置让它不编译、不运行。
 - 合入方式：锁定测试以 `spec:` 提交（由人提交）；实现 agent 在其上开发，测试与实现在同一个 PR 合入。
   Review 的比对基准是切片分支开头连续的 `spec:` / `docs:` 提交中的最后一个，`git diff <比对基准> HEAD -- <锁定路径>` 必须为空。PR 打开后又有新提交时，合入前评论 `@codex review` 重新触发 Codex review。
-  - CI 的 `scripts/check-locked-paths.sh` 逐个提交检查：比对基准之后的提交（含合并提交中手工解决的冲突）不得改锁定路径。
+  - CI 的 `scripts/check-locked-paths.sh` 逐个提交检查：比对基准之后的提交不得改锁定路径；合并提交的锁定路径必须与 Git 自动合并的结果一致。
   - 锁定路径与主干冲突时，把开头的 `spec:` / `docs:` 提交 rebase 到新主干上，不在合并提交里解决。
 
 ### 文档分层
