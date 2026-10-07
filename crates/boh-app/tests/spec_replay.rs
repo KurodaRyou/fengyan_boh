@@ -11,7 +11,7 @@ use boh_storage::clock::ManualClock;
 use boh_storage::rusqlite::types::Value as SqlValue;
 use boh_storage::rusqlite::{self, Connection};
 use serde_json::{Value, json};
-use spec_support::{MANAGER, assert_error, assert_success};
+use spec_support::{MANAGER, STAFF, assert_error, assert_success};
 
 const NOW: UnixMillis = UnixMillis(1_791_248_400_000); // 2026-10-06 09:00 +08:00
 /// 不是投影的表：账本、幂等记录、门店身份。认证状态表随认证切片加入此清单。
@@ -251,4 +251,124 @@ async fn failed_rebuild_rolls_back_every_projection() {
 
     assert_eq!(projections(&db_path).unwrap(), projections_before);
     assert_eq!(ledger(&db_path).unwrap(), ledger_before);
+}
+
+/// 平板发送时刻的平板本地时钟。
+const SENT: i64 = NOW.0 + 7 * 60_000;
+
+/// 记录一条温度读数：平板在 `captured_at` 录入、在 `SENT` 发送。返回完整响应。
+#[allow(clippy::unwrap_used)] // 测试夹具：响应体不是 JSON 已违反信封约定，直接终止测试。
+async fn log(
+    router: &axum::Router,
+    command_id: &str,
+    equipment_id: &str,
+    celsius_x10: i64,
+    note: Option<&str>,
+    captured_at: i64,
+    sent_at: i64,
+) -> spec_support::JsonReply {
+    let mut body = json!({
+        "command_id": command_id, "equipment_id": equipment_id, "celsius_x10": celsius_x10,
+        "captured_at": captured_at, "sent_at": sent_at,
+    });
+    if let Some(note) = note {
+        body["note"] = json!(note);
+    }
+    let reply = spec_support::post(router, "/api/v1/temperature-readings", Some(&STAFF), &body)
+        .await
+        .unwrap();
+    assert_success(&reply);
+    reply
+}
+
+// 设备与温度记录混合的账本：在线写入后篡改两张投影（删行、改行、插入多余的行），重建后全部投影与在线写入逐行一致，
+// 账本、processed_commands 和 store_meta 不变；重建可重复执行。
+// 重建不影响幂等回执：之后用原 command_id、原内容（sent_at 不同）重发读数，原样返回首次响应（含 warnings），不新增事件。
+// 账本中包含停用设备上的读数、带 / 不带 note 的读数和时钟回拨后的读数。
+#[tokio::test]
+async fn rebuild_restores_equipment_and_temperature_projections() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("boh.db");
+    let clock = ManualClock::new(NOW);
+    let router = spec_support::router(&db_path, clock.clock()).unwrap();
+    let a = create(&router, &cmd(1), "F1").await;
+    let b = create(&router, &cmd(2), "F2").await;
+    log(
+        &router,
+        &cmd(3),
+        &a,
+        -185,
+        Some("门封条结霜"),
+        SENT - 600_000,
+        SENT,
+    )
+    .await;
+    update(&router, &a, &cmd(4), 1, "Walk-in A", "FREEZER", true).await;
+    // 负 lag：首次响应带 CAPTURE_TIME_ADJUSTED。
+    let first = log(&router, &cmd(5), &b, 38, None, SENT + 60_000, SENT).await;
+    assert_eq!(
+        first.body["warnings"][0]["code"],
+        json!("CAPTURE_TIME_ADJUSTED")
+    );
+    update(&router, &b, &cmd(6), 1, "Walk-in", "FRIDGE", false).await;
+    log(&router, &cmd(7), &b, 41, None, SENT, SENT).await;
+    clock.set(UnixMillis(NOW.0 - 2 * 86_400_000));
+    log(
+        &router,
+        &cmd(8),
+        &a,
+        -180,
+        Some("回拨"),
+        SENT - 60_000,
+        SENT,
+    )
+    .await;
+    drop(router);
+    let online = projections(&db_path).unwrap();
+    assert!(
+        online
+            .iter()
+            .any(|(name, rows)| name == "temperature_readings" && rows.len() == 4)
+    );
+    let ledger_before = ledger(&db_path).unwrap();
+
+    let mut writer = spec_support::writer(&db_path).unwrap();
+    writer
+        .execute_batch(&format!(
+            "DELETE FROM temperature_readings WHERE celsius_x10 = 38;
+             UPDATE temperature_readings SET celsius_x10 = 0, note = 'tampered' WHERE celsius_x10 = -185;
+             UPDATE temperature_readings SET note = NULL WHERE celsius_x10 = -180;
+             INSERT INTO temperature_readings (id, event_seq, equipment_id, celsius_x10, note, actor_id,
+                 device_id, business_date, occurred_at, recorded_at)
+             VALUES ('01890a5d-ac96-774b-bcce-b302099a8998', 1, '{a}', 0, 'stray', '{actor}', '{device}',
+                 '2026-10-06', 0, 0);
+             UPDATE equipment SET name = 'tampered' WHERE code = 'F2';",
+            actor = MANAGER.employee_id,
+            device = MANAGER.device_id,
+        ))
+        .unwrap();
+    assert_ne!(projections(&db_path).unwrap(), online);
+
+    for _ in 0..2 {
+        assert_eq!(spec_support::rebuild_projections(&mut writer).unwrap(), 8);
+        assert_eq!(projections(&db_path).unwrap(), online);
+        assert_eq!(ledger(&db_path).unwrap(), ledger_before);
+    }
+    drop(writer);
+
+    clock.set(UnixMillis(NOW.0 + 3_600_000));
+    let router = spec_support::router(&db_path, clock.clock()).unwrap();
+    let retry = log(
+        &router,
+        &cmd(5),
+        &b,
+        38,
+        None,
+        SENT + 60_000,
+        SENT + 120_000,
+    )
+    .await;
+    assert_eq!(retry.body, first.body);
+    assert_eq!(ledger(&db_path).unwrap(), ledger_before);
+    assert_eq!(projections(&db_path).unwrap(), online);
 }

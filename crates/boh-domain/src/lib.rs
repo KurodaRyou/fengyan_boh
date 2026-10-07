@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub mod equipment;
+pub mod temperature;
 pub mod time;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

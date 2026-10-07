@@ -1,4 +1,4 @@
-//! 锁定迁移 001、002 的表结构；每项测试注明对应的规则（AGENTS.md / docs/domain.md）或迁移文件。
+//! 锁定迁移 001、002、003 的表结构；每项测试注明对应的规则（AGENTS.md / docs/domain.md）或迁移文件。
 
 use std::fmt::Debug;
 
@@ -11,6 +11,8 @@ const MIGRATION_001: &str = include_str!("../../../migrations/001_initial_schema
 const MIGRATION_001_FNV1A_64: u64 = 0xfdd0_ce57_922a_6b5f;
 const MIGRATION_002: &str = include_str!("../../../migrations/002_equipment.sql");
 const MIGRATION_002_FNV1A_64: u64 = 0x5b5d_70a4_7c72_9418;
+const MIGRATION_003: &str = include_str!("../../../migrations/003_temperature_readings.sql");
+const MIGRATION_003_FNV1A_64: u64 = 0x68f1_2381_a56a_04c3;
 const STORE: &str = "01890a5d-ac96-774b-bcce-b302099a8050";
 const ACTOR: &str = "01890a5d-ac96-774b-bcce-b302099a8051";
 const CMD: &str = "01890a5d-ac96-774b-bcce-b302099a8057";
@@ -160,10 +162,16 @@ fn migration_002_matches_frozen_checksum() {
     assert_eq!(fnv1a_64(MIGRATION_002), MIGRATION_002_FNV1A_64);
 }
 
+// AGENTS「迁移」不可修改：按 UTF-8 原始字节锁定 003 完整 SQL（包括注释）。
+#[test]
+fn migration_003_matches_frozen_checksum() {
+    assert_eq!(fnv1a_64(MIGRATION_003), MIGRATION_003_FNV1A_64);
+}
+
 // AGENTS「迁移」：程序支持的版本就是已锁定迁移文件的个数。
 #[test]
 fn latest_schema_version_counts_locked_migrations() {
-    assert_eq!(LATEST_SCHEMA_VERSION, 2);
+    assert_eq!(LATEST_SCHEMA_VERSION, 3);
 }
 
 // AGENTS「迁移」：重复执行迁移不改变版本，也不丢失已有数据。
@@ -703,15 +711,15 @@ fn upgrades_a_version_1_database_without_losing_data() {
 
     assert_eq!(schema_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
     assert_eq!(event_seqs(&conn).unwrap(), [1]);
-    let counts: (i64, i64, i64) = conn
+    let counts: (i64, i64, i64, i64) = conn
         .query_row(
             "SELECT (SELECT COUNT(*) FROM store_meta), (SELECT COUNT(*) FROM processed_commands),
-                    (SELECT COUNT(*) FROM equipment)",
+                    (SELECT COUNT(*) FROM equipment), (SELECT COUNT(*) FROM temperature_readings)",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .unwrap();
-    assert_eq!(counts, (1, 1, 0));
+    assert_eq!(counts, (1, 1, 0, 0));
 }
 
 // 002 + AGENTS「ID 与时间」：设备主键是 UUIDv7。
@@ -827,4 +835,342 @@ fn equipment_projection_can_be_cleared_and_rewritten() {
     .unwrap();
     assert_eq!(conn.execute("DELETE FROM equipment", []).unwrap(), 1);
     insert_equipment(&conn, EVT, "F1", "Walk-in", "FRIDGE", 1, 1).unwrap();
+}
+
+const EQUIPMENT: &str = "01890a5d-ac96-774b-bcce-b302099a8301";
+const EQUIPMENT2: &str = "01890a5d-ac96-774b-bcce-b302099a8302";
+const READING: &str = "01890a5d-ac96-774b-bcce-b302099a8401";
+const READING2: &str = "01890a5d-ac96-774b-bcce-b302099a8402";
+const READING3: &str = "01890a5d-ac96-774b-bcce-b302099a8403";
+const DEVICE: &str = "01890a5d-ac96-774b-bcce-b302099a8201";
+const INSERT_READING: &str =
+    "INSERT INTO temperature_readings (id, event_seq, equipment_id, celsius_x10, note,
+         actor_id, device_id, business_date, occurred_at, recorded_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
+
+struct Reading<'a> {
+    id: &'a str,
+    event_seq: i64,
+    equipment_id: &'a str,
+    celsius_x10: i64,
+    note: Option<&'a str>,
+    actor_id: &'a str,
+    device_id: &'a str,
+    business_date: &'a str,
+    occurred_at: i64,
+    recorded_at: i64,
+}
+
+impl<'a> Reading<'a> {
+    fn new(id: &'a str, event_seq: i64) -> Self {
+        Self {
+            id,
+            event_seq,
+            equipment_id: EQUIPMENT,
+            celsius_x10: 38,
+            note: None,
+            actor_id: ACTOR,
+            device_id: DEVICE,
+            business_date: "2026-10-05",
+            occurred_at: TS - 1000,
+            recorded_at: TS,
+        }
+    }
+
+    fn insert(&self, conn: &Connection) -> rusqlite::Result<usize> {
+        conn.execute(
+            INSERT_READING,
+            params![
+                self.id,
+                self.event_seq,
+                self.equipment_id,
+                self.celsius_x10,
+                self.note,
+                self.actor_id,
+                self.device_id,
+                self.business_date,
+                self.occurred_at,
+                self.recorded_at,
+            ],
+        )
+    }
+}
+
+/// 最新 schema，账本中已有 seq 1～3 三个事件，设备 EQUIPMENT 已存在。
+#[allow(clippy::unwrap_used)] // 测试夹具：前置数据写入失败时测试无法开始，直接终止。
+fn reading_db() -> (TempDir, Connection) {
+    let (dir, conn) = fresh_db();
+    insert_command(&conn, CMD, "{}").unwrap();
+    for id in [EVT, EVT2, EVT3] {
+        Event::new(id).insert(&conn).unwrap();
+    }
+    insert_equipment(&conn, EQUIPMENT, "F1", "Walk-in", "FRIDGE", 1, 1).unwrap();
+    (dir, conn)
+}
+
+fn reading_ids(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    conn.prepare("SELECT id FROM temperature_readings ORDER BY event_seq")?
+        .query_map([], |row| row.get(0))?
+        .collect()
+}
+
+/// 整表内容，按第一列排序。
+fn table_rows(
+    conn: &Connection,
+    table: &str,
+) -> rusqlite::Result<Vec<Vec<rusqlite::types::Value>>> {
+    let mut statement = conn.prepare(&format!("SELECT * FROM {table} ORDER BY 1"))?;
+    let columns = statement.column_count();
+    statement
+        .query_map([], |row| (0..columns).map(|i| row.get(i)).collect())?
+        .collect()
+}
+
+// AGENTS「迁移」：已有 002 数据（含设备投影）的库升级到 003，原有四张表逐行不变，新表为空且可引用原有事件和设备。
+#[test]
+#[allow(clippy::disallowed_methods)] // 锁定测试经 boh_storage::testing 取得原始连接。
+fn upgrades_a_version_2_database_without_losing_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut conn = open_writer(&dir.path().join("boh.db")).unwrap();
+    conn.execute_batch(MIGRATION_001).unwrap();
+    conn.execute_batch(MIGRATION_002).unwrap();
+    conn.pragma_update(None, "user_version", 2).unwrap();
+    insert_meta(&conn, 1, STORE).unwrap();
+    insert_command(&conn, CMD, "{}").unwrap();
+    Event::new(EVT).insert(&conn).unwrap();
+    insert_equipment(&conn, EQUIPMENT, "F1", "Walk-in", "FREEZER", 0, 2).unwrap();
+    let tables = [
+        "store_meta",
+        "processed_commands",
+        "store_events",
+        "equipment",
+    ];
+    let before: Vec<_> = tables
+        .iter()
+        .map(|t| table_rows(&conn, t).unwrap())
+        .collect();
+
+    migrate(&mut conn).unwrap();
+
+    assert_eq!(schema_version(&conn).unwrap(), 3);
+    let after: Vec<_> = tables
+        .iter()
+        .map(|t| table_rows(&conn, t).unwrap())
+        .collect();
+    assert_eq!(after, before);
+    assert!(reading_ids(&conn).unwrap().is_empty());
+    Reading::new(READING, 1).insert(&conn).unwrap();
+    assert_eq!(reading_ids(&conn).unwrap(), [READING]);
+}
+
+// 003 + AGENTS「ID 与时间」：读数 id、actor_id、device_id 是 UUIDv7。
+#[test]
+fn temperature_reading_uuid_columns_reject_v4_uppercase_and_wrong_length() {
+    let (_dir, conn) = reading_db();
+    for invalid in INVALID_IDS {
+        for column in ["id", "actor_id", "device_id"] {
+            let mut reading = Reading::new(READING, 1);
+            match column {
+                "id" => reading.id = invalid,
+                "actor_id" => reading.actor_id = invalid,
+                "device_id" => reading.device_id = invalid,
+                _ => unreachable!(),
+            }
+            assert_sqlite_error(reading.insert(&conn), ffi::SQLITE_CONSTRAINT_CHECK);
+        }
+    }
+    Reading::new(READING, 1).insert(&conn).unwrap();
+}
+
+// 003：读数 id 唯一；每个事件至多一行读数（event_seq 唯一）。
+#[test]
+fn temperature_reading_id_and_event_seq_are_unique() {
+    let (_dir, conn) = reading_db();
+    Reading::new(READING, 1).insert(&conn).unwrap();
+    assert_sqlite_error(
+        Reading::new(READING, 2).insert(&conn),
+        ffi::SQLITE_CONSTRAINT_PRIMARYKEY,
+    );
+    assert_sqlite_error(
+        Reading::new(READING2, 1).insert(&conn),
+        ffi::SQLITE_CONSTRAINT_UNIQUE,
+    );
+    Reading::new(READING2, 2).insert(&conn).unwrap();
+    assert_eq!(reading_ids(&conn).unwrap(), [READING, READING2]);
+}
+
+// 003 引用完整性：event_seq 必须是账本中已有的事件，立即检查。
+#[test]
+fn temperature_reading_event_seq_must_reference_an_event() {
+    let (_dir, conn) = reading_db();
+    for seq in [0, 4, 99] {
+        assert_sqlite_error(
+            Reading::new(READING, seq).insert(&conn),
+            ffi::SQLITE_CONSTRAINT_FOREIGNKEY,
+        );
+    }
+    assert!(reading_ids(&conn).unwrap().is_empty());
+    Reading::new(READING, 3).insert(&conn).unwrap();
+}
+
+// 003 引用完整性：equipment_id 必须是已有设备；外键延迟到提交时检查，同一事务允许先写读数、后写设备。
+#[test]
+fn temperature_reading_equipment_is_checked_at_commit() {
+    let (_dir, mut conn) = reading_db();
+    let mut orphan = Reading::new(READING, 1);
+    orphan.equipment_id = EQUIPMENT2;
+    // 自动提交：语句结束即提交，立即拒绝。
+    assert_sqlite_error(orphan.insert(&conn), ffi::SQLITE_CONSTRAINT_FOREIGNKEY);
+
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    orphan.insert(&tx).unwrap();
+    assert_sqlite_error(tx.commit(), ffi::SQLITE_CONSTRAINT_FOREIGNKEY);
+    assert!(reading_ids(&conn).unwrap().is_empty());
+
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    orphan.insert(&tx).unwrap();
+    insert_equipment(&tx, EQUIPMENT2, "F2", "Reach-in", "FREEZER", 1, 1).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(reading_ids(&conn).unwrap(), [READING]);
+}
+
+// AGENTS「只追加」：temperature_readings 是投影，没有只追加触发器；重建在一个事务内按任意顺序清空
+// equipment 与本表再重写，提交时引用完整即可。只删设备、留下引用它的读数则在提交时拒绝。
+#[test]
+fn temperature_projection_can_be_cleared_and_rewritten() {
+    let (_dir, mut conn) = reading_db();
+    Reading::new(READING, 1).insert(&conn).unwrap();
+    conn.execute(
+        "UPDATE temperature_readings SET celsius_x10 = 40, note = 'x' WHERE id = ?1",
+        params![READING],
+    )
+    .unwrap();
+
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    tx.execute("DELETE FROM equipment", []).unwrap();
+    assert_sqlite_error(tx.commit(), ffi::SQLITE_CONSTRAINT_FOREIGNKEY);
+    assert_eq!(reading_ids(&conn).unwrap(), [READING]);
+
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    assert_eq!(tx.execute("DELETE FROM equipment", []).unwrap(), 1);
+    assert_eq!(
+        tx.execute("DELETE FROM temperature_readings", []).unwrap(),
+        1
+    );
+    Reading::new(READING, 1).insert(&tx).unwrap();
+    insert_equipment(&tx, EQUIPMENT, "F1", "Walk-in", "FRIDGE", 1, 1).unwrap();
+    tx.commit().unwrap();
+    let stored: (i64, Option<String>) = conn
+        .query_row(
+            "SELECT celsius_x10, note FROM temperature_readings WHERE id = ?1",
+            params![READING],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(stored, (38, None));
+}
+
+// 003：celsius_x10 是 0.1 °C 的整数，取值 -500～5000（-50.0～500.0 °C），两端可取。
+#[test]
+fn celsius_x10_is_bounded() {
+    let (_dir, conn) = reading_db();
+    for invalid in [-501, 5001, i64::MIN, i64::MAX] {
+        let mut reading = Reading::new(READING, 1);
+        reading.celsius_x10 = invalid;
+        assert_sqlite_error(reading.insert(&conn), ffi::SQLITE_CONSTRAINT_CHECK);
+    }
+    for (id, seq, celsius_x10) in [(READING, 1, -500), (READING2, 2, 0), (READING3, 3, 5000)] {
+        let mut reading = Reading::new(id, seq);
+        reading.celsius_x10 = celsius_x10;
+        reading.insert(&conn).unwrap();
+    }
+}
+
+// 003：note 为 NULL（省略）或非空文本，最多 200 个字符（按字符计，不按字节）。
+#[test]
+fn temperature_note_is_null_or_non_empty_and_at_most_200_characters() {
+    let (_dir, conn) = reading_db();
+    let long_ascii = "a".repeat(201);
+    let long_cjk = "冷".repeat(201);
+    for invalid in ["", long_ascii.as_str(), long_cjk.as_str()] {
+        let mut reading = Reading::new(READING, 1);
+        reading.note = Some(invalid);
+        assert_sqlite_error(reading.insert(&conn), ffi::SQLITE_CONSTRAINT_CHECK);
+    }
+    let max_cjk = "冷".repeat(200);
+    Reading::new(READING, 1).insert(&conn).unwrap();
+    let mut reading = Reading::new(READING2, 2);
+    reading.note = Some(&max_cjk);
+    reading.insert(&conn).unwrap();
+    let notes: Vec<Option<String>> = conn
+        .prepare("SELECT note FROM temperature_readings ORDER BY event_seq")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(notes, [None, Some(max_cjk)]);
+}
+
+// AGENTS「ID 与时间」：营业日是 'YYYY-MM-DD' 且真实存在。
+#[test]
+fn temperature_business_date_must_be_a_real_iso_date() {
+    let (_dir, conn) = reading_db();
+    for date in [
+        "2026-02-30",
+        "2026-13-01",
+        "2026-1-5",
+        "2026/10/05",
+        "20261005",
+    ] {
+        let mut reading = Reading::new(READING, 1);
+        reading.business_date = date;
+        assert_sqlite_error(reading.insert(&conn), ffi::SQLITE_CONSTRAINT_CHECK);
+    }
+    Reading::new(READING, 1).insert(&conn).unwrap();
+}
+
+// AGENTS「SQLite」所有表用 STRICT：temperature_readings 的 INTEGER 列不接受非整数文本或小数。
+#[test]
+fn temperature_readings_is_strict() {
+    let (_dir, conn) = reading_db();
+    for column in ["event_seq", "celsius_x10", "occurred_at", "recorded_at"] {
+        for value in ["'warm'", "38.5"] {
+            let values: Vec<&str> = [
+                ("id", "?1"),
+                ("event_seq", "1"),
+                ("equipment_id", "?2"),
+                ("celsius_x10", "38"),
+                ("actor_id", "?3"),
+                ("device_id", "?4"),
+                ("business_date", "'2026-10-05'"),
+                ("occurred_at", "0"),
+                ("recorded_at", "0"),
+            ]
+            .iter()
+            .map(|(name, default)| if *name == column { value } else { default })
+            .collect();
+            assert_sqlite_error(
+                conn.execute(
+                    &format!(
+                        "INSERT INTO temperature_readings (id, event_seq, equipment_id, celsius_x10,
+                             actor_id, device_id, business_date, occurred_at, recorded_at)
+                         VALUES ({})",
+                        values.join(", ")
+                    ),
+                    params![READING, EQUIPMENT, ACTOR, DEVICE],
+                ),
+                ffi::SQLITE_CONSTRAINT_DATATYPE,
+            );
+        }
+    }
+    assert!(reading_ids(&conn).unwrap().is_empty());
 }

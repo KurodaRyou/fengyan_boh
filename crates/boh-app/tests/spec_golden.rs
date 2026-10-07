@@ -9,7 +9,7 @@ use std::path::Path;
 use boh_domain::UnixMillis;
 use boh_storage::clock::ManualClock;
 use serde_json::json;
-use spec_support::{MANAGER, assert_success};
+use spec_support::{MANAGER, STAFF, assert_success};
 
 const NOW: UnixMillis = UnixMillis(1_791_248_400_000); // 2026-10-06 09:00 +08:00
 
@@ -66,6 +66,68 @@ async fn master_data_changed_equipment() {
         [
             golden(include_str!("golden/MASTER_DATA_CHANGED@1/EQUIPMENT.json")),
             r#"{"entity":"EQUIPMENT","source":"LOCAL","snapshot":{"code":"F1","name":"急冻柜 \"B\"","equipment_type":"BLAST_FREEZER","active":false}}"#,
+        ]
+    );
+}
+
+/// 温度记录 golden 样本中的设备 ID。设备 ID 由服务端生成，比对前把实际 ID 替换成它，其余文本逐字节比对。
+const GOLDEN_EQUIPMENT_ID: &str = "01890a5d-ac96-774b-bcce-b302099a8301";
+
+// TEMPERATURE_LOGGED@1：note 出现与省略是两种结构分支，各一份样本；省略时不写 null。
+// 负温度、非 ASCII 文本不转义、引号转义一并锁定。
+#[tokio::test]
+async fn temperature_logged_with_and_without_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("boh.db");
+    let router = spec_support::router(&db_path, ManualClock::new(NOW).clock()).unwrap();
+    let reply = spec_support::post(
+        &router,
+        "/api/v1/equipment",
+        Some(&MANAGER),
+        &json!({
+            "command_id": "01890a5d-ac96-774b-bcce-b30209a90001",
+            "code": "F1", "name": "冷藏柜 1", "equipment_type": "FRIDGE", "active": true,
+        }),
+    )
+    .await
+    .unwrap();
+    let id = assert_success(&reply)["equipment"]["equipment_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for (command_id, celsius_x10, note) in [
+        (
+            "01890a5d-ac96-774b-bcce-b30209a90002",
+            -185,
+            Some("门封条结霜 \"B\""),
+        ),
+        ("01890a5d-ac96-774b-bcce-b30209a90003", 38, None),
+    ] {
+        let mut body = json!({
+            "command_id": command_id, "equipment_id": id, "celsius_x10": celsius_x10,
+            "captured_at": NOW.0 - 60_000, "sent_at": NOW.0,
+        });
+        if let Some(note) = note {
+            body["note"] = json!(note);
+        }
+        let reply =
+            spec_support::post(&router, "/api/v1/temperature-readings", Some(&STAFF), &body)
+                .await
+                .unwrap();
+        assert_success(&reply);
+    }
+
+    let payloads: Vec<String> = payloads(&db_path).unwrap()[1..]
+        .iter()
+        .map(|payload| payload.replace(&id, GOLDEN_EQUIPMENT_ID))
+        .collect();
+    assert_eq!(
+        payloads,
+        [
+            golden(include_str!("golden/TEMPERATURE_LOGGED@1/WITH_NOTE.json")),
+            golden(include_str!(
+                "golden/TEMPERATURE_LOGGED@1/WITHOUT_NOTE.json"
+            )),
         ]
     );
 }
