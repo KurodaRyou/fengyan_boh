@@ -56,7 +56,12 @@ fn run(mut conn: Connection, mut rx: mpsc::Receiver<Msg>) -> Result<(), StorageE
     }
     let checkpoint = checkpoint_truncate(&conn);
     let closed = conn.close().map_err(|(_, err)| StorageError::from(err));
-    checkpoint?;
+    match checkpoint {
+        Err(StorageError::CheckpointBusy) => {
+            tracing::warn!("WAL checkpoint busy at shutdown; committed data remains in WAL")
+        }
+        result => result?,
+    }
     closed
 }
 

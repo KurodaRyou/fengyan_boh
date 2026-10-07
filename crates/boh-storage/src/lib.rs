@@ -9,6 +9,7 @@ mod readers;
 pub mod store;
 mod writer;
 
+pub mod backup;
 pub mod clock;
 #[doc(hidden)]
 pub mod testing;

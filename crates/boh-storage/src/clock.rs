@@ -17,6 +17,17 @@ enum Source {
 }
 
 impl Clock {
+    /// Subscribe before the scheduler reads time so manual-clock updates cannot be lost.
+    pub fn changes(&self) -> ClockChanges {
+        ClockChanges {
+            clock: self.clone(),
+            manual: match &self.source {
+                Source::System => None,
+                Source::Manual(time) => Some(time.subscribe()),
+            },
+        }
+    }
+
     pub fn system() -> Clock {
         Self {
             source: Source::System,
@@ -54,6 +65,24 @@ impl Clock {
                     let _ = changes.changed().await;
                 }
             }
+        }
+    }
+}
+
+pub struct ClockChanges {
+    clock: Clock,
+    manual: Option<watch::Receiver<UnixMillis>>,
+}
+
+impl ClockChanges {
+    /// Manual changes wake immediately; system wall-clock jumps are sampled every second.
+    pub async fn changed(&mut self) -> UnixMillis {
+        if let Some(time) = &mut self.manual {
+            let _ = time.changed().await;
+            *time.borrow_and_update()
+        } else {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            self.clock.now()
         }
     }
 }

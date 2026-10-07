@@ -1,5 +1,10 @@
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
+    #[error("I/O: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("backup: {0}")]
+    Backup(String),
     #[error("domain: {0}")]
     Domain(#[from] boh_domain::DomainError),
 

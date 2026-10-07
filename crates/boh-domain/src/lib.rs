@@ -89,6 +89,10 @@ uuid_v7_id!(
     StoreId
 );
 uuid_v7_id!(
+    /// 每次备份的文件标识。
+    BackupId
+);
+uuid_v7_id!(
     /// 事件 ID（`store_events.id`）。
     EventId
 );

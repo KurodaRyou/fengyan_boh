@@ -1,14 +1,14 @@
 //! 门店边缘节点入口：加载配置 → 打开数据库并迁移 → 启动 HTTP →
 //! 收到 SIGTERM / SIGINT 后优雅关闭。
 
-mod config;
-
 use std::path::PathBuf;
 
 use anyhow::Context;
+use boh_app::background::BackupTasks;
 use boh_app::{AppState, http};
+use boh_server::config::parse_config;
+use boh_storage::backup::{Backup, BackupHealth};
 use boh_storage::clock::Clock;
-use config::parse_config;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::EnvFilter;
 
@@ -71,14 +71,32 @@ async fn main() -> anyhow::Result<()> {
 
     let mut sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
     let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
+    let backup = Backup::prepare(
+        &config.db_path,
+        &config.backup_dir,
+        store_id,
+        config.backup_keep_count,
+    )?;
+    let backup_health = BackupHealth::default();
+    let listener = tokio::net::TcpListener::bind(config.listen_addr)
+        .await
+        .with_context(|| format!("bind {}", config.listen_addr))?;
+    let tasks = BackupTasks::start(
+        backup,
+        clock.clone(),
+        backup_health.clone(),
+        config.timezone.clone(),
+        config.closing_backup_time,
+    )?;
+    let stop_backups = tasks.stop_handle();
     let shutdown = async move {
         tokio::select! {
             _ = sigterm.recv() => {}
             _ = sigint.recv() => {}
         }
+        stop_backups.stop();
         tracing::info!("shutdown signal received");
     };
-
     let app = http::router(AppState {
         writer: storage.writer,
         readers: storage.readers,
@@ -86,18 +104,22 @@ async fn main() -> anyhow::Result<()> {
         timezone: config.timezone,
         business_day_cutoff: config.business_day_cutoff,
         dev_actor_stub: config.dev_actor_stub,
+        db_path: config.db_path,
+        backup_health,
     });
-    let listener = tokio::net::TcpListener::bind(config.listen_addr)
-        .await
-        .with_context(|| format!("bind {}", config.listen_addr))?;
     tracing::info!(addr = %config.listen_addr, "listening");
-    axum::serve(listener, app)
+    let served = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await
-        .context("http server")?;
+        .context("http server");
 
-    tracing::info!("http stopped, draining writer");
-    storage.writer_handle.shutdown().await?;
+    tracing::info!("http stopped, draining backups");
+    let stopped = tasks.shutdown().await;
+    tracing::info!("backups stopped, draining writer");
+    let closed = storage.writer_handle.shutdown().await;
+    served?;
+    stopped?;
+    closed?;
     tracing::info!("shutdown complete");
     Ok(())
 }

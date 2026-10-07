@@ -62,11 +62,7 @@ impl Readers {
                     }
                 }
             })();
-            // 清理失败时丢弃连接并关闭池，绝不归还带未结束事务的连接。
-            if !conn.is_autocommit() {
-                inner.permits.close();
-                return Err(E::from(StorageError::ReadersClosed));
-            }
+            ensure_read_finished(&conn);
             // release 构建为 panic = "abort"，f 不会 unwind，因此无需在 panic 时归还连接。
             lock(&inner.idle).push(conn);
             result
@@ -76,6 +72,86 @@ impl Readers {
     }
 }
 
+fn ensure_read_finished(conn: &Connection) {
+    if !conn.is_autocommit() {
+        tracing::error!("reader transaction survived commit/rollback; aborting node");
+        std::process::abort();
+    }
+}
+
 fn lock(idle: &Mutex<Vec<Connection>>) -> MutexGuard<'_, Vec<Connection>> {
     idle.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroUsize;
+    use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn unfinished_transaction_aborts() {
+        const CHILD_PATH: &str = "BOH_READER_ABORT_TEST_DB";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let conn = crate::connection::open_reader(Path::new(&path)).unwrap();
+            conn.execute_batch("BEGIN DEFERRED").unwrap();
+            ensure_read_finished(&conn);
+            panic!("unfinished transaction did not abort");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("boh.db");
+        drop(crate::connection::open_writer(&db).unwrap());
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "readers::tests::unfinished_transaction_aborts",
+                "--nocapture",
+            ])
+            .env(CHILD_PATH, &db)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.signal(), Some(6), "{output:?}");
+    }
+
+    #[tokio::test]
+    async fn query_and_cleanup_errors_with_no_open_transaction_do_not_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::open(&dir.path().join("boh.db"), NonZeroUsize::MIN).unwrap();
+        // Query failure is rolled back, and the same pooled connection remains usable.
+        let result = storage
+            .readers
+            .call(|conn| -> Result<(), StorageError> {
+                conn.execute_batch("SELECT * FROM nonexistent_table")?;
+                Ok(())
+            })
+            .await;
+        assert!(matches!(result, Err(StorageError::Sqlite(_))));
+        // Force commit/rollback errors by ending the transaction inside the callback.
+        // Autocommit has already been restored: these errors must not abort the node.
+        for sql in ["COMMIT", "ROLLBACK"] {
+            let result = storage
+                .readers
+                .call(move |conn| -> Result<(), StorageError> {
+                    conn.execute_batch(sql)?;
+                    if sql == "ROLLBACK" {
+                        Err(StorageError::ReadersClosed)
+                    } else {
+                        Ok(())
+                    }
+                })
+                .await;
+            assert!(matches!(result, Err(StorageError::Sqlite(_))));
+            let value = storage
+                .readers
+                .call(|conn| -> Result<i64, StorageError> {
+                    assert!(!conn.is_autocommit());
+                    Ok(conn.query_row("SELECT 1", [], |r| r.get(0))?)
+                })
+                .await
+                .unwrap();
+            assert_eq!(value, 1);
+        }
+        storage.writer_handle.shutdown().await.unwrap();
+    }
 }
