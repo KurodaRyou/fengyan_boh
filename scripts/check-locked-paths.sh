@@ -13,11 +13,7 @@ head=${2:-HEAD}
 pathspecs=()
 while read -r pattern _; do
     [[ -z "$pattern" || "$pattern" == \#* ]] && continue
-    dir=0
-    if [[ "$pattern" == */ ]]; then
-        dir=1
-        pattern=${pattern%/}
-    fi
+    pattern=${pattern%/}
     if [[ "$pattern" == /* ]]; then
         path=${pattern#/}
     elif [[ "$pattern" == */* ]]; then
@@ -25,10 +21,8 @@ while read -r pattern _; do
     else
         path="**/$pattern"
     fi
-    pathspecs+=(":(glob)$path/**")
-    if (( ! dir )); then
-        pathspecs+=(":(glob)$path")
-    fi
+    # Match the path itself too: replacing a locked directory with a symlink must not slip through.
+    pathspecs+=(":(glob)$path" ":(glob)$path/**")
 done < <(for rev in "$base" "$head"; do git show "$rev:.github/CODEOWNERS" 2>/dev/null || true; done)
 
 if (( ${#pathspecs[@]} == 0 )); then
@@ -36,6 +30,7 @@ if (( ${#pathspecs[@]} == 0 )); then
     exit 1
 fi
 
+empty_tree=$(git hash-object -t tree /dev/null)
 failed=0
 leading=1
 baseline=$(git rev-parse --short "$(git merge-base "$base" "$head")")
@@ -46,14 +41,24 @@ while read -r commit; do
         changed='(octopus merge)'
     elif (( parents == 3 )); then
         # Compare with the merge Git would produce: a combined diff (--cc) hides resolutions that take one
-        # parent's version, and `-s ours`. Conflicted files keep their markers there, so conflicts show up too.
+        # parent's version, and `-s ours`.
         status=0
-        recreated=$(git merge-tree --write-tree --no-messages "$commit^1" "$commit^2" | sed -n 1p) || status=$?
+        merged=$(git merge-tree --write-tree --name-only --no-messages "$commit^1" "$commit^2") || status=$?
+        recreated=$(printf '%s\n' "$merged" | sed -n 1p)
         if (( status > 1 )) || [[ -z "$recreated" ]]; then
             printf 'git merge-tree failed for %s\n' "$commit" >&2
             exit 2
         fi
         changed=$(git diff --name-only "$recreated" "$commit" -- "${pathspecs[@]}")
+        # Any conflict on a locked path fails: some (e.g. modify/delete) leave no markers in the re-created tree.
+        conflicted=$(printf '%s\n' "$merged" | sed 1d)
+        if [[ -n "$conflicted" ]]; then
+            locked=$(for tree in "$commit^1" "$commit^2" "$recreated"; do
+                git diff --name-only "$empty_tree" "$tree" -- "${pathspecs[@]}"
+            done)
+            changed+=$'\n'$(printf '%s\n' "$conflicted" | grep -Fx -f <(printf '%s\n' "$locked") || true)
+        fi
+        changed=$(printf '%s\n' "$changed" | sed '/^$/d' | sort -u)
     else
         changed=$(git diff-tree --no-commit-id --name-only -r "$commit" -- "${pathspecs[@]}")
     fi
