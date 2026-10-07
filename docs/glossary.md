@@ -46,3 +46,4 @@
 | Count absorption | 盘点吸收 | 实物发生在某次盘点观察时点之前、却在盘点之后才入账的库存影响，已被盘点数计入，因此不再改动库存，只更正报表 | domain「盘点吸收」 |
 | Reversal | 冲销 | 追加一条 `EVENT_REVERSED`，整条抵消原事件 | domain「纠错」 |
 | Quantity correction | 数量更正 | 追加一条 `QUANTITY_CORRECTED`，只改数量并保持原批次 | domain「纠错」 |
+
