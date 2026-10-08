@@ -103,7 +103,7 @@
 1. **Write path 与基础设施**：时钟模块、相对校准、营业日纯函数；`Readers::call` 包读事务、写线程任务计时；信封加 `warnings`；`boh_storage::open()` 收口。
 2. **Walking skeleton 与首批切片**：
    设备主数据（walking skeleton：`ledger::execute` / `Ledger::append` / `projections::apply` 骨架与 `rebuild-projections`、`Actor` 开发桩、`boh-server init`、`EQUIPMENT` 写接口、迁移 002：`equipment`；打通 write path、幂等、重放、golden payload）
-   → 温度记录（迁移 003：`temperature_readings`）→ 备份模块与恢复演练测试、`/health` 字段（迁移 004：`store_events(recorded_at)` 索引）→ 005：其余主数据与库存投影表 → 收货 → 报损（FIFO、指定批次、账外缺口、库存明细查询）→ 不变量自检 → 盘点（含盘点吸收：已有的收货、报损一并实现吸收判定）→ 局域网 HTTPS → 员工认证。
+   → 温度记录（迁移 003：`temperature_readings`）→ 备份模块与恢复演练测试、`/health` 字段（迁移 004：`store_events(recorded_at)` 索引）→ 005：其余主数据与库存投影表 → 收货（迁移 006：批号列改名为 `manufacturer_lot_no`）→ 报损（FIFO、指定批次、账外缺口、库存明细查询）→ 不变量自检 → 盘点（含盘点吸收：已有的收货、报损一并实现吸收判定）→ 局域网 HTTPS → 员工认证。
    - 设备主数据切片的 `init` 只写 `store_meta`；预置报损原因随 005 加入；`EMPLOYEE`（`employees` 投影、写接口、golden 样本）与第一个店长随认证切片加入。
 3. **扩展**：生产 → 纠错（冲销、数量更正）→ 补录入口 → 销售导入。每一步配对应的验收用例。
 

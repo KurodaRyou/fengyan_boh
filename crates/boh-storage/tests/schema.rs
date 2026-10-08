@@ -1,4 +1,4 @@
-//! 锁定迁移 001、002、003、004、005 的表结构；每项测试注明对应的规则（AGENTS.md / docs/domain.md）或迁移文件。
+//! 锁定迁移 001、002、003、004、005、006 的表结构；每项测试注明对应的规则（AGENTS.md / docs/domain.md）或迁移文件。
 
 use std::fmt::Debug;
 
@@ -17,6 +17,9 @@ const MIGRATION_004: &str = include_str!("../../../migrations/004_store_events_r
 const MIGRATION_004_FNV1A_64: u64 = 0x401b_6d6e_ba06_70d2;
 const MIGRATION_005: &str = include_str!("../../../migrations/005_master_data_inventory.sql");
 const MIGRATION_005_FNV1A_64: u64 = 0x4191_3449_6be8_86c9;
+const MIGRATION_006: &str =
+    include_str!("../../../migrations/006_inventory_lots_manufacturer_lot_no.sql");
+const MIGRATION_006_FNV1A_64: u64 = 0x3773_286d_a4b7_9106;
 const STORE: &str = "01890a5d-ac96-774b-bcce-b302099a8050";
 const ACTOR: &str = "01890a5d-ac96-774b-bcce-b302099a8051";
 const CMD: &str = "01890a5d-ac96-774b-bcce-b302099a8057";
@@ -184,10 +187,16 @@ fn migration_005_matches_frozen_checksum() {
     assert_eq!(fnv1a_64(MIGRATION_005), MIGRATION_005_FNV1A_64);
 }
 
+// AGENTS「迁移」不可修改：按 UTF-8 原始字节锁定 006 完整 SQL（包括注释）。
+#[test]
+fn migration_006_matches_frozen_checksum() {
+    assert_eq!(fnv1a_64(MIGRATION_006), MIGRATION_006_FNV1A_64);
+}
+
 // AGENTS「迁移」：程序支持的版本就是已锁定迁移文件的个数。
 #[test]
 fn latest_schema_version_counts_locked_migrations() {
-    assert_eq!(LATEST_SCHEMA_VERSION, 5);
+    assert_eq!(LATEST_SCHEMA_VERSION, 6);
 }
 
 // AGENTS「迁移」：重复执行迁移不改变版本，也不丢失已有数据。
@@ -1398,7 +1407,7 @@ fn lot_row(lot_id: &str, source_event_seq: i64, source_line_no: i64) -> Row {
         ("source_line_no", source_line_no.to_string()),
         ("remaining_qty", "10".into()),
         ("expires_at", "NULL".into()),
-        ("supplier_lot_no", "NULL".into()),
+        ("manufacturer_lot_no", "NULL".into()),
     ]
 }
 
@@ -1535,6 +1544,59 @@ fn upgrades_a_version_4_database_without_losing_data() {
         assert_eq!(count_rows(&conn, table).unwrap(), 0, "{table}");
     }
     assert_eq!(count_rows(&conn, "inventory_on_hand").unwrap(), 0);
+}
+
+// 006 + AGENTS「迁移」：已有 005 数据的库升级到 006，inventory_lots 的批号列改名为 manufacturer_lot_no，
+// 各行取值不变；改名后的列仍拒绝空串。
+#[test]
+#[allow(clippy::disallowed_methods)] // 锁定测试经 boh_storage::testing 取得原始连接。
+fn upgrades_a_version_5_database_renaming_the_lot_number_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut conn = open_writer(&dir.path().join("boh.db")).unwrap();
+    for sql in [
+        MIGRATION_001,
+        MIGRATION_002,
+        MIGRATION_003,
+        MIGRATION_004,
+        MIGRATION_005,
+    ] {
+        conn.execute_batch(sql).unwrap();
+    }
+    conn.pragma_update(None, "user_version", 5).unwrap();
+    insert_meta(&conn, 1, STORE).unwrap();
+    insert_command(&conn, CMD, "{}").unwrap();
+    Event::new(EVT).insert(&conn).unwrap();
+    insert(&conn, "items", &item_row(ITEM, "FLOUR")).unwrap();
+    let mut old_lot = lot_row(LOT, 1, 0);
+    old_lot.pop();
+    old_lot.push(("supplier_lot_no", lit("B-2026-10")));
+    insert(&conn, "inventory_lots", &old_lot).unwrap();
+    let before = table_rows(&conn, "inventory_lots").unwrap();
+
+    migrate(&mut conn).unwrap();
+
+    assert_eq!(schema_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
+    assert_eq!(table_rows(&conn, "inventory_lots").unwrap(), before);
+    let stored: String = conn
+        .query_row(
+            "SELECT manufacturer_lot_no FROM inventory_lots WHERE lot_id = ?1",
+            [LOT],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, "B-2026-10");
+    assert!(
+        conn.prepare("SELECT supplier_lot_no FROM inventory_lots")
+            .is_err()
+    );
+    assert_sqlite_error(
+        insert(
+            &conn,
+            "inventory_lots",
+            &with(lot_row(LOT2, 1, 1), "manufacturer_lot_no", "''"),
+        ),
+        ffi::SQLITE_CONSTRAINT_CHECK,
+    );
 }
 
 // 005 + AGENTS「ID 与时间」：items、recipes、suppliers、waste_reasons 的主键与批次 lot_id 是 UUIDv7。
@@ -1849,7 +1911,7 @@ fn supplier_contact_phone_is_null_or_non_empty() {
 }
 
 // domain「批次」「投影表」：origin 枚举、source_line_no 从 0 开始、余量非负、(source_event_seq, source_line_no) 唯一，
-// supplier_lot_no 为 NULL 或非空；source_event_seq 立即引用账本中的事件，item_id 延迟引用物料。
+// manufacturer_lot_no 为 NULL 或非空；source_event_seq 立即引用账本中的事件，item_id 延迟引用物料。
 #[test]
 fn inventory_lots_are_checked() {
     let (_dir, mut conn) = master_db();
@@ -1867,7 +1929,7 @@ fn inventory_lots_are_checked() {
         ("origin", "'TRANSFER'"),
         ("source_line_no", "-1"),
         ("remaining_qty", "-1"),
-        ("supplier_lot_no", "''"),
+        ("manufacturer_lot_no", "''"),
     ] {
         assert_sqlite_error(
             insert(
@@ -1890,7 +1952,7 @@ fn inventory_lots_are_checked() {
             "expires_at",
             &TS.to_string(),
         ),
-        "supplier_lot_no",
+        "manufacturer_lot_no",
         "'B-2026-10'",
     );
     insert(&conn, "inventory_lots", &full).unwrap();

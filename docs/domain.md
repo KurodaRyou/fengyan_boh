@@ -197,20 +197,20 @@ occurred_at = recorded_at − lag
 |---|---|---|
 | `POST /api/v1/receipts` | `receipt.create` | 已认证员工 |
 
-- 请求体：`command_id`、`supplier_id`、`lines`、`captured_at`、`sent_at`。`lines` 每项 `{item_id, input, supplier_lot_no?, produced_on, expires_on, line_cost_cents}`，`input` 为 `{qty, unit_code, base_qty_per_unit}`（见「单位」）。
+- 请求体：`command_id`、`supplier_id`、`lines`、`captured_at`、`sent_at`。`lines` 每项 `{item_id, input, manufacturer_lot_no?, produced_on, expires_on, line_cost_cents}`，`input` 为 `{qty, unit_code, base_qty_per_unit}`（见「单位」）。
 - 写命令成功的 `data` 是 `{"receipt": 行}`；行为 `receipt_id`、`supplier_id`、`lines`（与 payload 的 `lines` 相同）、`business_date`、`occurred_at`、`recorded_at`、`actor_id`、`device_id`。
 - **取值**：不满足时 `400 VALIDATION_FAILED`，`details` 为 `{}`。
   - `lines` 非空。同一物料可以有多行，各行分别建批次。
   - `input.qty`、`input.base_qty_per_unit` 是正整数；`input.unit_code` 非空、首尾不能有空白字符。`input.qty × input.base_qty_per_unit` 不超出 `i64`。
   - `line_cost_cents` 是该行总金额（分），`>= 0`。
-  - `supplier_lot_no` 可以省略；出现时非空、首尾不能有空白字符、最多 64 个字符（按 Unicode 字符计），不接受 `null`。
+  - `manufacturer_lot_no` 可以省略；出现时非空、首尾不能有空白字符、最多 64 个字符（按 Unicode 字符计），不接受 `null`。
   - `produced_on`（生产日期）、`expires_on`（到期日）必填，是包装标签上的门店当地日期，格式 `'YYYY-MM-DD'`（真实日期），`produced_on <= expires_on`。标签只印保质期时长时，由客户端按日历推算 `expires_on`。
   - 请求体不接受 `occurred_at`（补录入口见「时间」）。
 - **新建**：服务端生成 UUIDv7 作为收货 ID（聚合 ID），每行生成一个 `lot_id`，写一条 `aggregate_version = 1` 的 `GOODS_RECEIVED`。
   - `occurred_at`、`business_date` 按「时间」的相对校准计算，规则与温度记录相同（`CAPTURE_TOO_OLD`、时间溢出的 `VALIDATION_FAILED`、`CAPTURE_TIME_ADJUSTED` 的 `details` 都是 `{}`）。
   - payload 每行：`qty = input.qty × input.base_qty_per_unit`；`expires_at` 是 `expires_on` 在门店时区（配置 `timezone`）的当日最后一毫秒，即次日当地 0 点的 UTC 毫秒减 1。
     - 理由：`projections::apply` 不读配置，换算结果必须写进 payload。
-  - payload 行的键顺序：`item_id`、`qty`、`input`、`lot_id`、`supplier_lot_no`、`produced_on`、`expires_on`、`expires_at`、`line_cost_cents`（被吸收的行在 `lot_id` 的位置写 `absorbed_by_event_id`）；`input` 的键顺序 `qty`、`unit_code`、`base_qty_per_unit`。
+  - payload 行的键顺序：`item_id`、`qty`、`input`、`lot_id`、`manufacturer_lot_no`、`produced_on`、`expires_on`、`expires_at`、`line_cost_cents`（被吸收的行在 `lot_id` 的位置写 `absorbed_by_event_id`）；`input` 的键顺序 `qty`、`unit_code`、`base_qty_per_unit`。
 - **业务校验**（幂等检查之后）：同时命中多个业务错误时，返回哪一个不作规定；都不写事件或 `processed_commands`。
   - 供应商、物料不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": "SUPPLIER" / "ITEM", "id"}`。停用的照常受理。
   - `unit_code` 既不是物料的 `base_unit` 也不在 `units` 中：`400 UNKNOWN_UNIT`，`details` 为 `{"line", "item_id", "unit_code"}`。
@@ -274,7 +274,7 @@ occurred_at = recorded_at − lag
 
 全部物料都按批次追踪。账面数 = 批次余量之和 + 账外缺口。
 
-- **批次 ID**：每条收货行、每次生产产出、每个盘盈由写入线程生成一个 `lot_id`（UUIDv7），写进 payload。供应商批号 `supplier_lot_no` 是可选属性，不作主键。
+- **批次 ID**：每条收货行、每次生产产出、每个盘盈由写入线程生成一个 `lot_id`（UUIDv7），写进 payload。生产商批号 `manufacturer_lot_no` 是可选属性，不作主键。
 - **到期时间** `expires_at`（UTC 毫秒，可空）只用于过期提醒，不参与分配。收货批次必有到期时间，由收货行的 `expires_on` 换算（见「收货接口」）；生产产出的到期时间随生产切片定；盘盈批次没有到期时间。
 - **FIFO 分配**：未指定 `lot_id` 的扣减，按（盘盈优先、`source_event_seq`、`source_line_no`）升序分配：`origin = 'COUNT_GAIN'` 的批次优先，同一优先级内先按来源事件的 `seq` 升序，再按原 payload 行序升序。同一收货事件允许同一物料有多行，各行分别建批次，按原 `lines` 数组顺序分配。补录的收货按入账顺序排队。
 - **来源行序**：批次投影保存 `source_line_no`，从 0 开始；收货取原 `lines[i]` 的 `i`，盘盈取原 `new_lots[i]` 的 `i`，生产 `output` 固定取 0。被吸收的行不建批次，其他行保留原下标，不重新编号。行序直接从已保存的 payload 恢复，不新增 payload 字段；更正、冲销或盘点调整已有批次时不改变它的 `source_event_seq` 和 `source_line_no`。
@@ -294,7 +294,7 @@ occurred_at = recorded_at − lag
 
 | event_type | aggregate_type | payload 要点 | 投影影响 |
 |---|---|---|---|
-| `GOODS_RECEIVED` | `RECEIPT` | `supplier_id`, `lines[{item_id, qty, input, lot_id \| absorbed_by_event_id, supplier_lot_no?, produced_on, expires_on, expires_at, line_cost_cents}]` | 每行新建一个批次；被吸收时不建 |
+| `GOODS_RECEIVED` | `RECEIPT` | `supplier_id`, `lines[{item_id, qty, input, lot_id \| absorbed_by_event_id, manufacturer_lot_no?, produced_on, expires_on, expires_at, line_cost_cents}]` | 每行新建一个批次；被吸收时不建 |
 | `PRODUCTION_BATCH_COMPLETED` | `PRODUCTION_BATCH` | `recipe_id`, `recipe_version`, `batch_count`, `started_at?`, `output{item_id, planned_qty, qty, lot_id \| absorbed_by_event_id, expires_at?}`, `consumed[{item_id, planned_qty, qty, alloc \| absorbed_by_event_id}]` | 原料按分配扣减（或被吸收）；成品新建批次 |
 | `WASTE_LOGGED` | `WASTE_RECORD` | `lines[{item_id, qty, input, reason_code, alloc \| absorbed_by_event_id}]` | 按分配扣减（或被吸收） |
 | `STOCK_COUNT_SUBMITTED` | `STOCK_COUNT` | `purpose`（`CLOSING` / `AUDIT`）, `lines[{item_id, lot_id?, counted_qty}]` | 无 |
@@ -322,7 +322,7 @@ occurred_at = recorded_at − lag
 ## 盘点
 
 1. **盘点表与草稿**：客户端按库存明细生成盘点表，不调用专门的盘点接口，不产生事件。库存明细查询返回物料的全部批次、账外缺口及门店节点当前的 `business_date`。
-   - 每个批次行显示收货或生产时间、到期日、供应商批号。盘点表不预填清点数量，有空格时客户端不允许提交。
+   - 每个批次行显示收货或生产时间、到期日、生产商批号。盘点表不预填清点数量，有空格时客户端不允许提交。
    - 草稿按设备保存在平板的 `IndexedDB` 中，刷新、休眠后都能恢复。草稿保存清点数及物料 / 批次标识、营业日和重试所需的命令信息，不保存库存余量，不改变「客户端不维护库存镜像」的规则。
    - 提交成功后删除草稿；提交被拒时保留已填的数，刷新盘点表后只补新出现的批次行。
    - 首次提交时生成的 `command_id` 存进草稿。结果未知时草稿锁定为只读，用原 ID、原内容重试，直到拿到结果。
@@ -465,7 +465,7 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 
 ## 投影表
 
-库存投影由迁移 005 定义，字段与约束以迁移为准：
+库存投影由迁移 005 定义（006 把 `inventory_lots` 的批号列改名为 `manufacturer_lot_no`），字段与约束以迁移为准：
 
 | 表 / 视图 | 内容 |
 |---|---|
