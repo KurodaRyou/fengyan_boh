@@ -68,14 +68,16 @@ occurred_at = recorded_at − lag
 
 ## 主数据
 
-| 实体（聚合类型） | 含义 | `snapshot` 字段 |
+| 实体（聚合类型） | 含义 | `snapshot` |
 |---|---|---|
-| `ITEM` | 物料，**含单位换算** | `code`, `name`, `base_unit`（`g` / `ml` / `pcs`）, `category`（`RAW` / `SEMI` / `FINISHED`）, `default_shelf_life_ms?`, `units[{unit_code, base_qty_per_unit}]`, `active` |
-| `RECIPE` | 配方，**含全部版本**；版本只增不改 | `code`, `name`, `output_item_id`, `versions[{version, output_qty_per_batch, lines[{item_id, qty_per_batch}]}]`, `active` |
-| `SUPPLIER` | 供应商 | `code`, `name`, `contact_phone?`, `active` |
+| `ITEM` | 物料，**含单位换算** | `boh_domain::master_data::ItemSnapshot` |
+| `RECIPE` | 配方，**含全部版本**；版本只增不改 | `boh_domain::master_data::RecipeSnapshot` |
+| `SUPPLIER` | 供应商 | `boh_domain::master_data::SupplierSnapshot` |
 | `EMPLOYEE` | 员工，**不含凭据** | `code`, `name`, `role`（`STAFF` / `MANAGER`）, `active` |
-| `WASTE_REASON` | 报损原因；初始化时预置 `EXPIRED`、`DAMAGED`、`PRODUCTION_DEFECT`、`TASTING`、`OTHER` | `code`, `name`, `active` |
-| `EQUIPMENT` | 设备 | `boh_domain::equipment::EquipmentSnapshot`；样本 `crates/boh-app/tests/golden/MASTER_DATA_CHANGED@1/EQUIPMENT.json` |
+| `WASTE_REASON` | 报损原因；初始化时预置 `EXPIRED`、`DAMAGED`、`PRODUCTION_DEFECT`、`TASTING`、`OTHER` | `boh_domain::master_data::WasteReasonSnapshot` |
+| `EQUIPMENT` | 设备 | `boh_domain::equipment::EquipmentSnapshot` |
+
+- 已落地实体的样本在 `crates/boh-app/tests/golden/MASTER_DATA_CHANGED@1/`。
 
 - 快照是该行变更后的完整内容，不是差量。行的主键是事件的 `aggregate_id`，`revision` 是 `aggregate_version`，都不重复写进快照。`active` 是布尔值。
 - `name` 非空；`code` 非空，在同一实体内唯一。`contact_phone` 不做格式校验。`MANAGER` 是店长，`STAFF` 是普通员工。
@@ -138,7 +140,7 @@ occurred_at = recorded_at − lag
 
 **设备**：请求体与行见 `boh_domain::equipment` 的 `CreateEquipment`、`UpdateEquipment`、`Equipment`。
 
-**物料**：新建 `code`、`name`、`base_unit`、`category`、`default_shelf_life_ms?`、`units`、`active`；修改 `name`、`category`、`default_shelf_life_ms?`、`units`、`active`。
+**物料**：请求体与行见 `boh_domain::master_data` 的 `CreateItem`、`UpdateItem`、`Item`。
 
 - `default_shelf_life_ms` 可以省略，出现时是正整数，不接受 `null`。修改时省略表示没有默认保质期。
 - `units` 是数组，可以为空，不接受 `null`。每项 `{unit_code, base_qty_per_unit}`：`unit_code` 非空、首尾不能有空白字符、不等于 `base_unit`；`base_qty_per_unit` 是正整数。
@@ -147,11 +149,13 @@ occurred_at = recorded_at − lag
 
 **配方**：
 
-| 方法与路径 | `command_type` | 请求体（另含 `command_id`） |
+| 方法与路径 | `command_type` | 请求体（`boh_domain::master_data`） |
 |---|---|---|
-| `POST /api/v1/recipes` | `recipe.create` | `code`, `name`, `output_item_id`, `active`, `output_qty_per_batch`, `lines` |
-| `PUT /api/v1/recipes/{recipe_id}` | `recipe.update` | `base_revision`, `name`, `active` |
-| `POST /api/v1/recipes/{recipe_id}/versions` | `recipe.add_version` | `base_revision`, `output_qty_per_batch`, `lines` |
+| `POST /api/v1/recipes` | `recipe.create` | `CreateRecipe` |
+| `PUT /api/v1/recipes/{recipe_id}` | `recipe.update` | `UpdateRecipe` |
+| `POST /api/v1/recipes/{recipe_id}/versions` | `recipe.add_version` | `AddRecipeVersion` |
+
+- 行见 `boh_domain::master_data::Recipe`。
 
 - 新建时 `output_qty_per_batch` 和 `lines` 构成版本 1。
 - **追加版本**：新版本号是当前最大版本 + 1，写一条 `MASTER_DATA_CHANGED`，`revision` + 1。权限、`base_revision`、配方不存在和成功的 `data` 同「修改」。
@@ -159,11 +163,11 @@ occurred_at = recorded_at − lag
 - `output_qty_per_batch`、`qty_per_batch` 是正整数。`lines` 非空，每项 `{item_id, qty_per_batch}`，同一版本内 `item_id` 不重复，按提交顺序保存。
 - `output_item_id` 和每个 `lines[].item_id` 引用 `ITEM`（规则见「引用」）。不限制物料的 `category`，不检查产出物料是否出现在自己的 `lines` 中。
 
-**供应商**：新建 `code`、`name`、`contact_phone?`、`active`；修改 `name`、`contact_phone?`、`active`。
+**供应商**：请求体与行见 `boh_domain::master_data` 的 `CreateSupplier`、`UpdateSupplier`、`Supplier`。
 
 - `contact_phone` 可以省略，出现时非空、首尾不能有空白字符，不接受 `null`。修改时省略表示删除联系电话。
 
-**报损原因**：新建 `code`、`name`、`active`；修改 `name`、`active`。预置的报损原因同样可以修改和停用。
+**报损原因**：请求体与行见 `boh_domain::master_data` 的 `CreateWasteReason`、`UpdateWasteReason`、`WasteReason`。预置的报损原因同样可以修改和停用。
 
 ### 温度记录接口
 

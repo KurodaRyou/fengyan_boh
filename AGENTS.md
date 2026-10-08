@@ -273,6 +273,7 @@ scripts/        CI 扫描脚本。
   | `rusqlite::Connection::open*` | `boh-storage/src/connection.rs`、备份模块 |
   | `boh_storage::testing` 中的函数 | 锁定测试及 `spec_support/` |
   | `boh_app::test_router`、`boh_app::test_node` | 锁定测试及 `spec_support/` |
+  | `boh_storage::backup::Backup::hold` | `boh_app::TestNode::hold_backups`、`boh-app` / `boh-storage` 中备份相关的 `#[cfg(test)]` 单元测试 |
   | `std::time::SystemTime::now`、`jiff::Timestamp::now`、`jiff::Zoned::now`、`jiff::tz::TimeZone::system`、`jiff::tz::TimeZone::try_system` | 时钟模块 |
   | `std::thread::sleep` | 无 |
   | `HashMap` / `HashSet`（`boh-domain`） | 无 |
