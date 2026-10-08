@@ -18,7 +18,7 @@
   发现规则不合理或缺失时，停下来在交付说明里提出，不要绕过。
 - 「尚未设计」一节和 `docs/domain.md`「待确认问题」中的内容，在设计落地到文档之前**不要实现**。
 - 交付前必须本地通过：`cargo fmt --all`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`、`scripts/ci-scan.sh`。
-- 交付说明写清：改了哪些文件、对应「开发顺序」的哪几步、有哪些未决问题。之后由 Claude 在本地 review，通过后再提 PR（见「开发顺序」第 9、10 步）。
+- 交付说明写清：改了哪些文件、对应「开发顺序」的哪几步、有哪些未决问题。之后由 Claude 在本地 review，通过后再提 PR（见「开发顺序」第 6、7 步）。
 - 合入：`main` 只接受 PR，CI `check` 必须通过，禁止强推和删除；不要求 PR 批准。
   - 所有提交和 PR 都用同一个 GitHub 账号，作者不能批准自己的 PR。锁定路径由本文件规则、Codex 自动 review、Claude review 把关，人确认后合入。
 - 锁定路径（`.github/CODEOWNERS` 列出的路径）的改动只能出现在人或 Claude 提交、提交信息以 `spec:`（锁定测试）或 `docs:`（规则、设计、迁移、CI 与构建配置）开头的提交中。
@@ -44,10 +44,10 @@
 - 预期值由人工确认。**任何人都不允许为了让测试通过而修改预期值。**
 - 实现 agent 认为锁定测试有错时，停下来在交付说明里提出。不得修改，不得加 `#[ignore]`，不得用 `cfg`、feature 或 Cargo 配置让它不编译、不运行。
 - 合入方式：锁定测试以 `spec:` 提交（由人提交）；实现 agent 在其上开发，测试与实现在同一个 PR 合入。
-  Review 的比对基准是切片分支开头连续的 `spec:` / `docs:` 提交中的最后一个，`git diff <比对基准> HEAD -- <锁定路径>` 必须为空。PR 打开后又有新提交时，合入前评论 `@codex review` 重新触发 Codex review。
+  Review 的比对基准是切片分支开头连续的 `spec:` / `docs:` 提交中的最后一个，`git diff <比对基准> HEAD -- <锁定路径>` 必须为空；实现开始后要改设计时按「开发顺序」末尾的规定处理。PR 打开后又有新提交时，合入前评论 `@codex review` 重新触发 Codex review。
 
 **独立测试审查**（测试 agent）：
-- 时机：「开发顺序」第 4 步，锁定测试和接口说明写好之后、人确认预期值之前。实现交付后（第 8 步之后），可以再做一次进程级黑盒验收，与 Claude review 并行。
+- 时机：「开发顺序」第 4.2 步，锁定测试和接口说明写好之后、人确认预期值之前。实现交付后（第 5 步之后），可以再做一次进程级黑盒验收，与 Claude review 并行。
 - 审查对象是 Claude 准备的副本：复制工作区，排除 `.git`、`workdocs/`、`target/`。产出（报告、脚本、日志、运行时数据）只写进副本中的 `blindtest/`。
   - 看不到提交历史、review 记录和过程文档，推演才独立于设计方。
 - 规范依据只有本文件和 `docs/`；代码和测试不是依据。
@@ -77,15 +77,24 @@
    - 整理不放在本切片的实现提交之后：实现之后的 `docs:` 提交不在分支开头，会让 `git diff <比对基准> HEAD -- <锁定路径>` 非空。
 2. **Claude**：写迁移 SQL（如需新表 / 投影表）。
 3. **Claude**：写 schema 测试，跑通后表结构锁定。
-4. **Claude**：写锁定测试（golden payload、HTTP 契约、验收用例、重放一致性）和接口说明；**测试 agent** 做独立测试审查，Claude 核对并补入采纳项；**人确认预期值**后作为 `spec:` 提交。
-5. **实现 agent**：`boh-domain` 命令 / 事件结构体 + 校验。
-6. **实现 agent**：`boh-app::service` 中经 `ledger::execute` 组装一个事务；`projections::apply` 增加该事件的投影。
-7. **实现 agent**：`boh-app::http` handler + 路由。
-8. **实现 agent**：全部锁定测试通过，补自己的单元测试，提交交付说明。
-9. **Claude** 在本地 review 切片分支：按「不可违反的规则」逐条核对，逐个提交核对锁定路径，`git diff <比对基准> HEAD -- <锁定路径>` 为空。
+4. **锁定测试**：
+   1. **Claude** 写锁定测试（golden payload、HTTP 契约、验收用例、重放一致性）和接口说明。
+   2. **测试 agent** 做独立测试审查（见「测试分工」）；Claude 逐条核对，把采纳项写进锁定测试、接口说明或 `docs/`。引出的规范修改作为 `docs:` 提交，放在 `spec:` 提交之前。
+   3. **人逐条确认预期值**后作为 `spec:` 提交。Claude 给出实现 agent 的 prompt：本切片范围、比对基准、需要顺带处理的 `workdocs/` 条目。
+5. **实现 agent**：在 `spec:` 提交之上实现本切片，交付前全部锁定测试通过：
+   - `boh-domain`：命令 / 事件结构体 + 校验。
+   - `boh-app::service`：经 `ledger::execute` 组装一个事务；`projections::apply` 增加该事件的投影。
+   - `boh-app::http`：handler + 路由。
+   - 补自己的单元测试，提交交付说明。
+6. **Claude** 在本地 review 切片分支：按「不可违反的规则」逐条核对，逐个提交核对锁定路径，`git diff <比对基准> HEAD -- <锁定路径>` 为空。
    有问题退回实现 agent 修改后重新 review；通过后 Claude 给出可以提 PR 的结论。
-10. **提 PR**，GitHub 上自动运行 **Codex** review（只在 PR 打开后运行，本地不跑）。Codex 的发现由 Claude 判断是否采纳，需要修改的退回实现 agent；
-    PR 打开后又有新提交时，合入前评论 `@codex review` 重新触发。CI `check` 通过后人合入。
+7. **提 PR**，GitHub 上自动运行 **Codex** review（只在 PR 打开后运行，本地不跑）。Codex 的发现由 Claude 判断是否采纳，需要修改的退回实现 agent；
+   PR 打开后又有新提交时，合入前评论 `@codex review` 重新触发。CI `check` 通过后人合入。
+
+**实现开始后要改设计**（第 6、7 步的 review 发现需要改 `docs/` 或锁定测试）：
+- 在切片分支开头的 `docs:` / `spec:` 提交之后追加新的提交：规范改动由 Claude 作为 `docs:` 提交；锁定测试改动由人逐条确认预期值后作为 `spec:` 提交。再把实现提交 rebase 到它们之后，比对基准随之后移。
+  - 切片分支允许强推，`main` 不允许：锁定路径的改动必须始终位于分支开头，不能合入后再补救。
+- 之后实现 agent 在 rebase 后的分支上修改，从第 6 步重新 review。
 
 ### 路线图
 
