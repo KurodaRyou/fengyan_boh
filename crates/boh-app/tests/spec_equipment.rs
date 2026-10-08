@@ -12,7 +12,8 @@ use boh_domain::UnixMillis;
 use boh_storage::clock::ManualClock;
 use serde_json::{Value, json};
 use spec_support::{
-    JsonReply, MANAGER, STAFF, assert_error, assert_success, is_uuid_v7, raw_request, request, send,
+    JsonReply, MANAGER, STAFF, assert_error, assert_success, is_uuid_v7, non_canonical_uuids,
+    raw_request, request, send,
 };
 use tempfile::TempDir;
 
@@ -521,7 +522,8 @@ async fn updating_unknown_equipment_is_not_found() {
     assert_eq!(node.counts().unwrap(), (1, 1));
 }
 
-// 设备接口「取值」与 AGENTS「HTTP 约定」：字段缺失、未知字段、类型或取值不对、路径参数无法解析，一律 400 VALIDATION_FAILED，不落库。
+// 设备接口「取值」与 AGENTS「HTTP 约定」「ID 与时间」：字段缺失、未知字段、类型或取值不对、路径参数无法解析，
+// 以及 command_id 或路径参数不是 36 位小写带连字符的 UUIDv7 文本（大写、无连字符、花括号、urn:），一律 400 VALIDATION_FAILED，不落库。
 #[tokio::test]
 async fn invalid_commands_are_rejected_with_validation_failed() {
     let node = node();
@@ -566,6 +568,10 @@ async fn invalid_commands_are_rejected_with_validation_failed() {
     for key in ["command_id", "code", "name", "equipment_type", "active"] {
         creates.push(without(&create, key));
     }
+    // AGENTS「ID 与时间」：只接受 36 位小写带连字符的形式。
+    for text in non_canonical_uuids(&cmd(2)) {
+        creates.push(with(&create, "command_id", json!(text)));
+    }
     for body in &creates {
         let reply = node.create(body).await;
         assert_error(&reply, 400, "VALIDATION_FAILED");
@@ -596,11 +602,21 @@ async fn invalid_commands_are_rejected_with_validation_failed() {
     ] {
         updates.push(without(&update, key));
     }
+    let mut bad_ids = vec![
+        "not-a-uuid".to_owned(),
+        "01890a5d-ac96-474b-bcce-b302099a8301".to_owned(),
+    ];
+    for text in non_canonical_uuids(&id) {
+        bad_ids.push(text.replace('{', "%7B").replace('}', "%7D"));
+    }
+    for text in non_canonical_uuids(&cmd(2)) {
+        updates.push(with(&update, "command_id", json!(text)));
+    }
     for body in &updates {
         let reply = node.update(&id, body).await;
         assert_error(&reply, 400, "VALIDATION_FAILED");
     }
-    for bad_id in ["not-a-uuid", "01890a5d-ac96-474b-bcce-b302099a8301"] {
+    for bad_id in &bad_ids {
         let reply = node.update(bad_id, &update).await;
         assert_error(&reply, 400, "VALIDATION_FAILED");
     }

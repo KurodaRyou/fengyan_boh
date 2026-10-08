@@ -372,3 +372,276 @@ async fn rebuild_restores_equipment_and_temperature_projections() {
     assert_eq!(ledger(&db_path).unwrap(), ledger_before);
     assert_eq!(projections(&db_path).unwrap(), online);
 }
+
+#[allow(clippy::unwrap_used)] // 测试夹具：写入前置状态的请求失败时，后续步骤没有意义，直接终止测试。
+async fn write(router: &axum::Router, method: &str, uri: &str, body: Value) -> Value {
+    let reply = if method == "PUT" {
+        spec_support::put(router, uri, Some(&MANAGER), &body).await
+    } else {
+        spec_support::post(router, uri, Some(&MANAGER), &body).await
+    }
+    .unwrap();
+    assert_success(&reply).clone()
+}
+
+// 物料、配方、供应商、报损原因混合的账本（含修改、追加版本、删除单位与联系电话、内容不变的修改）：
+// 在线写入后篡改主数据投影并在库存投影中插入多余的行，重建后全部投影与在线写入逐行一致——库存投影在本切片没有事件写入，重建后为空；
+// 账本、processed_commands 和 store_meta 不变；重建可重复执行；重建后的投影能继续支撑新的写命令。
+#[tokio::test]
+async fn rebuild_restores_master_data_projections() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("boh.db");
+    let clock = ManualClock::new(NOW);
+    let router = spec_support::router(&db_path, clock.clock()).unwrap();
+    let flour = write(
+        &router,
+        "POST",
+        "/api/v1/items",
+        json!({
+            "command_id": cmd(1), "code": "FLOUR", "name": "高筋面粉", "base_unit": "g",
+            "category": "RAW", "default_shelf_life_ms": 15_552_000_000_i64,
+            "units": [
+                { "unit_code": "bag", "base_qty_per_unit": 25000 },
+                { "unit_code": "cup", "base_qty_per_unit": 120 },
+            ],
+            "active": true,
+        }),
+    )
+    .await["item"]["item_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let toast = write(
+        &router,
+        "POST",
+        "/api/v1/items",
+        json!({
+            "command_id": cmd(2), "code": "TOAST", "name": "吐司", "base_unit": "pcs",
+            "category": "FINISHED", "units": [], "active": true,
+        }),
+    )
+    .await["item"]["item_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let recipe = write(
+        &router,
+        "POST",
+        "/api/v1/recipes",
+        json!({
+            "command_id": cmd(3), "code": "R-TOAST", "name": "吐司", "output_item_id": toast,
+            "active": true, "output_qty_per_batch": 12,
+            "lines": [{ "item_id": flour, "qty_per_batch": 3000 }],
+        }),
+    )
+    .await["recipe"]["recipe_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    write(
+        &router,
+        "PUT",
+        &format!("/api/v1/items/{flour}"),
+        json!({
+            "command_id": cmd(4), "base_revision": 1, "name": "高筋面粉", "category": "RAW",
+            "units": [{ "unit_code": "bag", "base_qty_per_unit": 20000 }], "active": false,
+        }),
+    )
+    .await;
+    write(
+        &router,
+        "POST",
+        &format!("/api/v1/recipes/{recipe}/versions"),
+        json!({
+            "command_id": cmd(5), "base_revision": 1, "output_qty_per_batch": 10,
+            "lines": [
+                { "item_id": toast, "qty_per_batch": 1 },
+                { "item_id": flour, "qty_per_batch": 2800 },
+            ],
+        }),
+    )
+    .await;
+    write(
+        &router,
+        "PUT",
+        &format!("/api/v1/recipes/{recipe}"),
+        json!({ "command_id": cmd(6), "base_revision": 2, "name": "白吐司", "active": true }),
+    )
+    .await;
+    let supplier = write(
+        &router,
+        "POST",
+        "/api/v1/suppliers",
+        json!({
+            "command_id": cmd(7), "code": "S1", "name": "面粉供应商",
+            "contact_phone": "021-5555 0101", "active": true,
+        }),
+    )
+    .await["supplier"]["supplier_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    write(
+        &router,
+        "PUT",
+        &format!("/api/v1/suppliers/{supplier}"),
+        json!({ "command_id": cmd(8), "base_revision": 1, "name": "面粉供应商", "active": false }),
+    )
+    .await;
+    let reason = write(
+        &router,
+        "POST",
+        "/api/v1/waste-reasons",
+        json!({ "command_id": cmd(9), "code": "EXPIRED", "name": "过期", "active": true }),
+    )
+    .await["waste_reason"]["waste_reason_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    write(
+        &router,
+        "PUT",
+        &format!("/api/v1/waste-reasons/{reason}"),
+        json!({ "command_id": cmd(10), "base_revision": 1, "name": "过期", "active": true }),
+    )
+    .await; // 内容不变，不写事件
+    drop(router);
+    let online = projections(&db_path).unwrap();
+    for (table, rows) in [
+        ("items", 2),
+        ("item_units", 1),
+        ("recipes", 1),
+        ("recipe_versions", 2),
+        ("recipe_lines", 3),
+        ("suppliers", 1),
+        ("waste_reasons", 1),
+        ("inventory_unallocated", 0),
+    ] {
+        assert!(
+            online
+                .iter()
+                .any(|(name, content)| name == table && content.len() == rows),
+            "{table}: {online:?}"
+        );
+    }
+    let ledger_before = ledger(&db_path).unwrap();
+
+    let mut writer = spec_support::writer(&db_path).unwrap();
+    writer
+        .execute_batch(&format!(
+            "DELETE FROM item_units;
+             INSERT INTO item_units (item_id, unit_code, base_qty_per_unit) VALUES ('{toast}', 'box', 6);
+             UPDATE items SET name = 'tampered', default_shelf_life_ms = 1 WHERE id = '{flour}';
+             UPDATE recipe_lines SET qty_per_batch = 1 WHERE version = 2;
+             DELETE FROM recipe_lines WHERE version = 1;
+             INSERT INTO recipe_versions (recipe_id, version, output_qty_per_batch) VALUES ('{recipe}', 9, 1);
+             UPDATE suppliers SET contact_phone = '000';
+             DELETE FROM waste_reasons;
+             INSERT INTO inventory_unallocated (item_id, qty) VALUES ('{flour}', -5);"
+        ))
+        .unwrap();
+    assert_ne!(projections(&db_path).unwrap(), online);
+
+    for _ in 0..2 {
+        assert_eq!(spec_support::rebuild_projections(&mut writer).unwrap(), 9);
+        assert_eq!(projections(&db_path).unwrap(), online);
+        assert_eq!(ledger(&db_path).unwrap(), ledger_before);
+    }
+    drop(writer);
+
+    let router = spec_support::router(&db_path, clock.clock()).unwrap();
+    let data = write(
+        &router,
+        "PUT",
+        &format!("/api/v1/recipes/{recipe}"),
+        json!({ "command_id": cmd(11), "base_revision": 3, "name": "白吐司", "active": false }),
+    )
+    .await;
+    assert_eq!(data["recipe"]["revision"], json!(4));
+    assert_eq!(data["recipe"]["versions"].as_array().unwrap().len(), 2);
+    let reply = spec_support::post(
+        &router,
+        "/api/v1/waste-reasons",
+        Some(&MANAGER),
+        &json!({ "command_id": cmd(12), "code": "EXPIRED", "name": "过期", "active": true }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        assert_error(&reply, 409, "CODE_ALREADY_EXISTS"),
+        &json!({ "code": "EXPIRED", "waste_reason_id": reason })
+    );
+}
+
+// domain「主数据」：source = HQ_PACKAGE 的 MASTER_DATA_CHANGED 与 LOCAL 的一样重建投影（payload 见 golden 样本，
+// 本期没有写入口，经 open_writer 直接写入账本，见 docs/interfaces.md「boh_storage::testing」）。
+// 重建后该行可以查询，也可以在本地修改：新事件 source = LOCAL，aggregate_version 2。
+#[tokio::test]
+async fn hq_package_master_data_rebuilds_like_local_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("boh.db");
+    let clock = ManualClock::new(NOW);
+    let router = spec_support::router(&db_path, clock.clock()).unwrap();
+    let local = write(
+        &router,
+        "POST",
+        "/api/v1/waste-reasons",
+        json!({ "command_id": cmd(1), "code": "EXPIRED", "name": "过期", "active": true }),
+    )
+    .await;
+    drop(router);
+
+    let hq_id = "01890a5d-ac96-774b-bcce-b30209a9f001";
+    let payload = include_str!("golden/MASTER_DATA_CHANGED@1/WASTE_REASON_HQ_PACKAGE.json");
+    let mut writer = spec_support::writer(&db_path).unwrap();
+    writer
+        .execute(
+            "INSERT INTO store_events (id, event_type, schema_version, aggregate_type, aggregate_id,
+                 aggregate_version, command_id, actor_id, device_id, business_date, occurred_at,
+                 recorded_at, payload)
+             VALUES ('01890a5d-ac96-774b-bcce-b30209a9f002', 'MASTER_DATA_CHANGED', 1, 'WASTE_REASON',
+                 ?1, 1, ?2, '00000000-0000-7000-8000-000000000000',
+                 '00000000-0000-7000-8000-000000000001', '2026-10-06', ?3, ?3, ?4)",
+            rusqlite::params![hq_id, cmd(1), NOW.0, payload.trim_end()],
+        )
+        .unwrap();
+    assert_eq!(spec_support::rebuild_projections(&mut writer).unwrap(), 2);
+    drop(writer);
+
+    let router = spec_support::router(&db_path, clock.clock()).unwrap();
+    let reply = spec_support::get(&router, "/api/v1/waste-reasons", Some(&STAFF))
+        .await
+        .unwrap();
+    let hq_row = json!({
+        "waste_reason_id": hq_id, "code": "HQ_RETURN", "name": "总部召回", "active": true,
+        "revision": 1,
+    });
+    assert_eq!(
+        assert_success(&reply),
+        &json!({ "waste_reasons": [local["waste_reason"], hq_row] })
+    );
+
+    let data = write(
+        &router,
+        "PUT",
+        &format!("/api/v1/waste-reasons/{hq_id}"),
+        json!({ "command_id": cmd(2), "base_revision": 1, "name": "召回", "active": false }),
+    )
+    .await;
+    assert_eq!(data["waste_reason"]["revision"], json!(2));
+    let reader = spec_support::reader(&db_path).unwrap();
+    let (version, payload): (i64, String) = reader
+        .query_row(
+            "SELECT aggregate_version, payload FROM store_events WHERE seq = 3",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(version, 2);
+    assert_eq!(
+        serde_json::from_str::<Value>(&payload).unwrap(),
+        json!({ "entity": "WASTE_REASON", "source": "LOCAL", "snapshot": {
+            "code": "HQ_RETURN", "name": "召回", "active": false,
+        } })
+    );
+}

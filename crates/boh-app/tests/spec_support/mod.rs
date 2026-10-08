@@ -246,7 +246,7 @@ pub fn assert_error<'a>(reply: &'a JsonReply, status: u16, code: &str) -> &'a Va
     &error["details"]
 }
 
-/// 小写、带连字符、版本位为 7 的 UUID 文本。
+/// AGENTS.md「ID 与时间」的规范 UUIDv7 文本：36 位小写带连字符，版本位 7，变体位 8～b。
 pub fn is_uuid_v7(text: &str) -> bool {
     let bytes = text.as_bytes();
     bytes.len() == 36
@@ -255,6 +255,18 @@ pub fn is_uuid_v7(text: &str) -> bool {
             _ => b.is_ascii_digit() || (b'a'..=b'f').contains(&b),
         })
         && bytes[14] == b'7'
+        && matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
+}
+
+/// 同一个 UUIDv7 的非规范文本形式：大写、无连字符、花括号、`urn:` 前缀（AGENTS.md「ID 与时间」：都按取值非法处理）。
+/// 放进路径时，调用方把花括号写成 `%7B` / `%7D`。
+pub fn non_canonical_uuids(id: &str) -> [String; 4] {
+    [
+        id.to_uppercase(),
+        id.replace('-', ""),
+        format!("{{{id}}}"),
+        format!("urn:uuid:{id}"),
+    ]
 }
 
 /// 执行查询，按列取出全部行。

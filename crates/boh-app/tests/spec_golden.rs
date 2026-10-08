@@ -131,3 +131,146 @@ async fn temperature_logged_with_and_without_note() {
         ]
     );
 }
+
+/// 配方 golden 样本中的物料 ID：比对前把服务端生成的实际 ID 替换成它们，其余文本逐字节比对。
+const GOLDEN_FLOUR_ID: &str = "01890a5d-ac96-774b-bcce-b302099a8501";
+const GOLDEN_TOAST_ID: &str = "01890a5d-ac96-774b-bcce-b302099a8502";
+const GOLDEN_EGG_ID: &str = "01890a5d-ac96-774b-bcce-b302099a8503";
+
+#[allow(clippy::unwrap_used)] // 测试夹具：写入样本数据的请求失败时，比对没有意义，直接终止测试。
+async fn post_ok(router: &axum::Router, uri: &str, body: serde_json::Value) -> serde_json::Value {
+    let reply = spec_support::post(router, uri, Some(&MANAGER), &body)
+        .await
+        .unwrap();
+    assert_success(&reply).clone()
+}
+
+// MASTER_DATA_CHANGED@1，entity = ITEM / RECIPE / SUPPLIER / WASTE_REASON，source = LOCAL：
+// ITEM 的 default_shelf_life_ms 出现与省略、SUPPLIER 的 contact_phone 出现与省略各一份样本，省略时不写 null；
+// ITEM 的 units 为空数组时照常写出；RECIPE 新建（一个版本）一份样本，追加版本后的快照含全部版本。
+// 键顺序为 domain.md「主数据」快照字段的顺序；非 ASCII 文本不转义、引号转义一并锁定。
+#[tokio::test]
+async fn master_data_changed_items_recipes_suppliers_and_waste_reasons() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("boh.db");
+    let router = spec_support::router(&db_path, ManualClock::new(NOW).clock()).unwrap();
+    let cmd = |n: u16| format!("01890a5d-ac96-774b-bcce-b30209b1{n:04x}");
+
+    let flour = post_ok(
+        &router,
+        "/api/v1/items",
+        json!({
+            "command_id": cmd(1), "code": "FLOUR", "name": "高筋面粉 \"T65\"", "base_unit": "g",
+            "category": "RAW", "default_shelf_life_ms": 15_552_000_000_i64,
+            "units": [
+                { "unit_code": "bag", "base_qty_per_unit": 25000 },
+                { "unit_code": "cup", "base_qty_per_unit": 120 },
+            ],
+            "active": true,
+        }),
+    )
+    .await["item"]["item_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let toast = post_ok(
+        &router,
+        "/api/v1/items",
+        json!({
+            "command_id": cmd(2), "code": "TOAST", "name": "吐司", "base_unit": "pcs",
+            "category": "FINISHED", "units": [], "active": true,
+        }),
+    )
+    .await["item"]["item_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let egg = post_ok(
+        &router,
+        "/api/v1/items",
+        json!({
+            "command_id": cmd(3), "code": "EGG", "name": "鸡蛋", "base_unit": "pcs",
+            "category": "RAW", "units": [], "active": true,
+        }),
+    )
+    .await["item"]["item_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let recipe = post_ok(
+        &router,
+        "/api/v1/recipes",
+        json!({
+            "command_id": cmd(4), "code": "R-TOAST", "name": "吐司", "output_item_id": toast,
+            "active": true, "output_qty_per_batch": 12,
+            "lines": [
+                { "item_id": flour, "qty_per_batch": 3000 },
+                { "item_id": egg, "qty_per_batch": 6 },
+            ],
+        }),
+    )
+    .await["recipe"]["recipe_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    post_ok(
+        &router,
+        &format!("/api/v1/recipes/{recipe}/versions"),
+        json!({
+            "command_id": cmd(5), "base_revision": 1, "output_qty_per_batch": 10,
+            "lines": [{ "item_id": egg, "qty_per_batch": 8 }],
+        }),
+    )
+    .await;
+    post_ok(
+        &router,
+        "/api/v1/suppliers",
+        json!({
+            "command_id": cmd(6), "code": "S-FLOUR", "name": "面粉供应商",
+            "contact_phone": "021-5555 0101", "active": true,
+        }),
+    )
+    .await;
+    post_ok(
+        &router,
+        "/api/v1/suppliers",
+        json!({ "command_id": cmd(7), "code": "S-EGG", "name": "鸡蛋供应商", "active": false }),
+    )
+    .await;
+    post_ok(
+        &router,
+        "/api/v1/waste-reasons",
+        json!({ "command_id": cmd(8), "code": "EXPIRED", "name": "过期", "active": true }),
+    )
+    .await;
+
+    let payloads: Vec<String> = payloads(&db_path)
+        .unwrap()
+        .iter()
+        .map(|payload| {
+            payload
+                .replace(&flour, GOLDEN_FLOUR_ID)
+                .replace(&toast, GOLDEN_TOAST_ID)
+                .replace(&egg, GOLDEN_EGG_ID)
+        })
+        .collect();
+    assert_eq!(
+        payloads,
+        [
+            golden(include_str!("golden/MASTER_DATA_CHANGED@1/ITEM.json")),
+            golden(include_str!(
+                "golden/MASTER_DATA_CHANGED@1/ITEM_WITHOUT_DEFAULT_SHELF_LIFE.json"
+            )),
+            r#"{"entity":"ITEM","source":"LOCAL","snapshot":{"code":"EGG","name":"鸡蛋","base_unit":"pcs","category":"RAW","units":[],"active":true}}"#,
+            golden(include_str!("golden/MASTER_DATA_CHANGED@1/RECIPE.json")),
+            r#"{"entity":"RECIPE","source":"LOCAL","snapshot":{"code":"R-TOAST","name":"吐司","output_item_id":"01890a5d-ac96-774b-bcce-b302099a8502","versions":[{"version":1,"output_qty_per_batch":12,"lines":[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8501","qty_per_batch":3000},{"item_id":"01890a5d-ac96-774b-bcce-b302099a8503","qty_per_batch":6}]},{"version":2,"output_qty_per_batch":10,"lines":[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8503","qty_per_batch":8}]}],"active":true}}"#,
+            golden(include_str!("golden/MASTER_DATA_CHANGED@1/SUPPLIER.json")),
+            golden(include_str!(
+                "golden/MASTER_DATA_CHANGED@1/SUPPLIER_WITHOUT_CONTACT_PHONE.json"
+            )),
+            golden(include_str!(
+                "golden/MASTER_DATA_CHANGED@1/WASTE_REASON.json"
+            )),
+        ]
+    );
+}

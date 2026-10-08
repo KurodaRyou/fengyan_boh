@@ -1,0 +1,1 @@
+{"entity":"ITEM","source":"LOCAL","snapshot":{"code":"FLOUR","name":"高筋面粉 \"T65\"","base_unit":"g","category":"RAW","default_shelf_life_ms":15552000000,"units":[{"unit_code":"bag","base_qty_per_unit":25000},{"unit_code":"cup","base_qty_per_unit":120}],"active":true}}

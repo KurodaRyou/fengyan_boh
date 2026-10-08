@@ -49,7 +49,7 @@ fn business_calls() -> Vec<(Method, String, Option<Value>)> {
     ]
 }
 
-// 开发桩：缺少任一请求头、取值非法或使用保留系统 ID，一律 401 UNAUTHENTICATED，不入账。
+// 开发桩：缺少任一请求头、取值非法（含 ID 不是 36 位小写带连字符的形式）或使用保留系统 ID，一律 401 UNAUTHENTICATED，不入账。
 #[tokio::test]
 async fn missing_or_invalid_identity_is_unauthenticated() {
     let dir = tempfile::tempdir().unwrap();
@@ -74,6 +74,24 @@ async fn missing_or_invalid_identity_is_unauthenticated() {
         ("X-Dev-Device-Id", "01890a5d-ac96-474b-bcce-b302099a8201"), // v4
         ("X-Dev-Device-Id", SYSTEM_DEVICE_ID),
         ("X-Dev-Device-Id", SYSTEM_ACTOR_ID),
+        // AGENTS「ID 与时间」：大写、无连字符、花括号、urn: 形式都按取值非法处理。
+        ("X-Dev-Employee-Id", "01890A5D-AC96-774B-BCCE-B302099A8101"),
+        ("X-Dev-Employee-Id", "01890a5dac96774bbcceb302099a8101"),
+        (
+            "X-Dev-Employee-Id",
+            "{01890a5d-ac96-774b-bcce-b302099a8101}",
+        ),
+        (
+            "X-Dev-Employee-Id",
+            "urn:uuid:01890a5d-ac96-774b-bcce-b302099a8101",
+        ),
+        ("X-Dev-Device-Id", "01890A5D-AC96-774B-BCCE-B302099A8201"),
+        ("X-Dev-Device-Id", "01890a5dac96774bbcceb302099a8201"),
+        ("X-Dev-Device-Id", "{01890a5d-ac96-774b-bcce-b302099a8201}"),
+        (
+            "X-Dev-Device-Id",
+            "urn:uuid:01890a5d-ac96-774b-bcce-b302099a8201",
+        ),
         ("X-Dev-Role", "ADMIN"),
         ("X-Dev-Role", "manager"),
         ("X-Dev-Role", ""),

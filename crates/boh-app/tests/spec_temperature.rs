@@ -14,7 +14,7 @@ use boh_storage::clock::ManualClock;
 use serde_json::{Value, json};
 use spec_support::{
     Actor, JsonReply, MANAGER, STAFF, SYSTEM_ACTOR_ID, SYSTEM_DEVICE_ID, assert_error,
-    assert_success, is_uuid_v7, raw_request, request, send,
+    assert_success, is_uuid_v7, non_canonical_uuids, raw_request, request, send,
 };
 use tempfile::TempDir;
 
@@ -498,6 +498,50 @@ async fn inactive_equipment_is_accepted() {
     assert_eq!(node.counts().unwrap(), (3, 3));
 }
 
+// 温度记录接口「新建」：不限制 equipment_type——烤箱、醒发箱等非冷藏设备上的读数照常受理。
+#[tokio::test]
+async fn any_equipment_type_is_accepted() {
+    let node = node();
+    let mut ids = Vec::new();
+    for (n, kind) in [
+        "FREEZER",
+        "BLAST_FREEZER",
+        "OVEN",
+        "PROOFER",
+        "MIXER",
+        "OTHER",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let reply = spec_support::post(
+            &node.router,
+            "/api/v1/equipment",
+            Some(&MANAGER),
+            &json!({
+                "command_id": cmd(10 + n as u16), "code": kind, "name": kind,
+                "equipment_type": kind, "active": true,
+            }),
+        )
+        .await
+        .unwrap();
+        ids.push(
+            assert_success(&reply)["equipment"]["equipment_id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+
+    for (n, id) in ids.iter().enumerate() {
+        node.log_ok(&STAFF, &body(&cmd(20 + n as u16), id, 1800, None, 0))
+            .await;
+    }
+
+    assert_eq!(node.readings().unwrap().len(), 6);
+    assert_eq!(node.counts().unwrap(), (12, 12));
+}
+
 // ---------------------------------------------------------------------------------------------
 // 业务校验
 // ---------------------------------------------------------------------------------------------
@@ -520,6 +564,28 @@ async fn unknown_equipment_is_not_found() {
     );
     assert_eq!(node.state(), before);
     node.log_ok(&STAFF, &body(&cmd(2), &f1, 38, None, 0)).await;
+    assert_eq!(node.counts().unwrap(), (2, 2));
+}
+
+// AGENTS「幂等」：被请求结构与取值校验拒绝（400 VALIDATION_FAILED）的命令不落库；修正内容后用同一个 command_id 重提，
+// 按新命令处理并成功。
+#[tokio::test]
+async fn a_command_rejected_as_invalid_can_be_corrected_with_the_same_id() {
+    let node = node();
+    let f1 = node.equipment(&cmd(1), "F1").await;
+    let before = node.state();
+
+    let reply = node
+        .log(&STAFF, &body(&cmd(2), &f1, 5001, Some("录错"), 0))
+        .await;
+    assert_error(&reply, 400, "VALIDATION_FAILED");
+    assert_eq!(node.state(), before);
+
+    let id = node
+        .log_ok(&STAFF, &body(&cmd(2), &f1, 501, Some("录错"), 0))
+        .await;
+    let readings = node.readings().unwrap();
+    assert_eq!((readings.len(), readings[0].0.as_str()), (1, id.as_str()));
     assert_eq!(node.counts().unwrap(), (2, 2));
 }
 
@@ -948,6 +1014,13 @@ async fn invalid_commands_are_rejected_with_validation_failed() {
         with("started_captured_at", json!(SENT)),
         with("unit", json!("C")),
     ];
+    // AGENTS「ID 与时间」：只接受 36 位小写带连字符的形式。
+    for text in non_canonical_uuids(&f1) {
+        bodies.push(with("equipment_id", json!(text)));
+    }
+    for text in non_canonical_uuids(&cmd(2)) {
+        bodies.push(with("command_id", json!(text)));
+    }
     for key in [
         "command_id",
         "equipment_id",
@@ -1071,8 +1144,8 @@ async fn list_filters_by_business_date_and_equipment() {
     );
 }
 
-// 温度记录接口「查询」与 AGENTS「HTTP 约定」：缺少 business_date、日期格式或取值非法、equipment_id 不是 UUIDv7、
-// 未知或重复的查询参数，一律 400 VALIDATION_FAILED。
+// 温度记录接口「查询」与 AGENTS「HTTP 约定」「ID 与时间」：缺少 business_date、日期格式或取值非法、equipment_id 不是
+// 规范形式的 UUIDv7、未知或重复的查询参数（含重复的 equipment_id），一律 400 VALIDATION_FAILED。
 #[tokio::test]
 async fn invalid_queries_are_rejected_with_validation_failed() {
     let node = node();
@@ -1093,7 +1166,14 @@ async fn invalid_queries_are_rejected_with_validation_failed() {
         "business_date=2026-10-06&equipment_id=".into(),
         "business_date=2026-10-06&foo=1".into(),
         "business_date=2026-10-06&business_date=2026-10-05".into(),
-    ] {
+        format!("business_date=2026-10-06&equipment_id={f1}&equipment_id={f1}"),
+        format!("business_date=2026-10-06&equipment_id={f1}&equipment_id={UNKNOWN_ID}"),
+    ]
+    .into_iter()
+    .chain(non_canonical_uuids(&f1).map(|text| {
+        let text = text.replace('{', "%7B").replace('}', "%7D");
+        format!("business_date=2026-10-06&equipment_id={text}")
+    })) {
         let reply = node.query(&STAFF, &query).await;
         assert_error(&reply, 400, "VALIDATION_FAILED");
     }
