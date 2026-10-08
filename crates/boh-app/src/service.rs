@@ -1,5 +1,7 @@
 //! Command orchestration. Business checks execute after ledger idempotency.
 
+pub(crate) mod master_data;
+
 use axum::http::StatusCode;
 use boh_domain::equipment::{
     CreateEquipment, Equipment, EquipmentChanged, EquipmentEntity, EquipmentSnapshot,

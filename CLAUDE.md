@@ -6,6 +6,11 @@
 Review 时以 AGENTS.md 的「不可违反的规则」为检查清单，逐条核对；除非用户要求，不直接改实现代码。
 本地 review（开发顺序第 9 步）在清单核对之后再跑 `/code-review`，补查清单以外的问题，与清单重复的不再列；两者都通过才给出可以提 PR 的结论。
 
+开发顺序第 4 步：先按下表用 `engineering:testing-strategy` 查覆盖缺口，再为测试 agent 准备独立测试审查（AGENTS.md「测试分工」）：
+- 副本放在仓库同级的 `../fengyan-blindtest-<切片>/`，复制工作区（锁定测试此时尚未提交），排除 `.git`、`workdocs/`、`target/`。
+- prompt 只写本切片的被测对象、要读的规范章节、要对照的锁定测试文件和场景覆盖面；角色约束由 AGENTS.md 规定，不在 prompt 中改写。
+- 核对报告后，把副本移到废纸篓。
+
 ## Engineering 插件
 
 按以下时机调用，只作补充，不替代本项目规则：

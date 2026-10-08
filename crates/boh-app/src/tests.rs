@@ -570,3 +570,388 @@ async fn health_reports_wal_io_failure_and_missing_wal_without_exposing_paths() 
     }
     node.storage.writer_handle.shutdown().await.unwrap();
 }
+
+fn master_command_id(n: u16) -> String {
+    format!("01890a5d-ac96-774b-bcce-b30209ad{n:04x}")
+}
+
+fn item_body(n: u16) -> Value {
+    json!({"command_id": master_command_id(n), "code": "FLOUR", "name": "面粉", "base_unit": "g",
+    "category": "RAW", "active": true, "units": [
+        {"unit_code": "bag", "base_qty_per_unit": 25000},
+        {"unit_code": "cup", "base_qty_per_unit": 120}
+    ]})
+}
+
+async fn seed_item(node: &Node) -> String {
+    let (status, body) = send(
+        node.router.clone(),
+        Method::POST,
+        "/api/v1/items",
+        item_body(1),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    body["data"]["item"]["item_id"].as_str().unwrap().to_owned()
+}
+
+fn recipe_body(item_id: &str) -> Value {
+    json!({"command_id": master_command_id(2), "code": "R1", "name": "配方", "active": true,
+        "output_item_id": item_id, "output_qty_per_batch": 2,
+        "lines": [{"item_id": item_id, "qty_per_batch": 4}]})
+}
+
+#[tokio::test]
+async fn child_projection_failures_restore_complete_snapshots_and_allow_original_retry() {
+    let node = node(true).await;
+    let item_id = seed_item(&node).await;
+    let original = send(
+        node.router.clone(),
+        Method::GET,
+        "/api/v1/items",
+        Value::Null,
+    )
+    .await;
+    node.storage
+        .writer
+        .call(|tx| -> Result<(), StorageError> {
+            tx.execute_batch(
+                "CREATE TRIGGER injected_item_failure BEFORE INSERT ON item_units
+            WHEN NEW.unit_code = 'box' BEGIN SELECT RAISE(ABORT, 'private child failure'); END;",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let update = json!({"command_id": master_command_id(3), "base_revision": 1,
+    "name": "新面粉", "category": "SEMI", "active": false, "units": [
+        {"unit_code": "bag", "base_qty_per_unit": 20000},
+        {"unit_code": "box", "base_qty_per_unit": 1000}
+    ]});
+    let path = format!("/api/v1/items/{item_id}");
+    assert_internal_error(send(node.router.clone(), Method::PUT, &path, update.clone()).await);
+    assert_eq!(counts(&node).await, (1, 1, 0));
+    assert_eq!(
+        send(
+            node.router.clone(),
+            Method::GET,
+            "/api/v1/items",
+            Value::Null
+        )
+        .await,
+        original
+    );
+    node.storage
+        .writer
+        .call(|tx| -> Result<(), StorageError> {
+            tx.execute_batch("DROP TRIGGER injected_item_failure")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        send(node.router.clone(), Method::PUT, &path, update)
+            .await
+            .0,
+        200
+    );
+
+    let (status, recipe) = send(
+        node.router.clone(),
+        Method::POST,
+        "/api/v1/recipes",
+        recipe_body(&item_id),
+    )
+    .await;
+    assert_eq!(status, 200, "{recipe}");
+    let recipe_id = recipe["data"]["recipe"]["recipe_id"].as_str().unwrap();
+    let original = send(
+        node.router.clone(),
+        Method::GET,
+        "/api/v1/recipes",
+        Value::Null,
+    )
+    .await;
+    node.storage
+        .writer
+        .call(|tx| -> Result<(), StorageError> {
+            tx.execute_batch(
+                "CREATE TRIGGER injected_recipe_failure BEFORE INSERT ON recipe_lines
+            WHEN NEW.version = 2 BEGIN SELECT RAISE(ABORT, 'private child failure'); END;",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let version = json!({"command_id": master_command_id(4), "base_revision": 1,
+        "output_qty_per_batch": 3, "lines": [{"item_id": item_id, "qty_per_batch": 6}]});
+    let path = format!("/api/v1/recipes/{recipe_id}/versions");
+    assert_internal_error(send(node.router.clone(), Method::POST, &path, version.clone()).await);
+    assert_eq!(counts(&node).await, (3, 3, 0));
+    assert_eq!(
+        send(
+            node.router.clone(),
+            Method::GET,
+            "/api/v1/recipes",
+            Value::Null
+        )
+        .await,
+        original
+    );
+    node.storage
+        .writer
+        .call(|tx| -> Result<(), StorageError> {
+            tx.execute_batch("DROP TRIGGER injected_recipe_failure")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (status, body) = send(node.router.clone(), Method::POST, &path, version).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["data"]["recipe"]["versions"].as_array().unwrap().len(),
+        2
+    );
+    assert_eq!(counts(&node).await, (4, 4, 0));
+    node.storage
+        .readers
+        .call(|conn| -> Result<(), StorageError> {
+            let (n, max): (i64, i64) =
+                conn.query_row("SELECT count(*), max(seq) FROM store_events", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?;
+            assert_eq!((n, max), (4, 4));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    node.storage.writer_handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_recipe_versions_serialize_and_retries_keep_the_original_snapshot() {
+    let node = node(true).await;
+    let item_id = seed_item(&node).await;
+    let (status, recipe) = send(
+        node.router.clone(),
+        Method::POST,
+        "/api/v1/recipes",
+        recipe_body(&item_id),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let recipe_id = recipe["data"]["recipe"]["recipe_id"].as_str().unwrap();
+    let path = format!("/api/v1/recipes/{recipe_id}/versions");
+    let version = json!({"command_id": master_command_id(3), "base_revision": 1,
+        "output_qty_per_batch": 3, "lines": [{"item_id": item_id, "qty_per_batch": 6}]});
+    let (a, b) = tokio::join!(
+        send(node.router.clone(), Method::POST, &path, version.clone()),
+        send(node.router.clone(), Method::POST, &path, version.clone()),
+    );
+    assert_eq!(a, b);
+    assert_eq!(a.0, 200);
+    assert_eq!(counts(&node).await, (3, 3, 0));
+    let competing = |n| {
+        json!({"command_id": master_command_id(n), "base_revision": 2,
+        "output_qty_per_batch": n, "lines": [{"item_id": item_id, "qty_per_batch": 8}]})
+    };
+    let (c, d) = tokio::join!(
+        send(node.router.clone(), Method::POST, &path, competing(4)),
+        send(node.router.clone(), Method::POST, &path, competing(5)),
+    );
+    assert!(matches!((c.0, d.0), (200, 409) | (409, 200)));
+    let rejected = if c.0 == 409 { c.1 } else { d.1 };
+    assert_eq!(rejected["error"]["code"], "REVISION_CONFLICT");
+    assert_eq!(rejected["error"]["details"], json!({"current_revision": 3}));
+    assert_eq!(
+        send(node.router.clone(), Method::POST, &path, version).await,
+        a
+    );
+    assert_eq!(counts(&node).await, (4, 4, 0));
+    node.storage.writer_handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn remaining_master_data_revision_overflows_do_not_commit_partial_changes() {
+    for (table, url, key) in [
+        ("items", "/api/v1/items", "item"),
+        ("recipes", "/api/v1/recipes", "recipe"),
+        ("suppliers", "/api/v1/suppliers", "supplier"),
+        ("waste_reasons", "/api/v1/waste-reasons", "waste_reason"),
+    ] {
+        let node = node(true).await;
+        let item_id = seed_item(&node).await;
+        let body = match key {
+            "item" => {
+                let mut body = item_body(2);
+                body["code"] = json!("SECOND");
+                body
+            }
+            "recipe" => recipe_body(&item_id),
+            _ => {
+                json!({"command_id": master_command_id(2), "code": "C1", "name": "原名", "active": true})
+            }
+        };
+        let (status, created) = send(node.router.clone(), Method::POST, url, body).await;
+        assert_eq!(status, 200, "{created}");
+        let id = created["data"][key][format!("{key}_id")].as_str().unwrap();
+        let id_owned = id.to_owned();
+        node.storage
+            .writer
+            .call(move |tx| -> Result<(), StorageError> {
+                tx.execute(
+                    &format!("UPDATE {table} SET revision = ?1 WHERE id = ?2"),
+                    boh_storage::rusqlite::params![i64::MAX, id_owned],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let mut update = json!({"command_id": master_command_id(3), "base_revision": i64::MAX,
+            "name": "新名", "active": false});
+        if key == "item" {
+            update["category"] = json!("RAW");
+            update["units"] = json!([]);
+        }
+        assert_internal_error(
+            send(
+                node.router.clone(),
+                Method::PUT,
+                &format!("{url}/{id}"),
+                update,
+            )
+            .await,
+        );
+        if key == "recipe" {
+            // Appending a version must also check revision before changing history.
+            assert_internal_error(send(node.router.clone(), Method::POST, &format!("{url}/{id}/versions"),
+                json!({"command_id": master_command_id(4), "base_revision": i64::MAX,
+                    "output_qty_per_batch": 3, "lines": [{"item_id": item_id, "qty_per_batch": 6}]})).await);
+        }
+        assert_eq!(counts(&node).await, (2, 2, 0));
+        let (_, listed) = send(node.router.clone(), Method::GET, url, Value::Null).await;
+        let mut expected = created["data"][key].clone();
+        expected["revision"] = json!(i64::MAX);
+        let rows = listed["data"][table].as_array().unwrap();
+        assert!(rows.contains(&expected), "{listed}");
+        node.storage.writer_handle.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn imported_snapshots_require_objects_in_nested_arrays_and_fail_atomically() {
+    use boh_domain::{AggregateId, CommandId, EventId};
+    use boh_storage::ledger::{self, Command, Event, ExecuteError};
+
+    let node = node(true).await;
+    let item_id = seed_item(&node).await;
+    let (status, recipe) = send(
+        node.router.clone(),
+        Method::POST,
+        "/api/v1/recipes",
+        recipe_body(&item_id),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let recipe_id = recipe["data"]["recipe"]["recipe_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let items_before = send(
+        node.router.clone(),
+        Method::GET,
+        "/api/v1/items",
+        Value::Null,
+    )
+    .await;
+    let recipes_before = send(
+        node.router.clone(),
+        Method::GET,
+        "/api/v1/recipes",
+        Value::Null,
+    )
+    .await;
+    let mut item = items_before.1["data"]["items"][0].clone();
+    item.as_object_mut().unwrap().remove("item_id");
+    item.as_object_mut().unwrap().remove("revision");
+    item["name"] = json!("tampered");
+    item["units"][0] = json!(item["units"][0].to_string());
+    let mut version_string = recipe["data"]["recipe"].clone();
+    version_string.as_object_mut().unwrap().remove("recipe_id");
+    version_string.as_object_mut().unwrap().remove("revision");
+    version_string["name"] = json!("tampered");
+    let mut line_string = version_string.clone();
+    version_string["versions"][0] = json!(version_string["versions"][0].to_string());
+    line_string["versions"][0]["lines"][0] =
+        json!(line_string["versions"][0]["lines"][0].to_string());
+    for (n, (entity, id, snapshot)) in (3..).zip([
+        ("ITEM", item_id.clone(), item),
+        ("RECIPE", recipe_id.clone(), version_string),
+        ("RECIPE", recipe_id, line_string),
+    ]) {
+        let command_id = CommandId::parse(&master_command_id(n)).unwrap();
+        let id = AggregateId::parse(&id).unwrap();
+        let payload =
+            json!({"entity": entity, "source": "HQ_PACKAGE", "snapshot": snapshot}).to_string();
+        let recorded_at = node.clock.clock().now();
+        let result = node
+            .storage
+            .writer
+            .call(move |tx| -> Result<String, ExecuteError> {
+                ledger::execute(
+                    tx,
+                    Command {
+                        id: command_id,
+                        command_type: "test.import",
+                        request: "{}",
+                        recorded_at,
+                    },
+                    |ledger| {
+                        ledger.append(&Event {
+                            id: EventId::from_parts(recorded_at, ledger::entropy(tx)?)
+                                .map_err(StorageError::from)?,
+                            event_type: "MASTER_DATA_CHANGED".into(),
+                            schema_version: 1,
+                            aggregate_type: entity.into(),
+                            aggregate_id: id,
+                            aggregate_version: 2,
+                            command_id,
+                            actor_id: AggregateId::parse("00000000-0000-7000-8000-000000000000")
+                                .map_err(StorageError::from)?,
+                            device_id: AggregateId::parse("00000000-0000-7000-8000-000000000001")
+                                .map_err(StorageError::from)?,
+                            business_date: "2026-10-06".into(),
+                            occurred_at: recorded_at,
+                            recorded_at,
+                            payload,
+                        })?;
+                        Ok("{}".into())
+                    },
+                )
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(counts(&node).await, (2, 2, 0));
+        assert_eq!(
+            send(
+                node.router.clone(),
+                Method::GET,
+                "/api/v1/items",
+                Value::Null
+            )
+            .await,
+            items_before
+        );
+        assert_eq!(
+            send(
+                node.router.clone(),
+                Method::GET,
+                "/api/v1/recipes",
+                Value::Null
+            )
+            .await,
+            recipes_before
+        );
+    }
+    node.storage.writer_handle.shutdown().await.unwrap();
+}

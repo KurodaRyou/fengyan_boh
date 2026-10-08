@@ -396,6 +396,34 @@ async fn shutdown_runs_the_running_and_queued_backups_first() {
     assert_eq!(fixture.numbers(), [1, 2, 3]);
 }
 
+// 「备份期间写入照常提交，备份快照可能包含 seq_before 之后的事件，所以只比下界」：备份读取 seq_before 之后、
+// VACUUM INTO 之前写入一个事件，本次备份仍成功，last_backup_seq 是写入后的 max(seq)。
+#[tokio::test]
+async fn writes_after_seq_before_are_included_and_the_backup_succeeds() {
+    let fixture = Fixture::new(local(12, 30));
+    let node = fixture.start(3, SH, "23:30").await;
+    create_equipment(&node.router, &cmd(1), "F1").await;
+    let hold = node.hold_backups();
+    fixture.clock.set(local(13, 0));
+    tokio::time::timeout(Duration::from_secs(10), hold.started())
+        .await
+        .unwrap();
+    create_equipment(&node.router, &cmd(2), "F2").await;
+
+    drop(hold);
+    fixture.wait_numbers(&[1]).await;
+    let data = wait_for_health(&node.router, "backup", |d| {
+        !d["last_backup_ok_at"].is_null()
+    })
+    .await;
+    assert_eq!(ms(&data["last_backup_ok_at"]), Some(local(13, 0).0));
+    assert_eq!(data["last_backup_seq"], json!(2));
+    assert_eq!(data["last_backup_failed_at"], Value::Null);
+    assert_eq!(data["status"], json!("ok"));
+    assert!(fixture.temporary_files().is_empty());
+    node.shutdown().await.unwrap();
+}
+
 // ---------------------------------------------------------------- 文件名与保留
 
 // 「保留策略」：按序号从大到小保留 N 份，第 N+1 份成功后删除序号最小的一份。
@@ -452,7 +480,7 @@ async fn retention_keeps_the_newest_numbers_and_leaves_other_files_alone() {
 }
 
 // 「扫描本店最终文件，取最大备份序号 checked_add(1)」：符合格式的文件都计入序号和保留额度，不检查内容；
-// 重启后序号接着递增；时钟回拨后文件名里的时间变早，保留仍按序号。
+// 重启后序号接着递增，/health 的备份字段只反映本进程（重启后为 null、status 为 ok）；时钟回拨后文件名里的时间变早，保留仍按序号。
 #[tokio::test]
 async fn numbering_continues_across_existing_files_restart_and_clock_rewind() {
     let fixture = Fixture::new(local(12, 30));
@@ -468,6 +496,11 @@ async fn numbering_continues_across_existing_files_restart_and_clock_rewind() {
 
     fixture.clock.set(local(15, 30));
     let node = fixture.start(3, SH, "23:30").await;
+    let data = spec_support::health(&node.router).await;
+    assert_eq!(data["last_backup_ok_at"], Value::Null);
+    assert_eq!(data["last_backup_seq"], Value::Null);
+    assert_eq!(data["last_backup_failed_at"], Value::Null);
+    assert_eq!(data["status"], json!("ok"));
     fixture.clock.set(local(16, 0));
     fixture.wait_numbers(&[43, 44, 45]).await;
 

@@ -3,6 +3,7 @@
 mod connection;
 mod error;
 pub mod ledger;
+mod master_data;
 mod migrate;
 mod projections;
 mod readers;

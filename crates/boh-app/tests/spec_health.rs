@@ -73,7 +73,10 @@ async fn new_node_reports_ok_and_unknown_backup_state() {
         ]
     );
     assert_eq!(data["status"], json!("ok"));
-    assert_eq!(data["schema_version"], json!(4));
+    assert_eq!(
+        data["schema_version"],
+        json!(boh_storage::LATEST_SCHEMA_VERSION)
+    );
     assert_eq!(data["clock_regression_ms"], json!(0));
     assert_eq!(data["last_backup_ok_at"], Value::Null);
     assert_eq!(data["last_backup_seq"], Value::Null);

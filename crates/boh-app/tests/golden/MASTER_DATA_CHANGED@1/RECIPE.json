@@ -1,0 +1,1 @@
+{"entity":"RECIPE","source":"LOCAL","snapshot":{"code":"R-TOAST","name":"吐司","output_item_id":"01890a5d-ac96-774b-bcce-b302099a8502","versions":[{"version":1,"output_qty_per_batch":12,"lines":[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8501","qty_per_batch":3000},{"item_id":"01890a5d-ac96-774b-bcce-b302099a8503","qty_per_batch":6}]}],"active":true}}

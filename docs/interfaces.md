@@ -80,6 +80,7 @@ pub mod testing {
 - `open_reader`：只读连接，已设好全部 PRAGMA 和 `query_only = ON`。
 - `migrate`：与 `open` 内部相同的迁移。
 - `rebuild_projections`：在 `conn` 上以 `BEGIN IMMEDIATE` 执行与 `Writer::rebuild_projections` 相同的重建。`conn` 须由 `open_writer` 打开。
+- 本期没有写入口的事件（如 `source = HQ_PACKAGE` 的 `MASTER_DATA_CHANGED`），锁定测试经 `open_writer` 直接写入 `processed_commands` 和 `store_events`（不写 `seq` 列），再 `rebuild_projections` 核对投影。
 - 这些函数都是转发到 crate 内部函数的独立函数，不用 `pub use`。
   - clippy 按函数定义禁用；重导出会让 crate 内部对原函数的调用也被禁用。
 - 两份 `clippy.toml` 禁用这些函数，只有锁定测试及 `spec_support/` 可以 `#[allow]`。
@@ -225,7 +226,8 @@ pub fn test_router(db_path: &Path, clock: Clock) -> Result<Router, StorageError>
   | `business_day_cutoff` | `04:00` |
   | `dev_actor_stub` | `true`（身份由请求头提供，见 domain.md「员工认证」开发桩） |
 
-- `store_meta` 为空时，用与 `boh-server init` 相同的代码写入上表的 `store_id`，`created_at` 取 `clock.now()`；已存在且 `store_id` 不同时返回 `Err`。
+- `store_meta` 为空时，用与 `boh-server init` 写 `store_meta` 相同的代码写入上表的 `store_id`，`created_at` 取 `clock.now()`；已存在且 `store_id` 不同时返回 `Err`。
+  - 不写预置主数据（报损原因），也不写 `processed_commands`：测试节点的账本从空开始。
 - 写线程不经 `shutdown`：`Router` 及其全部克隆释放后，写线程自行退出。
 - 不启动备份调度等后台任务：`/health` 的备份字段一直为 `null`。
 - 两份 `clippy.toml` 禁用 `test_router`，只有锁定测试及 `spec_support/` 可以 `#[allow]`。
@@ -265,7 +267,7 @@ impl BackupHold {
   - 配置：`store_id`、`business_day_cutoff`、开发桩同 `test_router`；`timezone` 同时用于营业日和闭店备份；时区或 `closing_backup_time` 非法时返回 `Err`。
   - 返回时，调度任务已按 `clock` 当时的时间算好第一个触发时刻。
 - `router`：与生产入口相同的路由；`/health` 反映本节点的备份结果。
-- `hold_backups`：返回的句柄存在期间，每次开始的备份在取得开始时间（文件名中的时间）之后、读取 `seq_before` 之前等待；所有句柄释放后继续。
+- `hold_backups`：返回的句柄存在期间，每次开始的备份在取得开始时间（文件名中的时间）并读取 `seq_before` 之后、执行 `VACUUM INTO` 之前等待；所有句柄释放后继续。
   - `started()`：有备份正在等待该句柄时返回（已在等待则立即返回）。
   - 句柄不借用 `TestNode`：持有句柄时也可以调用 `shutdown`，`shutdown` 会等到句柄释放、队列执行完。
 - `shutdown`：不再接受新的触发，执行完正在进行和已排队的备份，再 `WriterHandle::shutdown()`。返回后不留任何后台任务。
@@ -296,3 +298,13 @@ pub fn parse_config(text: &str) -> Result<Config, impl std::error::Error>;
 - 解析 TOML 配置文本，不读文件、不创建目录。错误类型由实现决定，锁定测试只区分 `Ok` / `Err`。
 - `backup_dir` 必填；`backup_keep_count` 缺省为 168，必须是正整数（TOML 整数，`1`–`u32::MAX`）；`closing_backup_time` 缺省为 `"23:30"`，格式见 `parse_closing_backup_time`。
 - `main` 经此函数加载配置。
+
+## boh-server：`init` 子命令
+
+锁定测试以子进程运行 `boh-server` 二进制（`env!("CARGO_BIN_EXE_boh-server")`）：`boh-server init <配置文件>`。
+
+- 退出码 0 表示成功，非 0 表示失败；测试不依赖输出文本。
+- 读取配置中的 `db_path`、`store_id`、`timezone`、`business_day_cutoff`；不创建 `backup_dir`，不监听端口，不启动后台任务。
+- 时间取系统时钟：测试只断言时间落在调用前后读取的系统时间之间，营业日按 `boh_domain::time::business_date` 由事件的 `occurred_at` 核对。
+- 写入内容见 domain.md「主数据」初始化；测试经 `boh_storage::testing::open_reader` 读取数据库，经 `boh_app::test_router` 访问已初始化的数据库。
+- 回滚测试：先经 `boh_storage::testing::open_writer` 和 `migrate` 建库，在 `waste_reasons` 中放一行 `code = 'OTHER'`；`init` 写不进最后一条预置原因，必须以非 0 退出，`store_meta`、`processed_commands`、`store_events` 仍为空。删掉这一行后 `init` 可以重新执行。

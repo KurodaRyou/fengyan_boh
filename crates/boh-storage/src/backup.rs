@@ -92,7 +92,6 @@ impl Backup {
         mut sync: impl FnMut(&Path) -> Result<(), StorageError>,
     ) -> Result<i64, StorageError> {
         let started = clock.now();
-        self.gate.wait();
         let source = open_source(&self.db_path)?;
         let entropy: [u8; 10] = source.query_row("SELECT randomblob(10)", [], |row| row.get(0))?;
         let id = BackupId::from_parts(started, entropy)?;
@@ -109,6 +108,7 @@ impl Backup {
                 }
             }
             let before = max_seq(&source)?;
+            self.gate.wait();
             let path = temporary
                 .to_str()
                 .ok_or_else(|| StorageError::Backup("snapshot path is not UTF-8".into()))?;

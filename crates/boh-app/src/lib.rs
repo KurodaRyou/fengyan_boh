@@ -4,6 +4,7 @@ pub mod actor;
 pub mod background;
 pub mod http;
 mod service;
+pub use service::master_data::initialize_store;
 #[cfg(test)]
 mod tests;
 

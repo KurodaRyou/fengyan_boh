@@ -1,4 +1,4 @@
-//! 锁定迁移 001、002、003、004 的表结构；每项测试注明对应的规则（AGENTS.md / docs/domain.md）或迁移文件。
+//! 锁定迁移 001、002、003、004、005 的表结构；每项测试注明对应的规则（AGENTS.md / docs/domain.md）或迁移文件。
 
 use std::fmt::Debug;
 
@@ -15,6 +15,8 @@ const MIGRATION_003: &str = include_str!("../../../migrations/003_temperature_re
 const MIGRATION_003_FNV1A_64: u64 = 0x68f1_2381_a56a_04c3;
 const MIGRATION_004: &str = include_str!("../../../migrations/004_store_events_recorded_at.sql");
 const MIGRATION_004_FNV1A_64: u64 = 0x401b_6d6e_ba06_70d2;
+const MIGRATION_005: &str = include_str!("../../../migrations/005_master_data_inventory.sql");
+const MIGRATION_005_FNV1A_64: u64 = 0x4191_3449_6be8_86c9;
 const STORE: &str = "01890a5d-ac96-774b-bcce-b302099a8050";
 const ACTOR: &str = "01890a5d-ac96-774b-bcce-b302099a8051";
 const CMD: &str = "01890a5d-ac96-774b-bcce-b302099a8057";
@@ -176,10 +178,16 @@ fn migration_004_matches_frozen_checksum() {
     assert_eq!(fnv1a_64(MIGRATION_004), MIGRATION_004_FNV1A_64);
 }
 
+// AGENTS「迁移」不可修改：按 UTF-8 原始字节锁定 005 完整 SQL（包括注释）。
+#[test]
+fn migration_005_matches_frozen_checksum() {
+    assert_eq!(fnv1a_64(MIGRATION_005), MIGRATION_005_FNV1A_64);
+}
+
 // AGENTS「迁移」：程序支持的版本就是已锁定迁移文件的个数。
 #[test]
 fn latest_schema_version_counts_locked_migrations() {
-    assert_eq!(LATEST_SCHEMA_VERSION, 4);
+    assert_eq!(LATEST_SCHEMA_VERSION, 5);
 }
 
 // AGENTS「迁移」：重复执行迁移不改变版本，也不丢失已有数据。
@@ -1248,7 +1256,7 @@ fn upgrades_a_version_3_database_without_losing_data() {
 
     migrate(&mut conn).unwrap();
 
-    assert_eq!(schema_version(&conn).unwrap(), 4);
+    assert_eq!(schema_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
     let after: Vec<_> = tables
         .iter()
         .map(|t| table_rows(&conn, t).unwrap())
@@ -1263,4 +1271,1016 @@ fn upgrades_a_version_3_database_without_losing_data() {
         .collect::<rusqlite::Result<_>>()
         .unwrap();
     assert_eq!(recorded, [TS, TS]);
+}
+
+// ---- 005：其余主数据与库存投影 ----
+
+const ITEM: &str = "01890a5d-ac96-774b-bcce-b302099a8501";
+const ITEM2: &str = "01890a5d-ac96-774b-bcce-b302099a8502";
+const ITEM3: &str = "01890a5d-ac96-774b-bcce-b302099a8503";
+const RECIPE: &str = "01890a5d-ac96-774b-bcce-b302099a8601";
+const RECIPE2: &str = "01890a5d-ac96-774b-bcce-b302099a8602";
+const SUPPLIER: &str = "01890a5d-ac96-774b-bcce-b302099a8701";
+const SUPPLIER2: &str = "01890a5d-ac96-774b-bcce-b302099a8702";
+const REASON: &str = "01890a5d-ac96-774b-bcce-b302099a8801";
+const REASON2: &str = "01890a5d-ac96-774b-bcce-b302099a8802";
+const LOT: &str = "01890a5d-ac96-774b-bcce-b302099a8901";
+const LOT2: &str = "01890a5d-ac96-774b-bcce-b302099a8902";
+const LOT3: &str = "01890a5d-ac96-774b-bcce-b302099a8903";
+
+/// 一行的全部列：(列名, SQL 字面量)。
+type Row = Vec<(&'static str, String)>;
+
+fn lit(text: &str) -> String {
+    format!("'{text}'")
+}
+
+/// 把 `row` 中的一列换成另一个 SQL 字面量；列名不存在时 panic（测试写错）。
+fn with(mut row: Row, column: &str, value: &str) -> Row {
+    let slot = row
+        .iter_mut()
+        .find(|(name, _)| *name == column)
+        .unwrap_or_else(|| panic!("no column {column}"));
+    slot.1 = value.to_owned();
+    row
+}
+
+fn insert(conn: &Connection, table: &str, row: &Row) -> rusqlite::Result<usize> {
+    let columns: Vec<&str> = row.iter().map(|(name, _)| *name).collect();
+    let values: Vec<&str> = row.iter().map(|(_, value)| value.as_str()).collect();
+    conn.execute(
+        &format!(
+            "INSERT INTO {table} ({}) VALUES ({})",
+            columns.join(", "),
+            values.join(", ")
+        ),
+        [],
+    )
+}
+
+fn item_row(id: &str, code: &str) -> Row {
+    vec![
+        ("id", lit(id)),
+        ("code", lit(code)),
+        ("name", lit("高筋面粉")),
+        ("base_unit", lit("g")),
+        ("category", lit("RAW")),
+        ("default_shelf_life_ms", "NULL".into()),
+        ("active", "1".into()),
+        ("revision", "1".into()),
+    ]
+}
+
+fn item_unit_row(item_id: &str, unit_code: &str) -> Row {
+    vec![
+        ("item_id", lit(item_id)),
+        ("unit_code", lit(unit_code)),
+        ("base_qty_per_unit", "25000".into()),
+    ]
+}
+
+fn recipe_row(id: &str, code: &str) -> Row {
+    vec![
+        ("id", lit(id)),
+        ("code", lit(code)),
+        ("name", lit("吐司")),
+        ("output_item_id", lit(ITEM2)),
+        ("active", "1".into()),
+        ("revision", "1".into()),
+    ]
+}
+
+fn recipe_version_row(recipe_id: &str, version: i64) -> Row {
+    vec![
+        ("recipe_id", lit(recipe_id)),
+        ("version", version.to_string()),
+        ("output_qty_per_batch", "10".into()),
+    ]
+}
+
+fn recipe_line_row(recipe_id: &str, version: i64, line_no: i64, item_id: &str) -> Row {
+    vec![
+        ("recipe_id", lit(recipe_id)),
+        ("version", version.to_string()),
+        ("line_no", line_no.to_string()),
+        ("item_id", lit(item_id)),
+        ("qty_per_batch", "500".into()),
+    ]
+}
+
+fn supplier_row(id: &str, code: &str) -> Row {
+    vec![
+        ("id", lit(id)),
+        ("code", lit(code)),
+        ("name", lit("面粉供应商")),
+        ("contact_phone", "NULL".into()),
+        ("active", "1".into()),
+        ("revision", "1".into()),
+    ]
+}
+
+fn waste_reason_row(id: &str, code: &str) -> Row {
+    vec![
+        ("id", lit(id)),
+        ("code", lit(code)),
+        ("name", lit("过期")),
+        ("active", "1".into()),
+        ("revision", "1".into()),
+    ]
+}
+
+fn lot_row(lot_id: &str, source_event_seq: i64, source_line_no: i64) -> Row {
+    vec![
+        ("lot_id", lit(lot_id)),
+        ("item_id", lit(ITEM)),
+        ("origin", lit("RECEIPT")),
+        ("source_event_seq", source_event_seq.to_string()),
+        ("source_line_no", source_line_no.to_string()),
+        ("remaining_qty", "10".into()),
+        ("expires_at", "NULL".into()),
+        ("supplier_lot_no", "NULL".into()),
+    ]
+}
+
+fn unallocated_row(item_id: &str, qty: i64) -> Row {
+    vec![("item_id", lit(item_id)), ("qty", qty.to_string())]
+}
+
+/// 一条未被吸收的收货流水：新建批次 LOT，+10。
+fn movement_row(event_seq: i64, movement_no: i64) -> Row {
+    vec![
+        ("event_seq", event_seq.to_string()),
+        ("movement_no", movement_no.to_string()),
+        ("item_id", lit(ITEM)),
+        ("lot_id", lit(LOT)),
+        ("kind", lit("RECEIPT")),
+        ("alloc_source", lit("NEW_LOT")),
+        ("nominal_qty", "10".into()),
+        ("qty_delta", "10".into()),
+        ("absorbed_by_event_id", "NULL".into()),
+        ("physical_at", TS.to_string()),
+        ("business_date", lit("2026-10-05")),
+    ]
+}
+
+/// 一条被事件 EVT 吸收的报损流水。
+fn absorbed_row(event_seq: i64, movement_no: i64) -> Row {
+    vec![
+        ("event_seq", event_seq.to_string()),
+        ("movement_no", movement_no.to_string()),
+        ("item_id", lit(ITEM)),
+        ("lot_id", "NULL".into()),
+        ("kind", lit("WASTE")),
+        ("alloc_source", lit("ABSORBED")),
+        ("nominal_qty", "-3".into()),
+        ("qty_delta", "0".into()),
+        ("absorbed_by_event_id", lit(EVT)),
+        ("physical_at", TS.to_string()),
+        ("business_date", lit("2026-10-05")),
+    ]
+}
+
+fn count_row(event_seq: i64, item_id: &str) -> Row {
+    vec![
+        ("event_seq", event_seq.to_string()),
+        ("item_id", lit(item_id)),
+        ("observed_at", TS.to_string()),
+        ("book_qty", "10".into()),
+        ("counted_qty", "8".into()),
+    ]
+}
+
+/// 最新 schema，账本中已有 seq 1～3 三个事件，物料 ITEM、ITEM2 已存在。
+#[allow(clippy::unwrap_used)] // 测试夹具：前置数据写入失败时测试无法开始，直接终止。
+fn master_db() -> (TempDir, Connection) {
+    let (dir, conn) = fresh_db();
+    insert_command(&conn, CMD, "{}").unwrap();
+    for id in [EVT, EVT2, EVT3] {
+        Event::new(id).insert(&conn).unwrap();
+    }
+    insert(&conn, "items", &item_row(ITEM, "FLOUR")).unwrap();
+    insert(&conn, "items", &item_row(ITEM2, "TOAST")).unwrap();
+    (dir, conn)
+}
+
+/// master_db，另有批次 LOT（物料 ITEM，由 seq 1 建立）。
+#[allow(clippy::unwrap_used)] // 测试夹具：前置数据写入失败时测试无法开始，直接终止。
+fn inventory_db() -> (TempDir, Connection) {
+    let (dir, conn) = master_db();
+    insert(&conn, "inventory_lots", &lot_row(LOT, 1, 0)).unwrap();
+    (dir, conn)
+}
+
+fn count_rows(conn: &Connection, table: &str) -> rusqlite::Result<i64> {
+    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+        row.get(0)
+    })
+}
+
+fn immediate(conn: &mut Connection) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+    conn.transaction_with_behavior(TransactionBehavior::Immediate)
+}
+
+const TABLES_005: [&str; 11] = [
+    "items",
+    "item_units",
+    "recipes",
+    "recipe_versions",
+    "recipe_lines",
+    "suppliers",
+    "waste_reasons",
+    "inventory_lots",
+    "inventory_unallocated",
+    "inventory_movements",
+    "inventory_counts",
+];
+
+// AGENTS「迁移」：已有 004 数据（含设备与温度投影）的库升级到 005，原有表逐行不变；
+// 新表为空，视图 inventory_on_hand 没有行。
+#[test]
+#[allow(clippy::disallowed_methods)] // 锁定测试经 boh_storage::testing 取得原始连接。
+fn upgrades_a_version_4_database_without_losing_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut conn = open_writer(&dir.path().join("boh.db")).unwrap();
+    for sql in [MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004] {
+        conn.execute_batch(sql).unwrap();
+    }
+    conn.pragma_update(None, "user_version", 4).unwrap();
+    insert_meta(&conn, 1, STORE).unwrap();
+    insert_command(&conn, CMD, "{}").unwrap();
+    Event::new(EVT).insert(&conn).unwrap();
+    insert_equipment(&conn, EQUIPMENT, "F1", "Walk-in", "FREEZER", 1, 1).unwrap();
+    Reading::new(READING, 1).insert(&conn).unwrap();
+    let tables = [
+        "store_meta",
+        "processed_commands",
+        "store_events",
+        "equipment",
+        "temperature_readings",
+    ];
+    let before: Vec<_> = tables
+        .iter()
+        .map(|t| table_rows(&conn, t).unwrap())
+        .collect();
+
+    migrate(&mut conn).unwrap();
+
+    assert_eq!(schema_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
+    let after: Vec<_> = tables
+        .iter()
+        .map(|t| table_rows(&conn, t).unwrap())
+        .collect();
+    assert_eq!(after, before);
+    for table in TABLES_005 {
+        assert_eq!(count_rows(&conn, table).unwrap(), 0, "{table}");
+    }
+    assert_eq!(count_rows(&conn, "inventory_on_hand").unwrap(), 0);
+}
+
+// 005 + AGENTS「ID 与时间」：items、recipes、suppliers、waste_reasons 的主键与批次 lot_id 是 UUIDv7。
+#[test]
+fn master_data_and_lot_ids_reject_v4_uppercase_and_wrong_length() {
+    let (_dir, conn) = master_db();
+    for invalid in INVALID_IDS {
+        let value = lit(invalid);
+        for (table, row) in [
+            ("items", with(item_row(ITEM3, "X"), "id", &value)),
+            ("recipes", with(recipe_row(RECIPE, "X"), "id", &value)),
+            ("suppliers", with(supplier_row(SUPPLIER, "X"), "id", &value)),
+            (
+                "waste_reasons",
+                with(waste_reason_row(REASON, "X"), "id", &value),
+            ),
+            ("inventory_lots", with(lot_row(LOT, 1, 0), "lot_id", &value)),
+        ] {
+            assert_sqlite_error(insert(&conn, table, &row), ffi::SQLITE_CONSTRAINT_CHECK);
+        }
+    }
+    insert(&conn, "items", &item_row(ITEM3, "X")).unwrap();
+    insert(&conn, "recipes", &recipe_row(RECIPE, "X")).unwrap();
+    insert(&conn, "suppliers", &supplier_row(SUPPLIER, "X")).unwrap();
+    insert(&conn, "waste_reasons", &waste_reason_row(REASON, "X")).unwrap();
+    insert(&conn, "inventory_lots", &lot_row(LOT, 1, 0)).unwrap();
+}
+
+// domain「主数据」：code 在同一实体内唯一，停用的行也占用 code；不同实体可以用相同的 code。
+#[test]
+fn master_data_codes_are_unique_within_each_entity() {
+    let (_dir, conn) = master_db();
+    let duplicate = with(item_row(ITEM3, "FLOUR"), "active", "0");
+    assert_sqlite_error(
+        insert(&conn, "items", &duplicate),
+        ffi::SQLITE_CONSTRAINT_UNIQUE,
+    );
+    for (table, first, second) in [
+        (
+            "recipes",
+            recipe_row(RECIPE, "C1"),
+            recipe_row(RECIPE2, "C1"),
+        ),
+        (
+            "suppliers",
+            supplier_row(SUPPLIER, "C1"),
+            supplier_row(SUPPLIER2, "C1"),
+        ),
+        (
+            "waste_reasons",
+            waste_reason_row(REASON, "C1"),
+            waste_reason_row(REASON2, "C1"),
+        ),
+    ] {
+        insert(&conn, table, &with(first, "active", "0")).unwrap();
+        assert_sqlite_error(insert(&conn, table, &second), ffi::SQLITE_CONSTRAINT_UNIQUE);
+    }
+    insert(&conn, "items", &item_row(ITEM3, "C1")).unwrap();
+}
+
+// domain「主数据」：code、name 非空；active 是布尔值（0 / 1），revision 从 1 开始。
+#[test]
+fn master_data_text_flags_and_revisions_are_checked() {
+    let (_dir, conn) = master_db();
+    let rows: [(&str, Row); 4] = [
+        ("items", item_row(ITEM3, "X")),
+        ("recipes", recipe_row(RECIPE, "X")),
+        ("suppliers", supplier_row(SUPPLIER, "X")),
+        ("waste_reasons", waste_reason_row(REASON, "X")),
+    ];
+    for (table, row) in &rows {
+        for (column, value) in [
+            ("code", "''"),
+            ("name", "''"),
+            ("active", "-1"),
+            ("active", "2"),
+            ("revision", "0"),
+            ("revision", "-1"),
+        ] {
+            assert_sqlite_error(
+                insert(&conn, table, &with(row.clone(), column, value)),
+                ffi::SQLITE_CONSTRAINT_CHECK,
+            );
+        }
+        insert(&conn, table, &with(row.clone(), "active", "0")).unwrap();
+    }
+}
+
+// domain「主数据」ITEM：base_unit 只能是 g / ml / pcs，category 只能是 RAW / SEMI / FINISHED（区分大小写）；
+// default_shelf_life_ms 为 NULL（快照中省略）或正整数。
+#[test]
+fn item_enums_and_shelf_life_are_checked() {
+    let (_dir, conn) = master_db();
+    let invalid = [
+        ("base_unit", "'G'"),
+        ("base_unit", "'kg'"),
+        ("base_unit", "''"),
+        ("category", "'raw'"),
+        ("category", "'PACKAGING'"),
+        ("default_shelf_life_ms", "0"),
+        ("default_shelf_life_ms", "-1"),
+    ];
+    for (column, value) in invalid {
+        assert_sqlite_error(
+            insert(&conn, "items", &with(item_row(ITEM3, "X"), column, value)),
+            ffi::SQLITE_CONSTRAINT_CHECK,
+        );
+    }
+    let valid = [
+        ("g", "RAW", "NULL"),
+        ("ml", "SEMI", "1"),
+        ("pcs", "FINISHED", "259200000"),
+    ];
+    for (n, (base_unit, category, shelf_life)) in valid.into_iter().enumerate() {
+        let id = format!("01890a5d-ac96-774b-bcce-b302099a851{n}");
+        let row = with(
+            with(
+                with(
+                    item_row(&id, &format!("V{n}")),
+                    "base_unit",
+                    &lit(base_unit),
+                ),
+                "category",
+                &lit(category),
+            ),
+            "default_shelf_life_ms",
+            shelf_life,
+        );
+        insert(&conn, "items", &row).unwrap();
+    }
+}
+
+// domain「主数据」units：同一物料内 unit_code 唯一、非空，系数是正整数；item_id 引用物料，延迟到提交时检查。
+#[test]
+fn item_units_are_checked() {
+    let (_dir, mut conn) = master_db();
+    insert(&conn, "item_units", &item_unit_row(ITEM, "bag")).unwrap();
+    assert_sqlite_error(
+        insert(&conn, "item_units", &item_unit_row(ITEM, "bag")),
+        ffi::SQLITE_CONSTRAINT_PRIMARYKEY,
+    );
+    insert(&conn, "item_units", &item_unit_row(ITEM2, "bag")).unwrap();
+    for (column, value) in [
+        ("unit_code", "''"),
+        ("base_qty_per_unit", "0"),
+        ("base_qty_per_unit", "-1"),
+    ] {
+        assert_sqlite_error(
+            insert(
+                &conn,
+                "item_units",
+                &with(item_unit_row(ITEM, "box"), column, value),
+            ),
+            ffi::SQLITE_CONSTRAINT_CHECK,
+        );
+    }
+    insert(&conn, "item_units", &item_unit_row(ITEM, "box")).unwrap();
+
+    // 自动提交：语句结束即提交，立即拒绝。
+    assert_sqlite_error(
+        insert(&conn, "item_units", &item_unit_row(ITEM3, "bag")),
+        ffi::SQLITE_CONSTRAINT_FOREIGNKEY,
+    );
+    let tx = immediate(&mut conn).unwrap();
+    insert(&tx, "item_units", &item_unit_row(ITEM3, "bag")).unwrap();
+    assert_sqlite_error(tx.commit(), ffi::SQLITE_CONSTRAINT_FOREIGNKEY);
+    let tx = immediate(&mut conn).unwrap();
+    insert(&tx, "item_units", &item_unit_row(ITEM3, "bag")).unwrap();
+    insert(&tx, "items", &item_row(ITEM3, "BUTTER")).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(count_rows(&conn, "item_units").unwrap(), 4);
+}
+
+// domain「主数据」RECIPE：output_item_id 引用物料，延迟到提交时检查。
+#[test]
+fn recipe_output_item_is_checked_at_commit() {
+    let (_dir, mut conn) = master_db();
+    let orphan = with(recipe_row(RECIPE, "R1"), "output_item_id", &lit(ITEM3));
+    assert_sqlite_error(
+        insert(&conn, "recipes", &orphan),
+        ffi::SQLITE_CONSTRAINT_FOREIGNKEY,
+    );
+    let tx = immediate(&mut conn).unwrap();
+    insert(&tx, "recipes", &orphan).unwrap();
+    assert_sqlite_error(tx.commit(), ffi::SQLITE_CONSTRAINT_FOREIGNKEY);
+    let tx = immediate(&mut conn).unwrap();
+    insert(&tx, "recipes", &orphan).unwrap();
+    insert(&tx, "items", &item_row(ITEM3, "BRIOCHE")).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(count_rows(&conn, "recipes").unwrap(), 1);
+}
+
+// domain「主数据」versions：version 从 1 开始、在同一配方内唯一，产出数量是正整数；recipe_id 引用配方，延迟检查。
+#[test]
+fn recipe_versions_are_checked() {
+    let (_dir, mut conn) = master_db();
+    insert(&conn, "recipes", &recipe_row(RECIPE, "R1")).unwrap();
+    insert(&conn, "recipe_versions", &recipe_version_row(RECIPE, 1)).unwrap();
+    assert_sqlite_error(
+        insert(&conn, "recipe_versions", &recipe_version_row(RECIPE, 1)),
+        ffi::SQLITE_CONSTRAINT_PRIMARYKEY,
+    );
+    for (column, value) in [
+        ("version", "0"),
+        ("version", "-1"),
+        ("output_qty_per_batch", "0"),
+        ("output_qty_per_batch", "-10"),
+    ] {
+        assert_sqlite_error(
+            insert(
+                &conn,
+                "recipe_versions",
+                &with(recipe_version_row(RECIPE, 2), column, value),
+            ),
+            ffi::SQLITE_CONSTRAINT_CHECK,
+        );
+    }
+    insert(&conn, "recipe_versions", &recipe_version_row(RECIPE, 2)).unwrap();
+
+    assert_sqlite_error(
+        insert(&conn, "recipe_versions", &recipe_version_row(RECIPE2, 1)),
+        ffi::SQLITE_CONSTRAINT_FOREIGNKEY,
+    );
+    let tx = immediate(&mut conn).unwrap();
+    insert(&tx, "recipe_versions", &recipe_version_row(RECIPE2, 1)).unwrap();
+    assert_sqlite_error(tx.commit(), ffi::SQLITE_CONSTRAINT_FOREIGNKEY);
+    let tx = immediate(&mut conn).unwrap();
+    insert(&tx, "recipe_versions", &recipe_version_row(RECIPE2, 1)).unwrap();
+    insert(&tx, "recipes", &recipe_row(RECIPE2, "R2")).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(count_rows(&conn, "recipe_versions").unwrap(), 3);
+}
+
+// domain「主数据」lines：同一版本内 item_id 不重复、line_no 从 0 起唯一，用量是正整数；
+// (recipe_id, version) 引用配方版本，item_id 引用物料，都延迟到提交时检查。
+#[test]
+fn recipe_lines_are_checked() {
+    let (_dir, mut conn) = master_db();
+    insert(&conn, "recipes", &recipe_row(RECIPE, "R1")).unwrap();
+    insert(&conn, "recipe_versions", &recipe_version_row(RECIPE, 1)).unwrap();
+    insert(&conn, "recipe_versions", &recipe_version_row(RECIPE, 2)).unwrap();
+    insert(&conn, "recipe_lines", &recipe_line_row(RECIPE, 1, 0, ITEM)).unwrap();
+    assert_sqlite_error(
+        insert(&conn, "recipe_lines", &recipe_line_row(RECIPE, 1, 0, ITEM2)),
+        ffi::SQLITE_CONSTRAINT_PRIMARYKEY,
+    );
+    assert_sqlite_error(
+        insert(&conn, "recipe_lines", &recipe_line_row(RECIPE, 1, 1, ITEM)),
+        ffi::SQLITE_CONSTRAINT_UNIQUE,
+    );
+    // 同一物料可以出现在另一个版本中。
+    insert(&conn, "recipe_lines", &recipe_line_row(RECIPE, 2, 0, ITEM)).unwrap();
+    for (column, value) in [
+        ("line_no", "-1"),
+        ("qty_per_batch", "0"),
+        ("qty_per_batch", "-500"),
+    ] {
+        assert_sqlite_error(
+            insert(
+                &conn,
+                "recipe_lines",
+                &with(recipe_line_row(RECIPE, 1, 1, ITEM2), column, value),
+            ),
+            ffi::SQLITE_CONSTRAINT_CHECK,
+        );
+    }
+    insert(&conn, "recipe_lines", &recipe_line_row(RECIPE, 1, 1, ITEM2)).unwrap();
+
+    for orphan in [
+        recipe_line_row(RECIPE, 3, 0, ITEM),
+        recipe_line_row(RECIPE, 2, 1, ITEM3),
+    ] {
+        assert_sqlite_error(
+            insert(&conn, "recipe_lines", &orphan),
+            ffi::SQLITE_CONSTRAINT_FOREIGNKEY,
+        );
+        let tx = immediate(&mut conn).unwrap();
+        insert(&tx, "recipe_lines", &orphan).unwrap();
+        assert_sqlite_error(tx.commit(), ffi::SQLITE_CONSTRAINT_FOREIGNKEY);
+    }
+    let tx = immediate(&mut conn).unwrap();
+    insert(&tx, "recipe_lines", &recipe_line_row(RECIPE, 3, 0, ITEM3)).unwrap();
+    insert(&tx, "recipe_versions", &recipe_version_row(RECIPE, 3)).unwrap();
+    insert(&tx, "items", &item_row(ITEM3, "BUTTER")).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(count_rows(&conn, "recipe_lines").unwrap(), 4);
+}
+
+// domain「主数据」SUPPLIER：contact_phone 为 NULL（快照中省略）或非空文本。
+#[test]
+fn supplier_contact_phone_is_null_or_non_empty() {
+    let (_dir, conn) = master_db();
+    assert_sqlite_error(
+        insert(
+            &conn,
+            "suppliers",
+            &with(supplier_row(SUPPLIER, "S1"), "contact_phone", "''"),
+        ),
+        ffi::SQLITE_CONSTRAINT_CHECK,
+    );
+    insert(&conn, "suppliers", &supplier_row(SUPPLIER, "S1")).unwrap();
+    insert(
+        &conn,
+        "suppliers",
+        &with(
+            supplier_row(SUPPLIER2, "S2"),
+            "contact_phone",
+            "'021-5555 0101 转 8'",
+        ),
+    )
+    .unwrap();
+}
+
+// domain「批次」「投影表」：origin 枚举、source_line_no 从 0 开始、余量非负、(source_event_seq, source_line_no) 唯一，
+// supplier_lot_no 为 NULL 或非空；source_event_seq 立即引用账本中的事件，item_id 延迟引用物料。
+#[test]
+fn inventory_lots_are_checked() {
+    let (_dir, mut conn) = master_db();
+    for (n, origin) in ["RECEIPT", "PRODUCTION", "COUNT_GAIN"].iter().enumerate() {
+        let id = format!("01890a5d-ac96-774b-bcce-b302099a891{n}");
+        let row = with(lot_row(&id, 2, n as i64), "origin", &lit(origin));
+        insert(&conn, "inventory_lots", &row).unwrap();
+    }
+    assert_sqlite_error(
+        insert(&conn, "inventory_lots", &lot_row(LOT, 2, 0)),
+        ffi::SQLITE_CONSTRAINT_UNIQUE,
+    );
+    for (column, value) in [
+        ("origin", "'receipt'"),
+        ("origin", "'TRANSFER'"),
+        ("source_line_no", "-1"),
+        ("remaining_qty", "-1"),
+        ("supplier_lot_no", "''"),
+    ] {
+        assert_sqlite_error(
+            insert(
+                &conn,
+                "inventory_lots",
+                &with(lot_row(LOT, 1, 0), column, value),
+            ),
+            ffi::SQLITE_CONSTRAINT_CHECK,
+        );
+    }
+    for seq in [0, 4] {
+        assert_sqlite_error(
+            insert(&conn, "inventory_lots", &lot_row(LOT, seq, 0)),
+            ffi::SQLITE_CONSTRAINT_FOREIGNKEY,
+        );
+    }
+    let full = with(
+        with(
+            with(lot_row(LOT, 1, 0), "remaining_qty", "0"),
+            "expires_at",
+            &TS.to_string(),
+        ),
+        "supplier_lot_no",
+        "'B-2026-10'",
+    );
+    insert(&conn, "inventory_lots", &full).unwrap();
+
+    let orphan = with(lot_row(LOT2, 3, 0), "item_id", &lit(ITEM3));
+    let tx = immediate(&mut conn).unwrap();
+    insert(&tx, "inventory_lots", &orphan).unwrap();
+    assert_sqlite_error(tx.commit(), ffi::SQLITE_CONSTRAINT_FOREIGNKEY);
+    let tx = immediate(&mut conn).unwrap();
+    insert(&tx, "inventory_lots", &orphan).unwrap();
+    insert(&tx, "items", &item_row(ITEM3, "BUTTER")).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(count_rows(&conn, "inventory_lots").unwrap(), 5);
+}
+
+// domain「批次」账外缺口：每个物料至多一行，qty <= 0；item_id 延迟引用物料。
+#[test]
+fn inventory_unallocated_is_checked() {
+    let (_dir, mut conn) = master_db();
+    assert_sqlite_error(
+        insert(&conn, "inventory_unallocated", &unallocated_row(ITEM, 1)),
+        ffi::SQLITE_CONSTRAINT_CHECK,
+    );
+    insert(&conn, "inventory_unallocated", &unallocated_row(ITEM, -2)).unwrap();
+    assert_sqlite_error(
+        insert(&conn, "inventory_unallocated", &unallocated_row(ITEM, -3)),
+        ffi::SQLITE_CONSTRAINT_PRIMARYKEY,
+    );
+    insert(&conn, "inventory_unallocated", &unallocated_row(ITEM2, 0)).unwrap();
+
+    let tx = immediate(&mut conn).unwrap();
+    insert(&tx, "inventory_unallocated", &unallocated_row(ITEM3, -1)).unwrap();
+    assert_sqlite_error(tx.commit(), ffi::SQLITE_CONSTRAINT_FOREIGNKEY);
+    assert_eq!(count_rows(&conn, "inventory_unallocated").unwrap(), 2);
+}
+
+// domain「投影表」流水：kind、alloc_source 枚举；(event_seq, movement_no) 唯一，movement_no 从 0 开始；营业日是真实日期；
+// event_seq、absorbed_by_event_id 立即引用账本，lot_id、item_id 延迟引用批次和物料。
+#[test]
+fn inventory_movement_columns_are_checked() {
+    let (_dir, mut conn) = inventory_db();
+    let kinds = ["RECEIPT", "PRODUCE", "CONSUME", "WASTE", "ADJUST"];
+    for (movement_no, kind) in kinds.iter().enumerate() {
+        let row = with(movement_row(1, movement_no as i64), "kind", &lit(kind));
+        insert(&conn, "inventory_movements", &row).unwrap();
+    }
+    assert_sqlite_error(
+        insert(&conn, "inventory_movements", &movement_row(1, 0)),
+        ffi::SQLITE_CONSTRAINT_PRIMARYKEY,
+    );
+    for (column, value) in [
+        ("kind", "'receipt'"),
+        ("kind", "'TRANSFER'"),
+        ("alloc_source", "'new_lot'"),
+        ("alloc_source", "'MANUAL'"),
+        ("movement_no", "-1"),
+        ("business_date", "'2026-02-30'"),
+        ("business_date", "'2026/10/05'"),
+    ] {
+        assert_sqlite_error(
+            insert(
+                &conn,
+                "inventory_movements",
+                &with(movement_row(2, 0), column, value),
+            ),
+            ffi::SQLITE_CONSTRAINT_CHECK,
+        );
+    }
+    for (column, value) in [
+        ("event_seq", "0"),
+        ("event_seq", "4"),
+        (
+            "absorbed_by_event_id",
+            "'01890a5d-ac96-774b-bcce-b302099a80ff'",
+        ),
+    ] {
+        let row = if column == "absorbed_by_event_id" {
+            with(absorbed_row(2, 0), column, value)
+        } else {
+            with(movement_row(2, 0), column, value)
+        };
+        assert_sqlite_error(
+            insert(&conn, "inventory_movements", &row),
+            ffi::SQLITE_CONSTRAINT_FOREIGNKEY,
+        );
+    }
+    for (column, value) in [("lot_id", lit(LOT2)), ("item_id", lit(ITEM3))] {
+        let tx = immediate(&mut conn).unwrap();
+        insert(
+            &tx,
+            "inventory_movements",
+            &with(movement_row(2, 0), column, &value),
+        )
+        .unwrap();
+        assert_sqlite_error(tx.commit(), ffi::SQLITE_CONSTRAINT_FOREIGNKEY);
+    }
+    assert_eq!(count_rows(&conn, "inventory_movements").unwrap(), 5);
+}
+
+// domain「盘点吸收」「投影表」：未被吸收的行 qty_delta = nominal_qty、alloc_source 不是 ABSORBED；
+// 被吸收的行带 absorbed_by_event_id、alloc_source = ABSORBED、qty_delta = 0、lot_id 为 NULL。
+// 指定 / FIFO / 新建批次的行必须带 lot_id，账外缺口（SHORTFALL）的行不带。
+#[test]
+fn inventory_movement_absorption_and_lot_rules_are_checked() {
+    let (_dir, conn) = inventory_db();
+    let rejected: Vec<Row> = vec![
+        with(movement_row(2, 0), "qty_delta", "9"),
+        with(movement_row(2, 0), "alloc_source", "'ABSORBED'"),
+        with(movement_row(2, 0), "absorbed_by_event_id", &lit(EVT)),
+        with(absorbed_row(2, 0), "alloc_source", "'FIFO'"),
+        with(absorbed_row(2, 0), "absorbed_by_event_id", "NULL"),
+        with(absorbed_row(2, 0), "qty_delta", "-3"),
+        with(absorbed_row(2, 0), "lot_id", &lit(LOT)),
+        with(movement_row(2, 0), "lot_id", "NULL"),
+        with(
+            with(movement_row(2, 0), "alloc_source", "'SPECIFIED'"),
+            "lot_id",
+            "NULL",
+        ),
+        with(
+            with(movement_row(2, 0), "alloc_source", "'FIFO'"),
+            "lot_id",
+            "NULL",
+        ),
+        with(movement_row(2, 0), "alloc_source", "'SHORTFALL'"),
+    ];
+    for row in &rejected {
+        assert_sqlite_error(
+            insert(&conn, "inventory_movements", row),
+            ffi::SQLITE_CONSTRAINT_CHECK,
+        );
+    }
+
+    let negative = |row: Row| with(with(row, "nominal_qty", "-4"), "qty_delta", "-4");
+    let accepted: Vec<Row> = vec![
+        absorbed_row(2, 0),
+        negative(with(movement_row(2, 1), "alloc_source", "'SPECIFIED'")),
+        negative(with(movement_row(2, 2), "alloc_source", "'FIFO'")),
+        negative(with(
+            with(movement_row(2, 3), "alloc_source", "'SHORTFALL'"),
+            "lot_id",
+            "NULL",
+        )),
+        with(movement_row(2, 4), "alloc_source", "'CORRECTION'"),
+        with(
+            with(movement_row(2, 5), "alloc_source", "'REVERSAL'"),
+            "lot_id",
+            "NULL",
+        ),
+        with(
+            with(movement_row(2, 6), "alloc_source", "'COUNT'"),
+            "lot_id",
+            "NULL",
+        ),
+        with(movement_row(2, 7), "alloc_source", "'COUNT'"),
+    ];
+    for row in &accepted {
+        insert(&conn, "inventory_movements", row).unwrap();
+    }
+    assert_eq!(count_rows(&conn, "inventory_movements").unwrap(), 8);
+}
+
+// domain「盘点」盘点投影：每次盘点的每个物料至多一行；counted_qty 非负，book_qty 可以为负（含账外缺口）；
+// event_seq 立即引用账本，item_id 延迟引用物料。
+#[test]
+fn inventory_counts_are_checked() {
+    let (_dir, mut conn) = master_db();
+    insert(&conn, "inventory_counts", &count_row(1, ITEM)).unwrap();
+    assert_sqlite_error(
+        insert(&conn, "inventory_counts", &count_row(1, ITEM)),
+        ffi::SQLITE_CONSTRAINT_PRIMARYKEY,
+    );
+    insert(&conn, "inventory_counts", &count_row(2, ITEM)).unwrap();
+    assert_sqlite_error(
+        insert(
+            &conn,
+            "inventory_counts",
+            &with(count_row(1, ITEM2), "counted_qty", "-1"),
+        ),
+        ffi::SQLITE_CONSTRAINT_CHECK,
+    );
+    insert(
+        &conn,
+        "inventory_counts",
+        &with(
+            with(count_row(1, ITEM2), "book_qty", "-2"),
+            "counted_qty",
+            "0",
+        ),
+    )
+    .unwrap();
+    assert_sqlite_error(
+        insert(&conn, "inventory_counts", &count_row(4, ITEM)),
+        ffi::SQLITE_CONSTRAINT_FOREIGNKEY,
+    );
+    let tx = immediate(&mut conn).unwrap();
+    insert(&tx, "inventory_counts", &count_row(3, ITEM3)).unwrap();
+    assert_sqlite_error(tx.commit(), ffi::SQLITE_CONSTRAINT_FOREIGNKEY);
+    assert_eq!(count_rows(&conn, "inventory_counts").unwrap(), 3);
+}
+
+// domain「盘点吸收」：吸收判定按 (item_id, observed_at, event_seq) 查找最早的盘点，索引覆盖这三列，不排序。
+#[test]
+fn count_index_serves_the_absorption_query() {
+    let (_dir, conn) = master_db();
+    let columns: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_index_info('idx_inventory_counts_item') ORDER BY seqno")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(columns, ["item_id", "observed_at", "event_seq"]);
+    let plan: Vec<String> = conn
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT e.id FROM inventory_counts c JOIN store_events e ON e.seq = c.event_seq
+             WHERE c.item_id = ?1 AND c.observed_at > ?2
+             ORDER BY c.observed_at, c.event_seq LIMIT 1",
+        )
+        .unwrap()
+        .query_map(params![ITEM, TS], |r| r.get(3))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(
+        plan.iter().any(|step| step.starts_with("SEARCH c USING")
+            && step.contains("INDEX idx_inventory_counts_item")),
+        "{plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|step| step.contains("TEMP B-TREE")),
+        "{plan:?}"
+    );
+}
+
+// domain「批次」「投影表」：账面数（视图 inventory_on_hand）= 批次余量之和 + 账外缺口；每个物料一行，没有库存为 0。
+#[test]
+fn inventory_on_hand_sums_lots_and_shortfall() {
+    let (_dir, conn) = inventory_db();
+    insert(&conn, "items", &item_row(ITEM3, "BUTTER")).unwrap();
+    insert(
+        &conn,
+        "inventory_lots",
+        &with(lot_row(LOT2, 2, 0), "remaining_qty", "7"),
+    )
+    .unwrap();
+    insert(
+        &conn,
+        "inventory_lots",
+        &with(lot_row(LOT3, 2, 1), "remaining_qty", "0"),
+    )
+    .unwrap();
+    insert(&conn, "inventory_unallocated", &unallocated_row(ITEM, -2)).unwrap();
+    insert(&conn, "inventory_unallocated", &unallocated_row(ITEM2, -5)).unwrap();
+
+    let on_hand: Vec<(String, i64)> = conn
+        .prepare("SELECT item_id, qty FROM inventory_on_hand ORDER BY item_id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        on_hand,
+        [(ITEM.into(), 15), (ITEM2.into(), -5), (ITEM3.into(), 0)]
+    );
+}
+
+// AGENTS「SQLite」所有表用 STRICT：005 各表的 INTEGER 列不接受非整数文本或小数。
+#[test]
+fn tables_005_are_strict() {
+    let (_dir, conn) = inventory_db();
+    let cases: [(&str, Row, &[&str]); 11] = [
+        (
+            "items",
+            item_row(ITEM3, "X"),
+            &["default_shelf_life_ms", "active", "revision"],
+        ),
+        (
+            "item_units",
+            item_unit_row(ITEM, "bag"),
+            &["base_qty_per_unit"],
+        ),
+        ("recipes", recipe_row(RECIPE, "X"), &["active", "revision"]),
+        (
+            "recipe_versions",
+            recipe_version_row(RECIPE, 1),
+            &["version", "output_qty_per_batch"],
+        ),
+        (
+            "recipe_lines",
+            recipe_line_row(RECIPE, 1, 0, ITEM),
+            &["version", "line_no", "qty_per_batch"],
+        ),
+        (
+            "suppliers",
+            supplier_row(SUPPLIER, "X"),
+            &["active", "revision"],
+        ),
+        (
+            "waste_reasons",
+            waste_reason_row(REASON, "X"),
+            &["active", "revision"],
+        ),
+        (
+            "inventory_lots",
+            lot_row(LOT2, 2, 0),
+            &[
+                "source_event_seq",
+                "source_line_no",
+                "remaining_qty",
+                "expires_at",
+            ],
+        ),
+        ("inventory_unallocated", unallocated_row(ITEM, -1), &["qty"]),
+        (
+            "inventory_movements",
+            movement_row(1, 0),
+            &[
+                "event_seq",
+                "movement_no",
+                "nominal_qty",
+                "qty_delta",
+                "physical_at",
+            ],
+        ),
+        (
+            "inventory_counts",
+            count_row(1, ITEM),
+            &["event_seq", "observed_at", "book_qty", "counted_qty"],
+        ),
+    ];
+    for (table, row, columns) in &cases {
+        for column in *columns {
+            for value in ["'many'", "2.5"] {
+                assert_sqlite_error(
+                    insert(&conn, table, &with(row.clone(), column, value)),
+                    ffi::SQLITE_CONSTRAINT_DATATYPE,
+                );
+            }
+        }
+    }
+}
+
+// AGENTS「只追加」：005 的表都是投影，没有只追加触发器；重建在一个事务内按任意顺序清空再重写，提交时引用完整即可。
+// 只删物料、留下引用它的行，则在提交时拒绝。
+#[test]
+fn tables_005_can_be_cleared_and_rewritten() {
+    let (_dir, mut conn) = inventory_db();
+    let rows: Vec<(&str, Row)> = vec![
+        ("item_units", item_unit_row(ITEM, "bag")),
+        ("recipes", recipe_row(RECIPE, "R1")),
+        ("recipe_versions", recipe_version_row(RECIPE, 1)),
+        ("recipe_lines", recipe_line_row(RECIPE, 1, 0, ITEM)),
+        ("suppliers", supplier_row(SUPPLIER, "S1")),
+        ("waste_reasons", waste_reason_row(REASON, "EXPIRED")),
+        ("inventory_unallocated", unallocated_row(ITEM, -2)),
+        ("inventory_movements", movement_row(1, 0)),
+        ("inventory_counts", count_row(3, ITEM)),
+    ];
+    for (table, row) in &rows {
+        insert(&conn, table, row).unwrap();
+    }
+    for table in TABLES_005 {
+        assert!(
+            conn.execute(&format!("UPDATE {table} SET rowid = rowid"), [])
+                .unwrap()
+                >= 1,
+            "{table}"
+        );
+    }
+
+    let tx = immediate(&mut conn).unwrap();
+    tx.execute("DELETE FROM items", []).unwrap();
+    assert_sqlite_error(tx.commit(), ffi::SQLITE_CONSTRAINT_FOREIGNKEY);
+    assert_eq!(count_rows(&conn, "items").unwrap(), 2);
+
+    let tx = immediate(&mut conn).unwrap();
+    for table in TABLES_005 {
+        tx.execute(&format!("DELETE FROM {table}"), []).unwrap();
+    }
+    for (table, row) in rows.iter().rev() {
+        insert(&tx, table, row).unwrap();
+    }
+    insert(&tx, "inventory_lots", &lot_row(LOT, 1, 0)).unwrap();
+    insert(&tx, "items", &item_row(ITEM2, "TOAST")).unwrap();
+    insert(&tx, "items", &item_row(ITEM, "FLOUR")).unwrap();
+    tx.commit().unwrap();
+    for table in TABLES_005 {
+        assert!(count_rows(&conn, table).unwrap() >= 1, "{table}");
+    }
 }

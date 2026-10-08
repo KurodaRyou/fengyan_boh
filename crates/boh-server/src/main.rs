@@ -63,11 +63,15 @@ async fn run(
     let clock = Clock::system();
     let store_id = config.store_id;
     if operation == Operation::Init {
-        let now = clock.now();
-        writer
-            .call(move |tx| boh_storage::store::initialize(tx, store_id, now))
-            .await
-            .context("initialize store")?;
+        boh_app::initialize_store(
+            writer,
+            store_id,
+            clock,
+            config.timezone,
+            config.business_day_cutoff,
+        )
+        .await
+        .context("initialize store")?;
         tracing::info!(store_id = %store_id, "store initialized");
         return Ok(());
     }

@@ -4,19 +4,21 @@ use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, put};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use boh_storage::{StorageError, schema_version};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::AppState;
+use crate::service::master_data;
 use crate::{
     actor::{Actor, Manager},
     service,
 };
 use boh_domain::AggregateId;
 use boh_domain::equipment::{CreateEquipment, UpdateEquipment};
+use boh_domain::master_data::*;
 use boh_domain::temperature::{LogTemperature, TemperatureQuery};
 use boh_domain::time::TimeError;
 
@@ -148,6 +150,27 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/temperature-readings",
             get(list_temperature_readings).post(log_temperature),
         )
+        .route("/api/v1/items", get(list_items).post(create_item))
+        .route("/api/v1/items/{item_id}", put(update_item))
+        .route("/api/v1/recipes", get(list_recipes).post(create_recipe))
+        .route("/api/v1/recipes/{recipe_id}", put(update_recipe))
+        .route(
+            "/api/v1/suppliers",
+            get(list_suppliers).post(create_supplier),
+        )
+        .route("/api/v1/suppliers/{supplier_id}", put(update_supplier))
+        .route(
+            "/api/v1/waste-reasons",
+            get(list_waste_reasons).post(create_waste_reason),
+        )
+        .route(
+            "/api/v1/waste-reasons/{waste_reason_id}",
+            put(update_waste_reason),
+        )
+        .route(
+            "/api/v1/recipes/{recipe_id}/versions",
+            post(add_recipe_version),
+        )
         .fallback(route_not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(state)
@@ -217,6 +240,163 @@ async fn list_temperature_readings(
     Ok(ok(serde_json::json!({
         "temperature_readings": service::list_temperature_readings(state, query).await?
     })))
+}
+
+async fn list_items(
+    State(state): State<AppState>,
+    _actor: Actor,
+) -> Result<Json<Envelope<Value>>, ApiError> {
+    Ok(ok(
+        serde_json::json!({ "items": master_data::list_items(state).await? }),
+    ))
+}
+
+async fn create_item(
+    State(state): State<AppState>,
+    Manager(actor): Manager,
+    body: Result<Json<CreateItem>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Json(command) = body.map_err(|_| ApiError::validation())?;
+    command.validate().map_err(|_| ApiError::validation())?;
+    Ok(Json(master_data::create_item(state, actor, command).await?))
+}
+
+async fn update_item(
+    State(state): State<AppState>,
+    Manager(actor): Manager,
+    path: Result<Path<String>, PathRejection>,
+    body: Result<Json<UpdateItem>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Path(id) = path.map_err(|_| ApiError::validation())?;
+    let id = AggregateId::parse(&id).map_err(|_| ApiError::validation())?;
+    let Json(command) = body.map_err(|_| ApiError::validation())?;
+    command.validate().map_err(|_| ApiError::validation())?;
+    Ok(Json(
+        master_data::update_item(state, actor, id, command).await?,
+    ))
+}
+
+async fn list_recipes(
+    State(state): State<AppState>,
+    _actor: Actor,
+) -> Result<Json<Envelope<Value>>, ApiError> {
+    Ok(ok(
+        serde_json::json!({ "recipes": master_data::list_recipes(state).await? }),
+    ))
+}
+
+async fn create_recipe(
+    State(state): State<AppState>,
+    Manager(actor): Manager,
+    body: Result<Json<CreateRecipe>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Json(command) = body.map_err(|_| ApiError::validation())?;
+    command.validate().map_err(|_| ApiError::validation())?;
+    Ok(Json(
+        master_data::create_recipe(state, actor, command).await?,
+    ))
+}
+
+async fn update_recipe(
+    State(state): State<AppState>,
+    Manager(actor): Manager,
+    path: Result<Path<String>, PathRejection>,
+    body: Result<Json<UpdateRecipe>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Path(id) = path.map_err(|_| ApiError::validation())?;
+    let id = AggregateId::parse(&id).map_err(|_| ApiError::validation())?;
+    let Json(command) = body.map_err(|_| ApiError::validation())?;
+    command.validate().map_err(|_| ApiError::validation())?;
+    Ok(Json(
+        master_data::update_recipe(state, actor, id, command).await?,
+    ))
+}
+
+async fn list_suppliers(
+    State(state): State<AppState>,
+    _actor: Actor,
+) -> Result<Json<Envelope<Value>>, ApiError> {
+    Ok(ok(
+        serde_json::json!({ "suppliers": master_data::list_suppliers(state).await? }),
+    ))
+}
+
+async fn create_supplier(
+    State(state): State<AppState>,
+    Manager(actor): Manager,
+    body: Result<Json<CreateSupplier>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Json(command) = body.map_err(|_| ApiError::validation())?;
+    command.validate().map_err(|_| ApiError::validation())?;
+    Ok(Json(
+        master_data::create_supplier(state, actor, command).await?,
+    ))
+}
+
+async fn update_supplier(
+    State(state): State<AppState>,
+    Manager(actor): Manager,
+    path: Result<Path<String>, PathRejection>,
+    body: Result<Json<UpdateSupplier>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Path(id) = path.map_err(|_| ApiError::validation())?;
+    let id = AggregateId::parse(&id).map_err(|_| ApiError::validation())?;
+    let Json(command) = body.map_err(|_| ApiError::validation())?;
+    command.validate().map_err(|_| ApiError::validation())?;
+    Ok(Json(
+        master_data::update_supplier(state, actor, id, command).await?,
+    ))
+}
+
+async fn list_waste_reasons(
+    State(state): State<AppState>,
+    _actor: Actor,
+) -> Result<Json<Envelope<Value>>, ApiError> {
+    Ok(ok(
+        serde_json::json!({ "waste_reasons": master_data::list_waste_reasons(state).await? }),
+    ))
+}
+
+async fn create_waste_reason(
+    State(state): State<AppState>,
+    Manager(actor): Manager,
+    body: Result<Json<CreateWasteReason>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Json(command) = body.map_err(|_| ApiError::validation())?;
+    command.validate().map_err(|_| ApiError::validation())?;
+    Ok(Json(
+        master_data::create_waste_reason(state, actor, command).await?,
+    ))
+}
+
+async fn update_waste_reason(
+    State(state): State<AppState>,
+    Manager(actor): Manager,
+    path: Result<Path<String>, PathRejection>,
+    body: Result<Json<UpdateWasteReason>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Path(id) = path.map_err(|_| ApiError::validation())?;
+    let id = AggregateId::parse(&id).map_err(|_| ApiError::validation())?;
+    let Json(command) = body.map_err(|_| ApiError::validation())?;
+    command.validate().map_err(|_| ApiError::validation())?;
+    Ok(Json(
+        master_data::update_waste_reason(state, actor, id, command).await?,
+    ))
+}
+
+async fn add_recipe_version(
+    State(state): State<AppState>,
+    Manager(actor): Manager,
+    path: Result<Path<String>, PathRejection>,
+    body: Result<Json<AddRecipeVersion>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Path(id) = path.map_err(|_| ApiError::validation())?;
+    let id = AggregateId::parse(&id).map_err(|_| ApiError::validation())?;
+    let Json(command) = body.map_err(|_| ApiError::validation())?;
+    command.validate().map_err(|_| ApiError::validation())?;
+    Ok(Json(
+        master_data::add_recipe_version(state, actor, id, command).await?,
+    ))
 }
 
 #[derive(Debug, Serialize)]

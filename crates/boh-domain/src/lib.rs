@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub mod equipment;
+pub mod master_data;
 pub mod temperature;
 pub mod time;
 
@@ -29,7 +30,7 @@ macro_rules! uuid_v7_id {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-        #[serde(try_from = "Uuid", into = "Uuid")]
+        #[serde(try_from = "String", into = "Uuid")]
         pub struct $name(Uuid);
 
         impl $name {
@@ -54,6 +55,9 @@ macro_rules! uuid_v7_id {
 
             pub fn parse(s: &str) -> Result<Self, DomainError> {
                 let id = Uuid::parse_str(s).map_err(|_| DomainError::InvalidId(s.to_owned()))?;
+                if id.to_string() != s {
+                    return Err(DomainError::InvalidId(s.to_owned()));
+                }
                 Self::from_uuid(id)
             }
 
@@ -67,6 +71,14 @@ macro_rules! uuid_v7_id {
 
             fn try_from(id: Uuid) -> Result<Self, DomainError> {
                 Self::from_uuid(id)
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = DomainError;
+
+            fn try_from(text: String) -> Result<Self, DomainError> {
+                Self::parse(&text)
             }
         }
 
@@ -145,5 +157,27 @@ mod tests {
         let ok: CommandId = serde_json::from_str(&format!("\"{V7}\"")).unwrap();
         assert_eq!(ok.to_string(), V7);
         assert!(serde_json::from_str::<CommandId>(&format!("\"{V4}\"")).is_err());
+    }
+
+    #[test]
+    fn every_id_parser_and_deserializer_requires_canonical_text() {
+        for text in [
+            V7.to_uppercase(),
+            V7.replace('-', ""),
+            format!("{{{V7}}}"),
+            format!("urn:uuid:{V7}"),
+        ] {
+            let json = serde_json::to_string(&text).unwrap();
+            assert!(CommandId::parse(&text).is_err());
+            assert!(AggregateId::parse(&text).is_err());
+            assert!(StoreId::parse(&text).is_err());
+            assert!(EventId::parse(&text).is_err());
+            assert!(BackupId::parse(&text).is_err());
+            assert!(serde_json::from_str::<CommandId>(&json).is_err());
+            assert!(serde_json::from_str::<AggregateId>(&json).is_err());
+            assert!(serde_json::from_str::<StoreId>(&json).is_err());
+            assert!(serde_json::from_str::<EventId>(&json).is_err());
+            assert!(serde_json::from_str::<BackupId>(&json).is_err());
+        }
     }
 }
