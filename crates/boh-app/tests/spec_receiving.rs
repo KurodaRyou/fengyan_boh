@@ -414,6 +414,7 @@ fn receipt(reply: &JsonReply) -> &Value {
     receipt
 }
 
+#[allow(clippy::unwrap_used)] // 测试夹具：调用方已用 is_uuid_v7 校验格式，解析失败直接终止测试。
 /// UUIDv7 文本前 48 位表示的 Unix 毫秒。
 fn uuid_v7_millis(id: &str) -> i64 {
     i64::from_str_radix(&format!("{}{}", &id[0..8], &id[9..13]), 16).unwrap()
