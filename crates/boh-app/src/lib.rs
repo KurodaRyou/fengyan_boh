@@ -82,6 +82,7 @@ pub struct TestNode {
 }
 
 impl TestNode {
+    #[allow(clippy::disallowed_methods)] // Locked backup tests pause execution through this test-node entry point.
     pub fn hold_backups(&self) -> BackupHold {
         self.backup.hold()
     }

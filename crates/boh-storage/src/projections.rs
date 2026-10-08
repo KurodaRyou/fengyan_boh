@@ -1,6 +1,7 @@
 //! Event-only projections shared by online appends and replay.
 
 use boh_domain::equipment::EquipmentType;
+use boh_domain::receiving::{GoodsReceived, ReceiptInput, ReceivedLine};
 use boh_domain::temperature::TemperatureLogged;
 use boh_domain::{AggregateId, CommandId, EventId, UnixMillis};
 use rusqlite::{Transaction, params};
@@ -36,6 +37,7 @@ pub(crate) fn apply(tx: &Transaction<'_>, event: &Event) -> Result<(), StorageEr
             crate::master_data::apply(tx, event)
         }
         ("TEMPERATURE_LOGGED", 1, "TEMPERATURE_READING") => apply_temperature(tx, event),
+        ("GOODS_RECEIVED", 1, "RECEIPT") => apply_receipt(tx, event),
         _ => Err(StorageError::InvalidEvent(
             "unsupported event type or version".into(),
         )),
@@ -155,6 +157,132 @@ fn apply_temperature(tx: &Transaction<'_>, event: &Event) -> Result<(), StorageE
     Ok(())
 }
 
+fn apply_receipt(tx: &Transaction<'_>, event: &Event) -> Result<(), StorageError> {
+    if event.aggregate_version != 1 {
+        return Err(StorageError::InvalidEvent(
+            "unsupported receipt aggregate version".into(),
+        ));
+    }
+    let payload = receipt_payload(tx, &event.payload)?;
+    // seq comes from the stored event in both the online and replay paths.
+    let seq: i64 = tx.query_row(
+        "SELECT seq FROM store_events WHERE id = ?1",
+        [event.id.to_string()],
+        |row| row.get(0),
+    )?;
+    for (index, line) in payload.lines.into_iter().enumerate() {
+        let index = i64::try_from(index)
+            .map_err(|_| StorageError::InvalidEvent("receipt line number overflow".into()))?;
+        tx.execute(
+            "INSERT INTO inventory_lots (lot_id, item_id, origin, source_event_seq,
+                 source_line_no, remaining_qty, expires_at, manufacturer_lot_no)
+             VALUES (?1, ?2, 'RECEIPT', ?3, ?4, ?5, ?6, ?7)",
+            params![
+                line.lot_id.to_string(),
+                line.item_id.to_string(),
+                seq,
+                index,
+                line.qty,
+                line.expires_at.0,
+                line.manufacturer_lot_no
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO inventory_movements (event_seq, movement_no, item_id, lot_id,
+                 kind, alloc_source, nominal_qty, qty_delta, absorbed_by_event_id,
+                 physical_at, business_date)
+             VALUES (?1, ?2, ?3, ?4, 'RECEIPT', 'NEW_LOT', ?5, ?5, NULL, ?6, ?7)",
+            params![
+                seq,
+                index,
+                line.item_id.to_string(),
+                line.lot_id.to_string(),
+                line.qty,
+                event.occurred_at.0,
+                event.business_date
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn receipt_payload(tx: &Transaction<'_>, json: &str) -> Result<GoodsReceived, StorageError> {
+    // Validate JSON types before extraction: SQLite otherwise coerces booleans
+    // and floating-point numbers when retrieving integer columns.
+    let valid: bool = tx.query_row(
+        "SELECT json_type(?1) = 'object'
+          AND (SELECT count(*) FROM json_each(?1)) = 2
+          AND json_type(?1, '$.supplier_id') = 'text'
+          AND json_type(?1, '$.lines') = 'array'
+          AND json_array_length(?1, '$.lines') > 0
+          AND NOT EXISTS (
+              SELECT 1 FROM json_each(?1, '$.lines') AS line
+              WHERE (CASE WHEN line.type = 'object' THEN
+                  (SELECT count(*) FROM json_each(line.value)) =
+                      CASE WHEN json_type(line.value, '$.manufacturer_lot_no') IS NULL
+                           THEN 8 ELSE 9 END
+                  AND json_type(line.value, '$.item_id') = 'text'
+                  AND json_type(line.value, '$.qty') = 'integer'
+                  AND json_type(line.value, '$.input') = 'object'
+                  AND (SELECT count(*) FROM json_each(line.value, '$.input')) = 3
+                  AND json_type(line.value, '$.input.qty') = 'integer'
+                  AND json_type(line.value, '$.input.unit_code') = 'text'
+                  AND json_type(line.value, '$.input.base_qty_per_unit') = 'integer'
+                  AND json_type(line.value, '$.lot_id') = 'text'
+                  AND (json_type(line.value, '$.manufacturer_lot_no') IS NULL
+                       OR json_type(line.value, '$.manufacturer_lot_no') = 'text')
+                  AND json_type(line.value, '$.produced_on') = 'text'
+                  AND json_type(line.value, '$.expires_on') = 'text'
+                  AND json_type(line.value, '$.expires_at') = 'integer'
+                  AND json_type(line.value, '$.line_cost_cents') = 'integer'
+              ELSE 0 END) IS NOT 1)",
+        [json],
+        |row| Ok(row.get::<_, Option<bool>>(0)?.unwrap_or(false)),
+    )?;
+    if !valid {
+        return Err(StorageError::InvalidEvent("invalid receipt payload".into()));
+    }
+    let invalid = |error: boh_domain::DomainError| StorageError::InvalidEvent(error.to_string());
+    let supplier_id: String =
+        tx.query_row("SELECT json_extract(?1, '$.supplier_id')", [json], |row| {
+            row.get(0)
+        })?;
+    let mut statement = tx.prepare(
+        "SELECT json_extract(value, '$.item_id'), json_extract(value, '$.qty'),
+                json_extract(value, '$.input.qty'), json_extract(value, '$.input.unit_code'),
+                json_extract(value, '$.input.base_qty_per_unit'), json_extract(value, '$.lot_id'),
+                json_extract(value, '$.manufacturer_lot_no'), json_extract(value, '$.produced_on'),
+                json_extract(value, '$.expires_on'), json_extract(value, '$.expires_at'),
+                json_extract(value, '$.line_cost_cents')
+         FROM json_each(?1, '$.lines') ORDER BY key",
+    )?;
+    let mut rows = statement.query([json])?;
+    let mut lines = Vec::new();
+    while let Some(row) = rows.next()? {
+        lines.push(ReceivedLine {
+            item_id: AggregateId::parse(&row.get::<_, String>(0)?).map_err(invalid)?,
+            qty: row.get(1)?,
+            input: ReceiptInput {
+                qty: row.get(2)?,
+                unit_code: row.get(3)?,
+                base_qty_per_unit: row.get(4)?,
+            },
+            lot_id: AggregateId::parse(&row.get::<_, String>(5)?).map_err(invalid)?,
+            manufacturer_lot_no: row.get(6)?,
+            produced_on: row.get(7)?,
+            expires_on: row.get(8)?,
+            expires_at: UnixMillis(row.get(9)?),
+            line_cost_cents: row.get(10)?,
+        });
+    }
+    let payload = GoodsReceived {
+        supplier_id: AggregateId::parse(&supplier_id).map_err(invalid)?,
+        lines,
+    };
+    payload.validate().map_err(invalid)?;
+    Ok(payload)
+}
+
 pub(crate) fn rebuild(tx: &Transaction<'_>) -> Result<u64, StorageError> {
     for table in PROJECTION_TABLES {
         tx.execute(&format!("DELETE FROM \"{table}\""), [])?;
@@ -192,9 +320,43 @@ pub(crate) fn rebuild(tx: &Transaction<'_>) -> Result<u64, StorageError> {
 
 #[cfg(test)]
 mod tests {
-    use super::PROJECTION_TABLES;
+    use super::{PROJECTION_TABLES, receipt_payload};
     use crate::{StorageError, open};
     use std::num::NonZeroUsize;
+
+    #[tokio::test]
+    async fn receipt_decoder_rejects_coerced_types_missing_keys_and_non_object_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = open(&dir.path().join("boh.db"), NonZeroUsize::MIN).unwrap();
+        let good = r#"{"supplier_id":"01890a5d-ac96-774b-bcce-b302099a8601","lines":[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8602","qty":5,"input":{"qty":5,"unit_code":"g","base_qty_per_unit":1},"lot_id":"01890a5d-ac96-774b-bcce-b302099a8701","produced_on":"2026-10-01","expires_on":"2026-10-20","expires_at":1792511999999,"line_cost_cents":0}]}"#;
+        storage
+            .writer
+            .call(move |tx| -> Result<(), StorageError> {
+                assert_eq!(receipt_payload(tx, good)?.lines.len(), 1);
+                for json in [
+                    good.replace("\"qty\":5", "\"qty\":true"),
+                    good.replace("\"qty\":5", "\"qty\":5.0"),
+                    good.replace("\"lot_id\":", "\"lot\":"),
+                    good.replace("\"qty\":5,\"input\"", "\"qty\":6,\"input\""),
+                    good.replace("\"expires_at\":1792511999999", "\"expires_at\":null"),
+                    good.replace("\"line_cost_cents\":0", "\"line_cost_cents\":0,\"extra\":1"),
+                    good.replace("\"lines\":[", "\"lines\":[\"text\","),
+                    good.replace("\"lines\":[", "\"lines\":[null,"),
+                ] {
+                    assert!(
+                        matches!(
+                            receipt_payload(tx, &json),
+                            Err(StorageError::InvalidEvent(_))
+                        ),
+                        "{json}"
+                    );
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        storage.writer_handle.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn rebuild_table_list_matches_migrated_schema() {

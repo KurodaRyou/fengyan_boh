@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 pub mod equipment;
 pub mod master_data;
+pub mod receiving;
 pub mod temperature;
 pub mod time;
 

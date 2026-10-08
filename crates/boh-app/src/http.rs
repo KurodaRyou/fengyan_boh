@@ -19,6 +19,7 @@ use crate::{
 use boh_domain::AggregateId;
 use boh_domain::equipment::{CreateEquipment, UpdateEquipment};
 use boh_domain::master_data::*;
+use boh_domain::receiving::CreateReceipt;
 use boh_domain::temperature::{LogTemperature, TemperatureQuery};
 use boh_domain::time::TimeError;
 
@@ -150,6 +151,7 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/temperature-readings",
             get(list_temperature_readings).post(log_temperature),
         )
+        .route("/api/v1/receipts", post(create_receipt))
         .route("/api/v1/items", get(list_items).post(create_item))
         .route("/api/v1/items/{item_id}", put(update_item))
         .route("/api/v1/recipes", get(list_recipes).post(create_recipe))
@@ -240,6 +242,18 @@ async fn list_temperature_readings(
     Ok(ok(serde_json::json!({
         "temperature_readings": service::list_temperature_readings(state, query).await?
     })))
+}
+
+async fn create_receipt(
+    State(state): State<AppState>,
+    actor: Actor,
+    body: Result<Json<CreateReceipt>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Json(command) = body.map_err(|_| ApiError::validation())?;
+    command.validate().map_err(|_| ApiError::validation())?;
+    Ok(Json(
+        service::receiving::create(state, actor, command).await?,
+    ))
 }
 
 async fn list_items(

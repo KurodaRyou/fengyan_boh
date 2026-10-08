@@ -15,6 +15,9 @@ use serde_json::{Value, json};
 
 use crate::{AppState, http};
 
+#[path = "receiving_tests.rs"]
+mod receiving;
+
 struct Node {
     _dir: tempfile::TempDir,
     storage: Storage,

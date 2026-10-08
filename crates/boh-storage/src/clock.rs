@@ -46,14 +46,12 @@ impl Clock {
     pub async fn sleep_until(&self, deadline: UnixMillis) {
         match &self.source {
             Source::System => loop {
-                let now = self.now();
-                if now >= deadline {
+                let wait = system_wait_duration(self.now(), Some(deadline));
+                if wait.is_zero() {
                     return;
                 }
                 // 最长每秒重新读取墙钟，也能及时发现向前跳变。
-                let remaining = deadline.0.checked_sub(now.0).unwrap_or(i64::MAX);
-                let millis = u64::try_from(remaining.min(1000)).unwrap_or(1000);
-                tokio::time::sleep(Duration::from_millis(millis)).await;
+                tokio::time::sleep(wait).await;
             },
             Source::Manual(time) => {
                 let mut changes = time.subscribe();
@@ -82,20 +80,27 @@ impl ClockChanges {
             let _ = time.changed().await;
             *time.borrow_and_update()
         } else {
-            let millis = if let Some(deadline) = deadline {
-                let now = self.clock.now();
-                if now >= deadline {
-                    return now;
-                }
-                let remaining = deadline.0.checked_sub(now.0).unwrap_or(i64::MAX);
-                u64::try_from(remaining.min(1000)).unwrap_or(1000)
-            } else {
-                1000
-            };
-            tokio::time::sleep(Duration::from_millis(millis)).await;
+            let now = self.clock.now();
+            let wait = system_wait_duration(now, deadline);
+            if wait.is_zero() {
+                return now;
+            }
+            tokio::time::sleep(wait).await;
             self.clock.now()
         }
     }
+}
+
+fn system_wait_duration(now: UnixMillis, deadline: Option<UnixMillis>) -> Duration {
+    let millis = match deadline {
+        Some(deadline) if now >= deadline => 0,
+        Some(deadline) => {
+            let remaining = deadline.0.checked_sub(now.0).unwrap_or(i64::MAX);
+            u64::try_from(remaining.min(1000)).unwrap_or(1000)
+        }
+        None => 1000,
+    };
+    Duration::from_millis(millis)
 }
 
 #[allow(clippy::disallowed_methods)] // 只有时钟模块可以读取系统时间。
@@ -162,6 +167,25 @@ mod tests {
     impl Wake for WakeCount {
         fn wake(self: Arc<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn system_wait_bounds_cover_expired_nearby_and_overflowing_deadlines() {
+        for (now, deadline, millis) in [
+            (100, Some(99), 0),
+            (100, Some(100), 0),
+            (100, Some(101), 1),
+            (100, Some(1099), 999),
+            (100, Some(1101), 1000),
+            (i64::MIN, Some(i64::MAX), 1000),
+            (i64::MAX, Some(i64::MIN), 0),
+            (0, None, 1000),
+        ] {
+            assert_eq!(
+                system_wait_duration(UnixMillis(now), deadline.map(UnixMillis)),
+                Duration::from_millis(millis),
+            );
         }
     }
 

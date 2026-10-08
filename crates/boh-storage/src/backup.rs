@@ -60,11 +60,6 @@ impl Backup {
         keep: NonZeroU32,
     ) -> Result<Self, StorageError> {
         fs::create_dir_all(directory)?;
-        if !directory.is_dir() {
-            return Err(StorageError::Backup(
-                "backup path is not a directory".into(),
-            ));
-        }
         Ok(Self {
             db_path: db_path.to_owned(),
             directory: directory.to_owned(),
