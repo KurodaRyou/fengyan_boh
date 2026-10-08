@@ -36,6 +36,7 @@ const END_OF_10_08: i64 = 1_791_475_199_999;
 const END_OF_10_15: i64 = 1_792_079_999_999;
 const END_OF_10_20: i64 = 1_792_511_999_999;
 const END_OF_10_22: i64 = 1_792_684_799_999;
+const END_OF_9998_12_31: i64 = 253_370_735_999_999;
 /// 2026-10-08 02:00 +08:00（营业日 2026-10-07）。
 const AT_10_08_0200: i64 = 1_791_396_000_000;
 /// 2026-10-08 00:30 +08:00。
@@ -657,7 +658,8 @@ async fn managers_can_receive_and_each_receipt_is_a_new_aggregate() {
 }
 
 // 取值边界照常受理：manufacturer_lot_no 恰好 64 个字符（按 Unicode 字符计，含非 ASCII），首尾以外的空白原样保存；
-// line_cost_cents = 0；produced_on = expires_on；input.qty × base_qty_per_unit 恰好等于 i64::MAX（另一个物料）。
+// line_cost_cents = 0；produced_on = expires_on；input.qty × base_qty_per_unit 恰好等于 i64::MAX（另一个物料）；
+// expires_on 恰好是上限 9998-12-31。
 #[tokio::test]
 async fn boundary_values_are_accepted() {
     let node = node();
@@ -672,14 +674,20 @@ async fn boundary_values_are_accepted() {
     line0["produced_on"] = json!("2026-10-06");
     line0["expires_on"] = json!("2026-10-06");
     let line1 = line(&big, i64::MAX, "unit", 1);
+    let mut line2 = line(&flour, 1, "g", 1);
+    line2["expires_on"] = json!("9998-12-31");
 
     let receipt = node
-        .receive_ok(&STAFF, &body(&cmd(3), &supplier, vec![line0, line1], 0))
+        .receive_ok(
+            &STAFF,
+            &body(&cmd(3), &supplier, vec![line0, line1, line2], 0),
+        )
         .await;
 
     assert_eq!(receipt["lines"][0]["manufacturer_lot_no"], json!(lot_no));
     assert_eq!(receipt["lines"][0]["expires_at"], json!(END_OF_10_06));
     assert_eq!(receipt["lines"][1]["qty"], json!(i64::MAX));
+    assert_eq!(receipt["lines"][2]["expires_at"], json!(END_OF_9998_12_31));
 }
 
 // domain「主数据」：命令引用已停用的供应商和物料照常受理。
@@ -1303,6 +1311,12 @@ async fn invalid_values_are_validation_failed() {
         l["expires_on"] = json!("2026-02-30")
     });
     row("expires_on number", &|l| l["expires_on"] = json!(20261020));
+    row("expires_on after 9998-12-31", &|l| {
+        l["expires_on"] = json!("9999-01-01")
+    });
+    row("expires_on 9999-12-31", &|l| {
+        l["expires_on"] = json!("9999-12-31")
+    });
     row("produced after expires", &|l| {
         l["produced_on"] = json!("2026-10-21")
     });
@@ -1571,6 +1585,7 @@ async fn validation_precedes_the_idempotency_check() {
         ("supplier_id", json!("not-a-uuid")),
         ("produced_on", json!("2026-10-21")),
         ("line_cost_cents", json!(-1)),
+        ("expires_on", json!("9999-01-01")),
     ] {
         let mut request = original.clone();
         if key == "lines" || key == "supplier_id" {
