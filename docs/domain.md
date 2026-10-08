@@ -191,6 +191,37 @@ occurred_at = recorded_at − lag
   - 参数缺失、取值非法、未知或重复的参数：`400 VALIDATION_FAILED`。`equipment_id` 合法但不存在时返回空数组。
 - 投影 `temperature_readings` 每条读数一行，字段以迁移 003 为准。冲销在投影和查询中的体现随纠错切片设计。
 
+### 收货接口
+
+| 方法与路径 | `command_type` | 权限 |
+|---|---|---|
+| `POST /api/v1/receipts` | `receipt.create` | 已认证员工 |
+
+- 请求体：`command_id`、`supplier_id`、`lines`、`captured_at`、`sent_at`。`lines` 每项 `{item_id, input, supplier_lot_no?, produced_on, expires_on, line_cost_cents}`，`input` 为 `{qty, unit_code, base_qty_per_unit}`（见「单位」）。
+- 写命令成功的 `data` 是 `{"receipt": 行}`；行为 `receipt_id`、`supplier_id`、`lines`（与 payload 的 `lines` 相同）、`business_date`、`occurred_at`、`recorded_at`、`actor_id`、`device_id`。
+- **取值**：不满足时 `400 VALIDATION_FAILED`，`details` 为 `{}`。
+  - `lines` 非空。同一物料可以有多行，各行分别建批次。
+  - `input.qty`、`input.base_qty_per_unit` 是正整数；`input.unit_code` 非空、首尾不能有空白字符。`input.qty × input.base_qty_per_unit` 超出 `i64`。
+  - `line_cost_cents` 是该行总金额（分），`>= 0`。
+  - `supplier_lot_no` 可以省略；出现时非空、首尾不能有空白字符、最多 64 个字符（按 Unicode 字符计），不接受 `null`。
+  - `produced_on`（生产日期）、`expires_on`（到期日）必填，是包装标签上的门店当地日期，格式 `'YYYY-MM-DD'`（真实日期），`produced_on <= expires_on`。标签只印保质期时长时，由客户端按日历推算 `expires_on`。
+  - 请求体不接受 `occurred_at`（补录入口见「时间」）。
+- **新建**：服务端生成 UUIDv7 作为收货 ID（聚合 ID），每行生成一个 `lot_id`，写一条 `aggregate_version = 1` 的 `GOODS_RECEIVED`。
+  - `occurred_at`、`business_date` 按「时间」的相对校准计算，规则与温度记录相同（`CAPTURE_TOO_OLD`、时间溢出的 `VALIDATION_FAILED`、`CAPTURE_TIME_ADJUSTED` 的 `details` 都是 `{}`）。
+  - payload 每行：`qty = input.qty × input.base_qty_per_unit`；`expires_at` 是 `expires_on` 在门店时区（配置 `timezone`）的当日最后一毫秒，即次日当地 0 点的 UTC 毫秒减 1。
+    - 理由：`projections::apply` 不读配置，换算结果必须写进 payload。
+  - payload 行的键顺序：`item_id`、`qty`、`input`、`lot_id`、`supplier_lot_no`、`produced_on`、`expires_on`、`expires_at`、`line_cost_cents`（被吸收的行在 `lot_id` 的位置写 `absorbed_by_event_id`）；`input` 的键顺序 `qty`、`unit_code`、`base_qty_per_unit`。
+- **业务校验**（幂等检查之后）：同时命中多个业务错误时，返回哪一个不作规定；都不写事件或 `processed_commands`。
+  - 供应商、物料不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": "SUPPLIER" / "ITEM", "id"}`。停用的照常受理。
+  - `unit_code` 既不是物料的 `base_unit` 也不在 `units` 中：`400 UNKNOWN_UNIT`，`details` 为 `{"line", "item_id", "unit_code"}`。
+  - 系数与当前值不同：`409 UNIT_CONVERSION_CHANGED`，`details` 为 `{"line", "item_id", "unit_code", "base_qty_per_unit": 当前值}`。`unit_code` 等于 `base_unit` 时当前值为 1。
+  - 日期与收货时间矛盾：`400 INVALID_LOT_DATES`，`details` 为 `{"line", "item_id", "reason"}`。以 `occurred_at` 在门店时区的日历日期 D 判定（不是营业日）：`produced_on > D` 时 `reason = "PRODUCED_IN_FUTURE"`；`expires_on < D` 时 `reason = "EXPIRED_ON_RECEIPT"`。等于 D 都允许。
+    - 用日历日期而不是营业日：日切前（如凌晨 2 点）收到当天生产的货是正常的。
+  - `line` 是行在 `lines` 中的下标。
+- **警告**：`CAPTURE_TIME_ADJUSTED` 在前，之后按 `line` 升序的 `EXPIRES_BEFORE_OLDER_STOCK`（见「批次」）。
+- **吸收**：收货行按「盘点吸收」判定。判定随盘点切片实现（见 AGENTS.md「路线图」）；在此之前账本中没有盘点，每行都新建批次。
+- **投影**：每行在 `inventory_lots` 建一个 `origin = 'RECEIPT'` 的批次（`source_line_no` 是行下标，`remaining_qty = qty`），在 `inventory_movements` 写一条 `kind = 'RECEIPT'`、`alloc_source = 'NEW_LOT'` 的流水，`physical_at = occurred_at`。`line_cost_cents`、`produced_on` 只在事件中。
+
 ### 员工认证
 
 - **设备注册**（平板安装时做一次）：在节点上运行 `boh-server enroll-code` 生成一次性注册码。新平板提交注册码和设备名，服务端签发设备令牌，作为 `device_id` 的来源，同时生成这台设备的解锁码。
@@ -244,13 +275,14 @@ occurred_at = recorded_at − lag
 全部物料都按批次追踪。账面数 = 批次余量之和 + 账外缺口。
 
 - **批次 ID**：每条收货行、每次生产产出、每个盘盈由写入线程生成一个 `lot_id`（UUIDv7），写进 payload。供应商批号 `supplier_lot_no` 是可选属性，不作主键。
-- **到期时间** `expires_at`（UTC 毫秒，可空）只用于过期提醒，不参与分配。只有日期的保质期由客户端换算成门店当地当日结束时刻再提交；未填写时可用 `default_shelf_life_ms` 推算，推算结果写进 payload。
+- **到期时间** `expires_at`（UTC 毫秒，可空）只用于过期提醒，不参与分配。收货批次必有到期时间，由收货行的 `expires_on` 换算（见「收货接口」）；生产产出的到期时间随生产切片定；盘盈批次没有到期时间。
 - **FIFO 分配**：未指定 `lot_id` 的扣减，按（盘盈优先、`source_event_seq`、`source_line_no`）升序分配：`origin = 'COUNT_GAIN'` 的批次优先，同一优先级内先按来源事件的 `seq` 升序，再按原 payload 行序升序。同一收货事件允许同一物料有多行，各行分别建批次，按原 `lines` 数组顺序分配。补录的收货按入账顺序排队。
 - **来源行序**：批次投影保存 `source_line_no`，从 0 开始；收货取原 `lines[i]` 的 `i`，盘盈取原 `new_lots[i]` 的 `i`，生产 `output` 固定取 0。被吸收的行不建批次，其他行保留原下标，不重新编号。行序直接从已保存的 payload 恢复，不新增 payload 字段；更正、冲销或盘点调整已有批次时不改变它的 `source_event_seq` 和 `source_line_no`。
 - 客户端可以指定 `lot_id`；指定批次余量不足时，不足部分继续按 FIFO 分配。
 - **账面不足**：全部批次分配完仍不够时不拒绝，剩余部分记入账外缺口，返回警告 `STOCK_SHORTFALL`。下一次包含该物料的盘点会把账外缺口清零。
 - 分配结果连同来源写进 payload：`alloc[{lot_id?, qty, source}]`。`qty` 为正数，不带 `lot_id` 表示账外缺口；`source`（`SPECIFIED` / `FIFO` / `SHORTFALL`，纠错另有 `CORRECTION` / `REVERSAL`，见「纠错」）。重放时直接使用，不重新分配。
-- 新批次的 `expires_at` 早于同物料现存最老的批次时，返回警告 `EXPIRES_BEFORE_OLDER_STOCK`。
+- 新批次的 `expires_at` 早于同物料另一个按 FIFO 先被扣的批次时，返回警告 `EXPIRES_BEFORE_OLDER_STOCK`。另一个批次指写入前已有的批次和同一命令中靠前的行新建的批次，且 `remaining_qty > 0`、`expires_at` 不为空。
+  - 每个命中的行一条警告，`details` 为 `{"line", "item_id", "lot_id"}`：`line` 是该行的下标，`lot_id` 是新批次。
 - **承诺边界**：批次是账面推定，不是实物证据。追溯报告分开显示「员工指定」「系统推定」「账外 / 吸收」三类。
 
 ## 事件目录
@@ -262,7 +294,7 @@ occurred_at = recorded_at − lag
 
 | event_type | aggregate_type | payload 要点 | 投影影响 |
 |---|---|---|---|
-| `GOODS_RECEIVED` | `RECEIPT` | `supplier_id`, `lines[{item_id, qty, input, lot_id \| absorbed_by_event_id, supplier_lot_no?, expires_at?, line_cost_cents}]` | 每行新建一个批次；被吸收时不建 |
+| `GOODS_RECEIVED` | `RECEIPT` | `supplier_id`, `lines[{item_id, qty, input, lot_id \| absorbed_by_event_id, supplier_lot_no?, produced_on, expires_on, expires_at, line_cost_cents}]` | 每行新建一个批次；被吸收时不建 |
 | `PRODUCTION_BATCH_COMPLETED` | `PRODUCTION_BATCH` | `recipe_id`, `recipe_version`, `batch_count`, `started_at?`, `output{item_id, planned_qty, qty, lot_id \| absorbed_by_event_id, expires_at?}`, `consumed[{item_id, planned_qty, qty, alloc \| absorbed_by_event_id}]` | 原料按分配扣减（或被吸收）；成品新建批次 |
 | `WASTE_LOGGED` | `WASTE_RECORD` | `lines[{item_id, qty, input, reason_code, alloc \| absorbed_by_event_id}]` | 按分配扣减（或被吸收） |
 | `STOCK_COUNT_SUBMITTED` | `STOCK_COUNT` | `purpose`（`CLOSING` / `AUDIT`）, `lines[{item_id, lot_id?, counted_qty}]` | 无 |
@@ -501,6 +533,9 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 | 分次闭店盘点 | 面粉账面 100、黄油账面 50；21:00 `CLOSING` 只盘面粉得 90；21:30 `CLOSING` 只盘黄油得 48 | 面粉调整 −10、黄油调整 −2；各写一行 `inventory_counts` |
 | 无批次行重复 | 同一物料提交两行不带 `lot_id` | `400 DUPLICATE_COUNT_LINE` |
 | 换算变化 | 离线录入「2 袋，每袋 25000 g」；提交前换算改为 20000 | `409 UNIT_CONVERSION_CHANGED`，不入账 |
+| 到期早于先扣的批次 | 面粉已有批次 A 余量 5、到期 10-20；一次收货 `lines[0]` 到期 10-15，`lines[1]` 到期 10-25，`lines[2]` 到期 10-22 | 两条 `EXPIRES_BEFORE_OLDER_STOCK`：`line` **0**（早于 A）、`line` **2**（早于同次的 `lines[1]`）；`lines[1]` 不警告；三行都入账 |
+| 到货即过期 | 10-08 收货，`expires_on` 10-07 | `400 INVALID_LOT_DATES`，`reason` `EXPIRED_ON_RECEIPT`；不入账。`expires_on` 10-08 照常受理 |
+| 凌晨收当天生产的货 | 10-08 02:00 收货（营业日 10-07），`produced_on` 10-08 | 照常受理；`produced_on` 10-09 时 `400 INVALID_LOT_DATES`，`reason` `PRODUCED_IN_FUTURE` |
 | 销售示例 | 生产 100、报损 8、闭店实数 5（调整 −87）、销售 84 | 未解释损耗 **3** |
 | 幂等 | 同一命令发送 2 次，`sent_at` 不同 | 第二次原样返回首次响应（含 warnings），`seq` 不增加 |
 | 盘点后的正常业务 | 09:20 盘点；10:30 报损并提交 | 不被吸收，正常扣减 |

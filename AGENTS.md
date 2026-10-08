@@ -103,9 +103,9 @@
 1. **Write path 与基础设施**：时钟模块、相对校准、营业日纯函数；`Readers::call` 包读事务、写线程任务计时；信封加 `warnings`；`boh_storage::open()` 收口。
 2. **Walking skeleton 与首批切片**：
    设备主数据（walking skeleton：`ledger::execute` / `Ledger::append` / `projections::apply` 骨架与 `rebuild-projections`、`Actor` 开发桩、`boh-server init`、`EQUIPMENT` 写接口、迁移 002：`equipment`；打通 write path、幂等、重放、golden payload）
-   → 温度记录（迁移 003：`temperature_readings`）→ 备份模块与恢复演练测试、`/health` 字段（迁移 004：`store_events(recorded_at)` 索引）→ 005：其余主数据与库存投影表 → 收货 + 报损（FIFO、账外缺口、分配来源、吸收规则、不变量自检）→ 局域网 HTTPS → 员工认证。
+   → 温度记录（迁移 003：`temperature_readings`）→ 备份模块与恢复演练测试、`/health` 字段（迁移 004：`store_events(recorded_at)` 索引）→ 005：其余主数据与库存投影表 → 收货 → 报损（FIFO、指定批次、账外缺口、库存明细查询）→ 不变量自检 → 盘点（含盘点吸收：已有的收货、报损一并实现吸收判定）→ 局域网 HTTPS → 员工认证。
    - 设备主数据切片的 `init` 只写 `store_meta`；预置报损原因随 005 加入；`EMPLOYEE`（`employees` 投影、写接口、golden 样本）与第一个店长随认证切片加入。
-3. **扩展**：生产 → 盘点 → 纠错（冲销、数量更正）→ 补录入口 → 销售导入。每一步配对应的验收用例。
+3. **扩展**：生产 → 纠错（冲销、数量更正）→ 补录入口 → 销售导入。每一步配对应的验收用例。
 
 ---
 
@@ -217,7 +217,7 @@ scripts/        CI 扫描脚本。
 - 服务端生成的 UUIDv7 在写事务内构造：时间部分取该命令的 `recorded_at`（负值按 0），随机部分取 SQLite `randomblob(10)`，由 `boh-domain` 的纯函数拼装。不用 `Uuid::now_v7()`。
   - `now_v7()` 在 uuid crate 内部读系统时钟，绕过时钟模块，`disallowed-methods` 也拦不住。
 - 时间戳一律 `INTEGER`，UTC Unix **毫秒**。禁止存格式化的日期时间字符串。
-  例外：表示门店当地日期的业务字段——`business_date`（营业日）和采购单的 `deliver_on`（要求到货日），格式 `'YYYY-MM-DD'`，它们是业务概念而不是时间点。
+  例外：表示门店当地日期的业务字段——`business_date`（营业日）、采购单的 `deliver_on`（要求到货日）、收货行的 `produced_on`（生产日期）和 `expires_on`（到期日），格式 `'YYYY-MM-DD'`，它们是业务概念而不是时间点。
 - **事件间顺序只看 `seq`**：重放、同步按 `seq`；FIFO 先扣盘盈批次，再按来源事件的 `seq` 升序，同一来源事件内按原 payload 的行序（`source_line_no`）升序。不按任何时间戳。
 - `recorded_at` 取系统时钟原值，**不做单调钳制**。
   - 顺序已由 `seq` 保证；钳制会让一次跳到未来的时钟把之后的时间全部卡在未来。
@@ -342,7 +342,7 @@ scripts/        CI 扫描脚本。
     判断备份是否过期、重启前的历史，留到需要「门店当前是否受有效备份保护」时另行设计。
   - 生成报告成功返回 `200`（含 `degraded`）；查询数据库或读取 WAL 文件失败（文件不存在除外）返回 `500 INTERNAL_ERROR`。监控必须看 `data.status`，不能只看状态码。
   - 后续加入的字段：认证实现后加 `auth_failures_last_hour`；同步实现后加 `max(seq) − acked_seq` 和最后一次成功同步的时间；
-    库存切片实现不变量自检后加最近一次的结果（检查范围、结果结构、检查任务自身失败与发现不变量被破坏如何分别报告，随该切片定）。
+    不变量自检切片加最近一次的结果（检查范围、结果结构、检查任务自身失败与发现不变量被破坏如何分别报告，随该切片定）。
   - 不变量自检由定时任务在读连接上执行：启动时一次，之后每个 UTC 整点后 30 分一次；`/health` 只返回最近一次的结果，不现场计算。
 
 ---
