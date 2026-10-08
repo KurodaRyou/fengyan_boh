@@ -204,7 +204,7 @@ occurred_at = recorded_at − lag
   - `input.qty`、`input.base_qty_per_unit` 是正整数；`input.unit_code` 非空、首尾不能有空白字符。`input.qty × input.base_qty_per_unit` 不超出 `i64`。
   - `line_cost_cents` 是该行总金额（分），`>= 0`。
   - `manufacturer_lot_no` 可以省略；出现时非空、首尾不能有空白字符、最多 64 个字符（按 Unicode 字符计），不接受 `null`。
-  - `produced_on`（生产日期）、`expires_on`（到期日）必填，是包装标签上的门店当地日期，格式 `'YYYY-MM-DD'`（真实日期），`produced_on <= expires_on`。标签只印保质期时长时，由客户端按日历推算 `expires_on`。
+  - `produced_on`（生产日期）、`expires_on`（到期日）必填，是包装标签上的门店当地日期，格式 `'YYYY-MM-DD'`（真实日期），`produced_on <= expires_on`，`expires_on` 不晚于 `9998-12-31`（`expires_at` 由次日当地 0 点换算，须在时间戳范围内）。标签只印保质期时长时，由客户端按日历推算 `expires_on`。
   - 请求体不接受 `occurred_at`（补录入口见「时间」）。
 - **新建**：服务端生成 UUIDv7 作为收货 ID（聚合 ID），每行生成一个 `lot_id`，写一条 `aggregate_version = 1` 的 `GOODS_RECEIVED`。
   - `occurred_at`、`business_date` 按「时间」的相对校准计算，规则与温度记录相同（`CAPTURE_TOO_OLD`、时间溢出的 `VALIDATION_FAILED`、`CAPTURE_TIME_ADJUSTED` 的 `details` 都是 `{}`）。
