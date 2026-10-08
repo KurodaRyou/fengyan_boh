@@ -80,7 +80,7 @@
 4. **锁定测试**：
    1. **Claude** 写锁定测试（golden payload、HTTP 契约、验收用例、重放一致性）和接口说明。
    2. **测试 agent** 做独立测试审查（见「测试分工」）；Claude 逐条核对，把采纳项写进锁定测试、接口说明或 `docs/`。引出的规范修改作为 `docs:` 提交，放在 `spec:` 提交之前。
-   3. **人逐条确认预期值**后作为 `spec:` 提交。Claude 给出实现 agent 的 prompt：本切片范围、比对基准、需要顺带落实的已生效改动（已写回 `docs/` 或锁定测试，如上一切片遗留的修复）；prompt 不引用 `workdocs/`。
+   3. **人逐条确认预期值**后作为 `spec:` 提交。Claude 给出实现 agent 的 prompt：本切片范围、比对基准、需要顺带落实的已生效改动（已写回 `docs/` 或锁定测试，如上一切片遗留的修复）、不涉及规范的小改动（如去掉多余的检查）。`workdocs/` 中的条目由 Claude 把内容直接写进 prompt，不让实现 agent 读取或引用 `workdocs/`。
 5. **实现 agent**：在 `spec:` 提交之上实现本切片，交付前全部锁定测试通过：
    - `boh-domain`：命令 / 事件结构体 + 校验。
    - `boh-app::service`：经 `ledger::execute` 组装一个事务；`projections::apply` 增加该事件的投影。
