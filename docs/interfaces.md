@@ -111,7 +111,7 @@ impl ManualClock {
 - `sleep_until`：`now() >= deadline` 时才返回，`deadline` 已过时立即返回；系统时间回拨时随之推迟。必须在 tokio 运行时内调用。
 - `ManualClock` 供测试使用：由它得到的 `Clock` 共享同一个时间，不随真实时间流动。`set` 可以回拨，`advance` 只向前；时间到达 `deadline` 后，正在等待的 `sleep_until` 立即返回。
 - HTTP 黑盒测试：把 `ManualClock::clock()` 交给 `test_router`，服务端读到的当前时间（如 `recorded_at`）就是 `ManualClock` 设定的值。
-- 备份触发测试经 `boh_app::test_node` 进行：调度任务按 `now()` 算出下一个触发时刻（UTC 整点或 `closing_backup_time`），时钟回拨后重算（AGENTS.md「备份」触发）。
+- 备份触发测试经 `boh_app::test_node` 进行：调度任务按 `now()` 算出下一个触发时刻（UTC 整点或 `closing_backup_time`），时钟回拨后重算（[backup.md](backup.md)「触发」）。
   - 测试把时间设到触发前 1ms，断言未触发；推进 1ms，断言触发。
   - 排队用例：用 `TestNode::hold_backups` 让备份停在执行中，再推进到下一个触发时刻。
 
