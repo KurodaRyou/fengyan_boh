@@ -9,7 +9,21 @@ use crate::StorageError;
 use crate::ledger::Event;
 
 // The schema comparison test must cover every projection introduced by a migration.
-const PROJECTION_TABLES: &[&str] = &["equipment", "temperature_readings"];
+const PROJECTION_TABLES: &[&str] = &[
+    "equipment",
+    "temperature_readings",
+    "items",
+    "item_units",
+    "recipes",
+    "recipe_versions",
+    "recipe_lines",
+    "suppliers",
+    "waste_reasons",
+    "inventory_lots",
+    "inventory_unallocated",
+    "inventory_movements",
+    "inventory_counts",
+];
 
 pub(crate) fn apply(tx: &Transaction<'_>, event: &Event) -> Result<(), StorageError> {
     match (
@@ -18,6 +32,9 @@ pub(crate) fn apply(tx: &Transaction<'_>, event: &Event) -> Result<(), StorageEr
         event.aggregate_type.as_str(),
     ) {
         ("MASTER_DATA_CHANGED", 1, "EQUIPMENT") => apply_equipment(tx, event),
+        ("MASTER_DATA_CHANGED", 1, "ITEM" | "RECIPE" | "SUPPLIER" | "WASTE_REASON") => {
+            crate::master_data::apply(tx, event)
+        }
         ("TEMPERATURE_LOGGED", 1, "TEMPERATURE_READING") => apply_temperature(tx, event),
         _ => Err(StorageError::InvalidEvent(
             "unsupported event type or version".into(),
