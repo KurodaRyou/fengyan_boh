@@ -43,7 +43,7 @@
 - 锁定测试的辅助代码只放在 `crates/*/tests/spec_support/`（同样锁定），不依赖任何不受保护的代码。
 - 预期值由人工确认。**任何人都不允许为了让测试通过而修改预期值。**
 - 实现 agent 认为锁定测试有错时，停下来在交付说明里提出。不得修改，不得加 `#[ignore]`，不得用 `cfg`、feature 或 Cargo 配置让它不编译、不运行。
-- 合入方式：锁定测试以 `spec:` 提交（由人提交）；实现 agent 在其上开发，测试与实现在同一个 PR 合入。
+- 合入方式：人确认预期值后，锁定测试由 Claude 以 `spec:` 提交；实现 agent 在其上开发，测试与实现在同一个 PR 合入。
   Review 的比对基准是切片分支开头连续的 `spec:` / `docs:` 提交中的最后一个，`git diff <比对基准> HEAD -- <锁定路径>` 必须为空；实现开始后要改设计时按「开发顺序」末尾的规定处理。PR 打开后又有新提交时，合入前评论 `@codex review` 重新触发 Codex review。
 
 **独立测试审查**（测试 agent）：
@@ -80,7 +80,7 @@
 4. **锁定测试**：
    1. **Claude** 写锁定测试（golden payload、HTTP 契约、验收用例、重放一致性）和接口说明。
    2. **测试 agent** 做独立测试审查（见「测试分工」）；Claude 逐条核对，把采纳项写进锁定测试、接口说明或 `docs/`。引出的规范修改作为 `docs:` 提交，放在 `spec:` 提交之前。
-   3. **人逐条确认预期值**后作为 `spec:` 提交。Claude 给出实现 agent 的 prompt：本切片范围、比对基准、需要顺带落实的已生效改动（已写回 `docs/` 或锁定测试，如上一切片遗留的修复）、不涉及规范的小改动（如去掉多余的检查）。小改动来自 `workdocs/` 时，Claude 先确认它仍然适用、不涉及规范，再把内容直接写进 prompt；不让实现 agent 读取或引用 `workdocs/`。
+   3. **人逐条确认预期值**后，Claude 作为 `spec:` 提交，并给出实现 agent 的 prompt：本切片范围、比对基准、需要顺带落实的已生效改动（已写回 `docs/` 或锁定测试，如上一切片遗留的修复）、不涉及规范的小改动（如去掉多余的检查）。小改动来自 `workdocs/` 时，Claude 先确认它仍然适用、不涉及规范，再把内容直接写进 prompt；不让实现 agent 读取或引用 `workdocs/`。
 5. **实现 agent**：在 `spec:` 提交之上实现本切片，交付前全部锁定测试通过：
    - `boh-domain`：命令 / 事件结构体 + 校验。
    - `boh-app::service`：经 `ledger::execute` 组装一个事务；`projections::apply` 增加该事件的投影。
@@ -93,7 +93,7 @@
    人合入的条件：CI `check` 通过，PR 的 HEAD 与 Claude 最近一次结论中的 HEAD 一致。仓库只允许 merge commit 合入，保留 `docs:` / `spec:` / 实现提交的边界。
 
 **实现开始后要改设计**（第 5 步实现中或第 6、7 步 review 中发现需要改 `docs/`、迁移或锁定测试）：
-- 在切片分支开头的 `docs:` / `spec:` 提交之后追加新的提交：规范改动由 Claude 作为 `docs:` 提交；锁定测试改动由人逐条确认预期值后作为 `spec:` 提交。再把实现提交 rebase 到它们之后，比对基准随之后移。
+- 在切片分支开头的 `docs:` / `spec:` 提交之后追加新的提交：规范改动由 Claude 作为 `docs:` 提交；锁定测试改动由人逐条确认预期值后，Claude 作为 `spec:` 提交。再把实现提交 rebase 到它们之后，比对基准随之后移。
   - 切片分支允许强推，`main` 不允许：锁定路径的改动必须始终位于分支开头，不能合入后再补救。
 - 锁定测试改动按影响重做第 4 步：新增事件、payload 分支、错误码或警告码时，先查覆盖缺口并做第 4.2 步独立测试审查，再由人确认预期值；只修正已有用例的预期值或措辞时，人确认后即可提交。
 - 之后实现 agent 在 rebase 后的分支上修改，从第 6 步重新 review。
@@ -103,9 +103,9 @@
 1. **Write path 与基础设施**：时钟模块、相对校准、营业日纯函数；`Readers::call` 包读事务、写线程任务计时；信封加 `warnings`；`boh_storage::open()` 收口。
 2. **Walking skeleton 与首批切片**：
    设备主数据（walking skeleton：`ledger::execute` / `Ledger::append` / `projections::apply` 骨架与 `rebuild-projections`、`Actor` 开发桩、`boh-server init`、`EQUIPMENT` 写接口、迁移 002：`equipment`；打通 write path、幂等、重放、golden payload）
-   → 温度记录（迁移 003：`temperature_readings`）→ 备份模块与恢复演练测试、`/health` 字段（迁移 004：`store_events(recorded_at)` 索引）→ 005：其余主数据与库存投影表 → 收货 + 报损（FIFO、账外缺口、分配来源、吸收规则、不变量自检）→ 局域网 HTTPS → 员工认证。
+   → 温度记录（迁移 003：`temperature_readings`）→ 备份模块与恢复演练测试、`/health` 字段（迁移 004：`store_events(recorded_at)` 索引）→ 005：其余主数据与库存投影表 → 收货（迁移 006：批号列改名为 `manufacturer_lot_no`）→ 报损（FIFO、指定批次、账外缺口、库存明细查询）→ 不变量自检 → 盘点（含盘点吸收：已有的收货、报损一并实现吸收判定）→ 局域网 HTTPS → 员工认证。
    - 设备主数据切片的 `init` 只写 `store_meta`；预置报损原因随 005 加入；`EMPLOYEE`（`employees` 投影、写接口、golden 样本）与第一个店长随认证切片加入。
-3. **扩展**：生产 → 盘点 → 纠错（冲销、数量更正）→ 补录入口 → 销售导入。每一步配对应的验收用例。
+3. **扩展**：生产 → 纠错（冲销、数量更正）→ 补录入口 → 销售导入。每一步配对应的验收用例。
 
 ---
 
@@ -217,7 +217,7 @@ scripts/        CI 扫描脚本。
 - 服务端生成的 UUIDv7 在写事务内构造：时间部分取该命令的 `recorded_at`（负值按 0），随机部分取 SQLite `randomblob(10)`，由 `boh-domain` 的纯函数拼装。不用 `Uuid::now_v7()`。
   - `now_v7()` 在 uuid crate 内部读系统时钟，绕过时钟模块，`disallowed-methods` 也拦不住。
 - 时间戳一律 `INTEGER`，UTC Unix **毫秒**。禁止存格式化的日期时间字符串。
-  例外：表示门店当地日期的业务字段——`business_date`（营业日）和采购单的 `deliver_on`（要求到货日），格式 `'YYYY-MM-DD'`，它们是业务概念而不是时间点。
+  例外：表示门店当地日期的业务字段——`business_date`（营业日）、采购单的 `deliver_on`（要求到货日）、收货行的 `produced_on`（生产日期）和 `expires_on`（到期日），格式 `'YYYY-MM-DD'`，它们是业务概念而不是时间点。
 - **事件间顺序只看 `seq`**：重放、同步按 `seq`；FIFO 先扣盘盈批次，再按来源事件的 `seq` 升序，同一来源事件内按原 payload 的行序（`source_line_no`）升序。不按任何时间戳。
 - `recorded_at` 取系统时钟原值，**不做单调钳制**。
   - 顺序已由 `seq` 保证；钳制会让一次跳到未来的时钟把之后的时间全部卡在未来。
@@ -273,6 +273,7 @@ scripts/        CI 扫描脚本。
   | `rusqlite::Connection::open*` | `boh-storage/src/connection.rs`、备份模块 |
   | `boh_storage::testing` 中的函数 | 锁定测试及 `spec_support/` |
   | `boh_app::test_router`、`boh_app::test_node` | 锁定测试及 `spec_support/` |
+  | `boh_storage::backup::Backup::hold` | `boh_app::TestNode::hold_backups`、`boh-app` / `boh-storage` 中备份相关的 `#[cfg(test)]` 单元测试 |
   | `std::time::SystemTime::now`、`jiff::Timestamp::now`、`jiff::Zoned::now`、`jiff::tz::TimeZone::system`、`jiff::tz::TimeZone::try_system` | 时钟模块 |
   | `std::thread::sleep` | 无 |
   | `HashMap` / `HashSet`（`boh-domain`） | 无 |
@@ -341,7 +342,7 @@ scripts/        CI 扫描脚本。
     判断备份是否过期、重启前的历史，留到需要「门店当前是否受有效备份保护」时另行设计。
   - 生成报告成功返回 `200`（含 `degraded`）；查询数据库或读取 WAL 文件失败（文件不存在除外）返回 `500 INTERNAL_ERROR`。监控必须看 `data.status`，不能只看状态码。
   - 后续加入的字段：认证实现后加 `auth_failures_last_hour`；同步实现后加 `max(seq) − acked_seq` 和最后一次成功同步的时间；
-    库存切片实现不变量自检后加最近一次的结果（检查范围、结果结构、检查任务自身失败与发现不变量被破坏如何分别报告，随该切片定）。
+    不变量自检切片加最近一次的结果（检查范围、结果结构、检查任务自身失败与发现不变量被破坏如何分别报告，随该切片定）。
   - 不变量自检由定时任务在读连接上执行：启动时一次，之后每个 UTC 整点后 30 分一次；`/health` 只返回最近一次的结果，不现场计算。
 
 ---

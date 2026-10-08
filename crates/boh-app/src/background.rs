@@ -161,6 +161,7 @@ async fn run(
 ) {
     let mut active: Option<JoinHandle<()>> = None;
     let mut stopping = false;
+    let mut schedule_failed = false;
     loop {
         if !stopping && (*stop.borrow() || stop.has_changed().is_err()) {
             stopping = true;
@@ -173,9 +174,15 @@ async fn run(
             None
         } else {
             match schedule.observe(clock.now(), &mut queue) {
-                Ok(()) => Some(schedule.deadline()),
+                Ok(()) => {
+                    schedule_failed = false;
+                    Some(schedule.deadline())
+                }
                 Err(error) => {
-                    tracing::error!(%error, "cannot calculate backup trigger");
+                    if !schedule_failed {
+                        tracing::error!(%error, "cannot calculate backup trigger");
+                        schedule_failed = true;
+                    }
                     // Keep draining accepted work, but do not spin on a stale deadline.
                     None
                 }
@@ -219,9 +226,98 @@ mod tests {
     use boh_domain::time::{parse_closing_backup_time, parse_timezone};
     use boh_storage::clock::ManualClock;
     use std::num::{NonZeroU32, NonZeroUsize};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+    use tracing::instrument::WithSubscriber;
+
+    #[derive(Clone, Default)]
+    struct ErrorCounter(Arc<AtomicUsize>);
+
+    impl tracing::Subscriber for ErrorCounter {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() == tracing::Level::ERROR
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::ERROR {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    async fn poll_pending(mut future: std::pin::Pin<&mut impl std::future::Future<Output = ()>>) {
+        std::future::poll_fn(|cx| {
+            assert!(future.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
 
     #[tokio::test]
+    async fn scheduling_errors_log_once_per_failure_period_and_again_after_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("boh.db");
+        let storage = boh_storage::open(&db, NonZeroUsize::MIN).unwrap();
+        let initial = UnixMillis(1_791_261_000_000);
+        let schedule = Schedule::new(
+            initial,
+            parse_timezone("Asia/Shanghai").unwrap(),
+            parse_closing_backup_time("23:30").unwrap(),
+        )
+        .unwrap();
+        let invalid = UnixMillis(253_402_400_000_000);
+        let clock = ManualClock::new(invalid);
+        let backup = Backup::prepare(
+            &db,
+            &dir.path().join("backups"),
+            StoreId::parse("01890a5d-ac96-774b-bcce-b302099a8050").unwrap(),
+            NonZeroU32::MIN,
+        )
+        .unwrap();
+        let (stop, stopping) = watch::channel(false);
+        let counter = ErrorCounter::default();
+        let mut task = Box::pin(
+            run(
+                backup,
+                clock.clock(),
+                BackupHealth::default(),
+                schedule,
+                clock.clock().changes(),
+                stopping,
+                VecDeque::new(),
+            )
+            .with_subscriber(counter.clone()),
+        );
+        poll_pending(task.as_mut()).await;
+        assert_eq!(counter.0.load(Ordering::Relaxed), 1);
+        for offset in 1..=3 {
+            clock.set(UnixMillis(invalid.0 + offset));
+            poll_pending(task.as_mut()).await;
+            assert_eq!(counter.0.load(Ordering::Relaxed), 1);
+        }
+        clock.set(initial);
+        poll_pending(task.as_mut()).await;
+        assert_eq!(counter.0.load(Ordering::Relaxed), 1);
+        clock.set(invalid);
+        poll_pending(task.as_mut()).await;
+        assert_eq!(counter.0.load(Ordering::Relaxed), 2);
+        stop.send_replace(true);
+        task.await;
+        storage.writer_handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)] // Backup unit test pauses execution to verify draining and clock recovery.
     async fn scheduling_error_drains_accepted_backups_and_recovers_with_the_clock() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("boh.db");
@@ -284,6 +380,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::disallowed_methods)] // Backup unit test pauses execution to verify the stop signal rejects new triggers.
     async fn stop_signal_rejects_triggers_while_a_backup_is_still_running() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("boh.db");

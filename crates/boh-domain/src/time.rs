@@ -203,3 +203,78 @@ pub fn business_date(
     }
     Ok(BusinessDate(date))
 }
+
+/// Calendar date at the store, independent of the business-day cutoff.
+pub fn local_date(at: UnixMillis, timezone: &StoreTimeZone) -> Result<BusinessDate, TimeError> {
+    let timestamp = Timestamp::from_millisecond(at.0).map_err(|_| TimeError::OutOfRange)?;
+    let date = timezone.0.to_datetime(timestamp).date();
+    if !(0..=9999).contains(&date.year()) {
+        return Err(TimeError::OutOfRange);
+    }
+    Ok(BusinessDate(date))
+}
+
+/// The last millisecond of a local calendar date, using the next local midnight.
+pub fn end_of_local_date(date: Date, timezone: &StoreTimeZone) -> Result<UnixMillis, TimeError> {
+    let next_date = date.tomorrow().map_err(|_| TimeError::OutOfRange)?;
+    let midnight = timezone
+        .0
+        .to_ambiguous_timestamp(next_date.at(0, 0, 0, 0))
+        .compatible()
+        .map_err(|_| TimeError::OutOfRange)?;
+    midnight
+        .as_millisecond()
+        .checked_sub(1)
+        .map(UnixMillis)
+        .ok_or(TimeError::OutOfRange)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expiry_uses_local_midnight_across_short_and_long_dst_days() {
+        let timezone = parse_timezone("America/Los_Angeles").unwrap();
+        for (date, expected) in [
+            ("2026-03-08", "2026-03-09T06:59:59.999Z"),
+            ("2026-11-01", "2026-11-02T07:59:59.999Z"),
+        ] {
+            let expected: Timestamp = expected.parse().unwrap();
+            assert_eq!(
+                end_of_local_date(date.parse().unwrap(), &timezone).unwrap(),
+                UnixMillis(expected.as_millisecond()),
+            );
+        }
+    }
+
+    #[test]
+    fn receipt_calendar_date_is_independent_of_cutoff_and_uses_store_timezone() {
+        let time: Timestamp = "2026-10-07T18:00:00Z".parse().unwrap();
+        let time = UnixMillis(time.as_millisecond());
+        let shanghai = parse_timezone("Asia/Shanghai").unwrap();
+        assert_eq!(
+            local_date(time, &shanghai).unwrap().to_string(),
+            "2026-10-08"
+        );
+        assert_eq!(
+            business_date(time, &shanghai, parse_business_day_cutoff("04:00").unwrap())
+                .unwrap()
+                .to_string(),
+            "2026-10-07",
+        );
+        let los_angeles = parse_timezone("America/Los_Angeles").unwrap();
+        assert_eq!(
+            local_date(time, &los_angeles).unwrap().to_string(),
+            "2026-10-07"
+        );
+        assert_eq!(
+            local_date(UnixMillis(i64::MAX), &shanghai),
+            Err(TimeError::OutOfRange)
+        );
+        assert_eq!(
+            end_of_local_date("9999-12-31".parse().unwrap(), &shanghai),
+            Err(TimeError::OutOfRange)
+        );
+    }
+}
