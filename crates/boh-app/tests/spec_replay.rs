@@ -645,3 +645,207 @@ async fn hq_package_master_data_rebuilds_like_local_changes() {
         } })
     );
 }
+
+/// 收货请求的一行：`qty` 个 `unit_code`（每个 `factor` 个基本单位），到期日 `expires_on`。
+fn receipt_line(item_id: &str, qty: i64, unit_code: &str, factor: i64, expires_on: &str) -> Value {
+    json!({
+        "item_id": item_id,
+        "input": { "qty": qty, "unit_code": unit_code, "base_qty_per_unit": factor },
+        "produced_on": "2026-10-01", "expires_on": expires_on, "line_cost_cents": 100,
+    })
+}
+
+/// 收货：平板在 `SENT − lag` 录入、在 `sent_at` 发送。返回完整响应。
+#[allow(clippy::unwrap_used)] // 测试夹具：响应体不是 JSON 已违反信封约定，直接终止测试。
+async fn receive(
+    router: &axum::Router,
+    command_id: &str,
+    supplier_id: &str,
+    lines: Vec<Value>,
+    lag: i64,
+    sent_at: i64,
+) -> spec_support::JsonReply {
+    let body = json!({
+        "command_id": command_id, "supplier_id": supplier_id, "lines": lines,
+        "captured_at": SENT - lag, "sent_at": sent_at,
+    });
+    let reply = spec_support::post(router, "/api/v1/receipts", Some(&STAFF), &body)
+        .await
+        .unwrap();
+    assert_success(&reply);
+    reply
+}
+
+// 收货的账本（同一物料两行、带生产商批号、单位换算、负 lag 的警告、前一营业日）：在线写入后篡改库存投影
+// （删批次及其流水、改余量与来源行序、改流水数量），重建后全部投影与在线写入逐行一致，账本、processed_commands 和 store_meta 不变；
+// 重建可重复执行。验收用例「来源行序重建」：同次收货的 A、B 重建后 source_line_no 仍为 0、1。
+// 重建不影响幂等回执：之后用原 command_id、原内容（sent_at 不同）重发，原样返回首次响应（含 warnings），不新增事件。
+// 重建后的批次能继续支撑新的写命令：新批次早于 A 到期时返回 EXPIRES_BEFORE_OLDER_STOCK。
+#[tokio::test]
+async fn rebuild_restores_receipt_projections() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("boh.db");
+    let clock = ManualClock::new(NOW);
+    let router = spec_support::router(&db_path, clock.clock()).unwrap();
+    let id = |data: Value, key: &str, field: &str| data[key][field].as_str().unwrap().to_owned();
+    let flour = id(
+        write(
+            &router,
+            "POST",
+            "/api/v1/items",
+            json!({
+                "command_id": cmd(1), "code": "FLOUR", "name": "面粉", "base_unit": "g",
+                "category": "RAW", "units": [{ "unit_code": "bag", "base_qty_per_unit": 25000 }],
+                "active": true,
+            }),
+        )
+        .await,
+        "item",
+        "item_id",
+    );
+    let butter = id(
+        write(
+            &router,
+            "POST",
+            "/api/v1/items",
+            json!({
+                "command_id": cmd(2), "code": "BUTTER", "name": "黄油", "base_unit": "g",
+                "category": "RAW", "units": [], "active": true,
+            }),
+        )
+        .await,
+        "item",
+        "item_id",
+    );
+    let supplier = id(
+        write(
+            &router,
+            "POST",
+            "/api/v1/suppliers",
+            json!({ "command_id": cmd(3), "code": "S1", "name": "S1", "active": true }),
+        )
+        .await,
+        "supplier",
+        "supplier_id",
+    );
+    let first = receive(
+        &router,
+        &cmd(4),
+        &supplier,
+        vec![
+            receipt_line(&flour, 5, "g", 1, "2026-10-20"),
+            receipt_line(&flour, 10, "g", 1, "2026-10-25"),
+        ],
+        0,
+        SENT,
+    )
+    .await;
+    let a = first.body["data"]["receipt"]["lines"][0]["lot_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let b = first.body["data"]["receipt"]["lines"][1]["lot_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut with_lot_no = receipt_line(&butter, 2, "g", 1, "2026-10-15");
+    with_lot_no["manufacturer_lot_no"] = json!("L-1");
+    let lines = vec![
+        with_lot_no,
+        receipt_line(&flour, 1, "bag", 25000, "2026-10-22"),
+    ];
+    let second = receive(&router, &cmd(5), &supplier, lines.clone(), -60_000, SENT).await;
+    assert_eq!(
+        second.body["warnings"][0]["code"],
+        json!("CAPTURE_TIME_ADJUSTED")
+    );
+    let butter_lot = second.body["data"]["receipt"]["lines"][0]["lot_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // lag 6 小时：occurred_at 为 03:00，归前一营业日。
+    receive(
+        &router,
+        &cmd(6),
+        &supplier,
+        vec![receipt_line(&butter, 3, "g", 1, "2026-10-20")],
+        6 * 3_600_000,
+        SENT,
+    )
+    .await;
+
+    let online = projections(&db_path).unwrap();
+    for (table, rows) in [("inventory_lots", 5), ("inventory_movements", 5)] {
+        assert!(
+            online
+                .iter()
+                .any(|(name, content)| name == table && content.len() == rows),
+            "{table}: {online:?}"
+        );
+    }
+    let ledger_before = ledger(&db_path).unwrap();
+
+    let mut writer = spec_support::writer(&db_path).unwrap();
+    writer
+        .execute_batch(&format!(
+            "DELETE FROM inventory_movements WHERE lot_id = '{b}';
+             DELETE FROM inventory_lots WHERE lot_id = '{b}';
+             UPDATE inventory_lots SET remaining_qty = 1, source_line_no = 7 WHERE lot_id = '{a}';
+             UPDATE inventory_movements SET nominal_qty = 9, qty_delta = 9 WHERE lot_id = '{butter_lot}';"
+        ))
+        .unwrap();
+    assert_ne!(projections(&db_path).unwrap(), online);
+
+    for _ in 0..2 {
+        assert_eq!(spec_support::rebuild_projections(&mut writer).unwrap(), 6);
+        assert_eq!(projections(&db_path).unwrap(), online);
+        assert_eq!(ledger(&db_path).unwrap(), ledger_before);
+    }
+    let line_nos = spec_support::rows(
+        &writer,
+        &format!(
+            "SELECT lot_id, source_line_no FROM inventory_lots
+             WHERE lot_id IN ('{a}', '{b}') ORDER BY source_line_no"
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        line_nos,
+        [
+            vec![SqlValue::Text(a.clone()), SqlValue::Integer(0)],
+            vec![SqlValue::Text(b.clone()), SqlValue::Integer(1)],
+        ]
+    );
+    drop(writer);
+
+    let router = spec_support::router(&db_path, clock.clock()).unwrap();
+    let retry = receive(
+        &router,
+        &cmd(5),
+        &supplier,
+        lines,
+        -60_000,
+        SENT + 3_600_000,
+    )
+    .await;
+    assert_eq!(retry.body, second.body);
+    assert_eq!(ledger(&db_path).unwrap(), ledger_before);
+    let reply = receive(
+        &router,
+        &cmd(7),
+        &supplier,
+        vec![receipt_line(&flour, 1, "g", 1, "2026-10-18")],
+        0,
+        SENT,
+    )
+    .await;
+    let lot = reply.body["data"]["receipt"]["lines"][0]["lot_id"].clone();
+    assert_eq!(
+        reply.body["warnings"],
+        json!([{
+            "code": "EXPIRES_BEFORE_OLDER_STOCK",
+            "message": reply.body["warnings"][0]["message"],
+            "details": { "line": 0, "item_id": flour, "lot_id": lot },
+        }])
+    );
+}

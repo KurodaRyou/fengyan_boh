@@ -274,3 +274,101 @@ async fn master_data_changed_items_recipes_suppliers_and_waste_reasons() {
         ]
     );
 }
+
+/// 收货 golden 样本中的供应商 ID 和批次 ID（物料 ID 沿用 `GOLDEN_FLOUR_ID`）：比对前把服务端生成的实际 ID 替换成它们。
+const GOLDEN_SUPPLIER_ID: &str = "01890a5d-ac96-774b-bcce-b302099a8601";
+const GOLDEN_LOT_IDS: [&str; 2] = [
+    "01890a5d-ac96-774b-bcce-b302099a8701",
+    "01890a5d-ac96-774b-bcce-b302099a8702",
+];
+
+// GOODS_RECEIVED@1：行的 manufacturer_lot_no 出现与省略各一份样本，省略时不写 null；键顺序见 domain.md「收货接口」。
+// expires_at 是 expires_on 在 Asia/Shanghai 的当日最后一毫秒；非 ASCII 文本不转义、引号转义一并锁定。
+// 被吸收分支（absorbed_by_event_id 代替 lot_id）的样本随盘点切片加入：在那之前没有写入口能产生它。
+#[tokio::test]
+async fn goods_received_with_and_without_manufacturer_lot_no() {
+    let cmd = |n: u16| format!("01890a5d-ac96-774b-bcce-b30209b2{n:04x}");
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("boh.db");
+    let router = spec_support::router(&db_path, ManualClock::new(NOW).clock()).unwrap();
+    let flour = post_ok(
+        &router,
+        "/api/v1/items",
+        json!({
+            "command_id": cmd(1), "code": "FLOUR", "name": "面粉", "base_unit": "g",
+            "category": "RAW", "units": [{ "unit_code": "袋", "base_qty_per_unit": 25000 }],
+            "active": true,
+        }),
+    )
+    .await["item"]["item_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let supplier = post_ok(
+        &router,
+        "/api/v1/suppliers",
+        json!({ "command_id": cmd(2), "code": "S-FLOUR", "name": "面粉供应商", "active": true }),
+    )
+    .await["supplier"]["supplier_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut lots = Vec::new();
+    for (command_id, line) in [
+        (
+            cmd(3),
+            json!({
+                "item_id": flour, "input": { "qty": 2, "unit_code": "袋", "base_qty_per_unit": 25000 },
+                "manufacturer_lot_no": "批号 \"A\"-1", "produced_on": "2026-10-01",
+                "expires_on": "2026-10-20", "line_cost_cents": 12345,
+            }),
+        ),
+        (
+            cmd(4),
+            json!({
+                "item_id": flour, "input": { "qty": 3000, "unit_code": "g", "base_qty_per_unit": 1 },
+                "produced_on": "2026-10-06", "expires_on": "2026-10-06", "line_cost_cents": 0,
+            }),
+        ),
+    ] {
+        let reply = spec_support::post(
+            &router,
+            "/api/v1/receipts",
+            Some(&STAFF),
+            &json!({
+                "command_id": command_id, "supplier_id": supplier, "lines": [line],
+                "captured_at": NOW.0 - 60_000, "sent_at": NOW.0,
+            }),
+        )
+        .await
+        .unwrap();
+        lots.push(
+            assert_success(&reply)["receipt"]["lines"][0]["lot_id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+
+    let payloads: Vec<String> = payloads(&db_path).unwrap()[2..]
+        .iter()
+        .map(|payload| {
+            payload
+                .replace(&flour, GOLDEN_FLOUR_ID)
+                .replace(&supplier, GOLDEN_SUPPLIER_ID)
+                .replace(&lots[0], GOLDEN_LOT_IDS[0])
+                .replace(&lots[1], GOLDEN_LOT_IDS[1])
+        })
+        .collect();
+    assert_eq!(
+        payloads,
+        [
+            golden(include_str!(
+                "golden/GOODS_RECEIVED@1/WITH_MANUFACTURER_LOT_NO.json"
+            )),
+            golden(include_str!(
+                "golden/GOODS_RECEIVED@1/WITHOUT_MANUFACTURER_LOT_NO.json"
+            )),
+        ]
+    );
+}
