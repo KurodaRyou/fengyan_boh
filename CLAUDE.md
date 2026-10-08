@@ -6,7 +6,7 @@
 Review 时以 AGENTS.md 的「不可违反的规则」为检查清单，逐条核对；除非用户要求，不直接改实现代码。
 本地 review（开发顺序第 6 步）在清单核对之后再跑 `/code-review`，补查清单以外的问题，与清单重复的不再列；两者都通过才给出可以提 PR 的结论。
 
-开发顺序第 1 步：先读 `workdocs/deferred-review-items.md` 中属于本切片的条目，写回 `docs/` 或锁定测试后删除对应条目。
+开发顺序第 1 步：`workdocs/deferred-review-items.md` 存在时（不进版本库，只在本机），先读其中属于本切片的条目，写回 `docs/` 或锁定测试后删除对应条目。
 
 开发顺序第 4.1 步写完后：先按下表用 `engineering:testing-strategy` 查覆盖缺口，再为测试 agent 准备独立测试审查（AGENTS.md「测试分工」）：
 - 副本放在仓库同级的 `../fengyan-blindtest-<切片>/`，复制工作区（锁定测试此时尚未提交），排除 `.git`、`workdocs/`、`target/`。
