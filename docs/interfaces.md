@@ -80,6 +80,7 @@ pub mod testing {
 - `open_reader`：只读连接，已设好全部 PRAGMA 和 `query_only = ON`。
 - `migrate`：与 `open` 内部相同的迁移。
 - `rebuild_projections`：在 `conn` 上以 `BEGIN IMMEDIATE` 执行与 `Writer::rebuild_projections` 相同的重建。`conn` 须由 `open_writer` 打开。
+- 本期没有写入口的事件（如 `source = HQ_PACKAGE` 的 `MASTER_DATA_CHANGED`），锁定测试经 `open_writer` 直接写入 `processed_commands` 和 `store_events`（不写 `seq` 列），再 `rebuild_projections` 核对投影。
 - 这些函数都是转发到 crate 内部函数的独立函数，不用 `pub use`。
   - clippy 按函数定义禁用；重导出会让 crate 内部对原函数的调用也被禁用。
 - 两份 `clippy.toml` 禁用这些函数，只有锁定测试及 `spec_support/` 可以 `#[allow]`。
@@ -305,4 +306,5 @@ pub fn parse_config(text: &str) -> Result<Config, impl std::error::Error>;
 - 退出码 0 表示成功，非 0 表示失败；测试不依赖输出文本。
 - 读取配置中的 `db_path`、`store_id`、`timezone`、`business_day_cutoff`；不创建 `backup_dir`，不监听端口，不启动后台任务。
 - 时间取系统时钟：测试只断言时间落在调用前后读取的系统时间之间，营业日按 `boh_domain::time::business_date` 由事件的 `occurred_at` 核对。
-- 写入内容见 domain.md「主数据」初始化；测试经 `boh_storage::testing::open_reader` 读取数据库。
+- 写入内容见 domain.md「主数据」初始化；测试经 `boh_storage::testing::open_reader` 读取数据库，经 `boh_app::test_router` 访问已初始化的数据库。
+- 回滚测试：先经 `boh_storage::testing::open_writer` 和 `migrate` 建库，在 `waste_reasons` 中放一行 `code = 'OTHER'`；`init` 写不进最后一条预置原因，必须以非 0 退出，`store_meta`、`processed_commands`、`store_events` 仍为空。删掉这一行后 `init` 可以重新执行。

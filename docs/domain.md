@@ -85,7 +85,7 @@ occurred_at = recorded_at − lag
 
 - 主键一律 UUIDv7。`code` 人可读、各门店统一（物料的 `code` 用于销售导入）。
 - `code`、`ITEM` 的 `base_unit` 和 `RECIPE` 的 `output_item_id` 创建后不可修改；配方已有的版本不可修改，只能追加新版本。
-  理由：账本数量按基本单位存；配方版本中的产出数量是产出物料的基本单位。
+  理由：账本数量按基本单位存；配方版本中的数量按产出物料和用料的基本单位解释，历史版本的产出物料也不能变。
 - 每行带 `revision`，每次变更 +1。主数据只停用（`active = 0`），不删除。
 - HTTP 修改命令携带客户端看到的 `base_revision`，与当前 `revision` 不等时返回 `409 REVISION_CONFLICT`（`details` 为 `{"current_revision": n}`），不写事件或 `processed_commands`。新建命令不带 `base_revision`；主数据包导入按快照逐行比对，不适用此规则。
 - 命令引用已停用的主数据照常受理，停用只在界面上隐藏。
@@ -154,7 +154,8 @@ occurred_at = recorded_at − lag
 | `POST /api/v1/recipes/{recipe_id}/versions` | `recipe.add_version` | `base_revision`, `output_qty_per_batch`, `lines` |
 
 - 新建时 `output_qty_per_batch` 和 `lines` 构成版本 1。
-- **追加版本**：新版本号是当前最大版本 + 1，写一条 `MASTER_DATA_CHANGED`，`revision` + 1；与最新版本内容相同也照常追加。权限、`base_revision`、配方不存在和成功的 `data` 同「修改」。
+- **追加版本**：新版本号是当前最大版本 + 1，写一条 `MASTER_DATA_CHANGED`，`revision` + 1。权限、`base_revision`、配方不存在和成功的 `data` 同「修改」。
+  - `output_qty_per_batch` 和 `lines`（含行顺序）都与最新版本相同时，不新增版本、不写事件，`revision` 不变；命令照常成功并写入 `processed_commands`，响应为当前配方。只与最新版本比较：从 A 改为 B 再改回 A，仍新增版本。
 - `output_qty_per_batch`、`qty_per_batch` 是正整数。`lines` 非空，每项 `{item_id, qty_per_batch}`，同一版本内 `item_id` 不重复，按提交顺序保存。
 - `output_item_id` 和每个 `lines[].item_id` 引用 `ITEM`（规则见「引用」）。不限制物料的 `category`，不检查产出物料是否出现在自己的 `lines` 中。
 
@@ -240,8 +241,8 @@ occurred_at = recorded_at − lag
 
 - **批次 ID**：每条收货行、每次生产产出、每个盘盈由写入线程生成一个 `lot_id`（UUIDv7），写进 payload。供应商批号 `supplier_lot_no` 是可选属性，不作主键。
 - **到期时间** `expires_at`（UTC 毫秒，可空）只用于过期提醒，不参与分配。只有日期的保质期由客户端换算成门店当地当日结束时刻再提交；未填写时可用 `default_shelf_life_ms` 推算，推算结果写进 payload。
-- **FIFO 分配**：未指定 `lot_id` 的扣减，按（盘盈优先、`source_seq`、`source_line_no`）升序分配：`origin = 'COUNT_GAIN'` 的批次优先，同一优先级内先按来源事件的 `seq` 升序，再按原 payload 行序升序。同一收货事件允许同一物料有多行，各行分别建批次，按原 `lines` 数组顺序分配。补录的收货按入账顺序排队。
-- **来源行序**：批次投影保存 `source_line_no`，从 0 开始；收货取原 `lines[i]` 的 `i`，盘盈取原 `new_lots[i]` 的 `i`，生产 `output` 固定取 0。被吸收的行不建批次，其他行保留原下标，不重新编号。行序直接从已保存的 payload 恢复，不新增 payload 字段；更正、冲销或盘点调整已有批次时不改变它的 `source_seq` 和 `source_line_no`。
+- **FIFO 分配**：未指定 `lot_id` 的扣减，按（盘盈优先、`source_event_seq`、`source_line_no`）升序分配：`origin = 'COUNT_GAIN'` 的批次优先，同一优先级内先按来源事件的 `seq` 升序，再按原 payload 行序升序。同一收货事件允许同一物料有多行，各行分别建批次，按原 `lines` 数组顺序分配。补录的收货按入账顺序排队。
+- **来源行序**：批次投影保存 `source_line_no`，从 0 开始；收货取原 `lines[i]` 的 `i`，盘盈取原 `new_lots[i]` 的 `i`，生产 `output` 固定取 0。被吸收的行不建批次，其他行保留原下标，不重新编号。行序直接从已保存的 payload 恢复，不新增 payload 字段；更正、冲销或盘点调整已有批次时不改变它的 `source_event_seq` 和 `source_line_no`。
 - 客户端可以指定 `lot_id`；指定批次余量不足时，不足部分继续按 FIFO 分配。
 - **账面不足**：全部批次分配完仍不够时不拒绝，剩余部分记入账外缺口，返回警告 `STOCK_SHORTFALL`。下一次包含该物料的盘点会把账外缺口清零。
 - 分配结果连同来源写进 payload：`alloc[{lot_id?, qty, source}]`。`qty` 为正数，不带 `lot_id` 表示账外缺口；`source`（`SPECIFIED` / `FIFO` / `SHORTFALL`，纠错另有 `CORRECTION` / `REVERSAL`，见「纠错」）。重放时直接使用，不重新分配。
@@ -432,15 +433,21 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 
 | 表 / 视图 | 内容 |
 |---|---|
-| `inventory_lots` | 每个批次一行，余量为 0 的批次保留；`source_seq`、`source_line_no` 见「批次」 |
+| `inventory_lots` | 每个批次一行，余量为 0 的批次保留；`source_event_seq`、`source_line_no` 是建批次的事件和原 payload 下标（见「批次」），之后的调整不改变它们 |
 | `inventory_unallocated` | 账外缺口，每个物料至多一行 |
-| `inventory_movements` | 每条库存影响按批次展开，一行一条 |
+| `inventory_movements` | 每条库存影响按批次展开，一行一条；`event_seq` 是产生它的事件，`movement_no` 是事件内的展开编号 |
 | `inventory_counts` | 每次盘点的每个被盘物料一行，零差异也写；`observed_at` 是盘点事件的 `occurred_at` |
 | 视图 `inventory_on_hand` | 每个物料的账面数，没有库存时为 0 |
 
 - `inventory_movements` 的数量带符号，增加为正：`nominal_qty` 是按申报内容应有的变动量，`qty_delta` 是实际作用于账面的变动量。
   - 未被吸收的行两者相等。被吸收的行 `qty_delta = 0`、`lot_id` 为 `NULL`；`absorbed_by_event_id` 直接取自 payload，重放时不查其他事件。
   - 未被吸收且 `lot_id` 为 `NULL` 的行作用于账外缺口。
+- **展开顺序**：`movement_no` 在同一事件内从 0 开始连续编号，按以下顺序展开；在线写入和重建使用同一个顺序。
+  - 行的顺序：`PRODUCTION_BATCH_COMPLETED` 先 `output`，再按下标升序的 `consumed`；其他事件按下标升序的 `lines`。
+  - 每行展开为：新建批次（`lot_id`）一条；被吸收（`absorbed_by_event_id`）一条；带 `alloc` 的按 `alloc` 数组顺序每项一条。
+  - `STOCK_ADJUSTED`：带 `lot_id` 的行一条，`qty_delta = delta`；不带 `lot_id` 的行先一条账外缺口归零（`lot_id` 为 `NULL`，`qty_delta = −book_qty`），再一条 `new_lots` 中该物料的盘盈批次。
+  - `nominal_qty = 0` 的展开项不写流水，也不占编号。
+  - 一条 payload 行可能分到多个批次，所以流水不按 payload 行号编号。
 - `kind`：收货 `RECEIPT`，生产产出 `PRODUCE`，生产用料 `CONSUME`，报损 `WASTE`，盘点调整 `ADJUST`；纠错行沿用原行的 `kind`（见「纠错」）。
 - `alloc_source`：新建批次（含盘盈批次）`NEW_LOT`；盘点对已有批次和账外缺口的调整 `COUNT`；被吸收 `ABSORBED`；其余直接取 payload 中 `alloc` 的 `source`。
 - **不变量**（测试和定时自检都检查）：

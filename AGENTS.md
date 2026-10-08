@@ -247,7 +247,7 @@ scripts/        CI 扫描脚本。
 
 ### ID 与时间
 - 所有实体 / 事件主键用 **UUIDv7**（`TEXT`，36 位小写带连字符，版本位 `7`，变体位 `8`–`b`）。禁止自增整数 ID。
-  唯一例外：`store_events.seq`（门店内提交顺序，由 SQLite 分配）。投影表中的 `line_no`、`source_line_no` 是行号，不是自增键。
+  唯一例外：`store_events.seq`（门店内提交顺序，由 SQLite 分配）。投影表中的 `line_no`、`source_line_no`、`movement_no` 是行号或展开编号，不是自增键。
 - 客户端提交的 ID（如 `command_id`，含请求体、路径参数、查询参数和开发桩请求头中的 ID）在 `boh-domain` 中校验必须是 v7，文本只接受与存储相同的 36 位小写带连字符形式；大写、无连字符、花括号、`urn:` 前缀都按取值非法处理。
 - 服务端生成的 UUIDv7 在写事务内构造：时间部分取该命令的 `recorded_at`（负值按 0），随机部分取 SQLite `randomblob(10)`，由 `boh-domain` 的纯函数拼装。不用 `Uuid::now_v7()`。
   - `now_v7()` 在 uuid crate 内部读系统时钟，绕过时钟模块，`disallowed-methods` 也拦不住。

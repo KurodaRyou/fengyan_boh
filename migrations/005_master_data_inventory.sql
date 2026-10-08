@@ -78,18 +78,19 @@ CREATE TABLE waste_reasons (
 ) STRICT;
 
 -- 批次：每条收货行、每次生产产出、每个盘盈一行；余量为 0 的批次保留。
--- FIFO 按（盘盈优先、source_seq、source_line_no）升序，见 docs/domain.md「批次」。
+-- FIFO 按（盘盈优先、source_event_seq、source_line_no）升序，见 docs/domain.md「批次」。
+-- source_event_seq、source_line_no 是建批次的事件和原 payload 下标，之后的调整不改变它们。
 CREATE TABLE inventory_lots (
-    lot_id          TEXT PRIMARY KEY
-                    CHECK (length(lot_id) = 36 AND lot_id = lower(lot_id) AND substr(lot_id, 15, 1) = '7'),
-    item_id         TEXT NOT NULL REFERENCES items(id) DEFERRABLE INITIALLY DEFERRED,
-    origin          TEXT NOT NULL CHECK (origin IN ('RECEIPT', 'PRODUCTION', 'COUNT_GAIN')),
-    source_seq      INTEGER NOT NULL REFERENCES store_events(seq),  -- 建批次的事件
-    source_line_no  INTEGER NOT NULL CHECK (source_line_no >= 0),    -- 原 payload 下标；生产 output 为 0
-    remaining_qty   INTEGER NOT NULL CHECK (remaining_qty >= 0),
-    expires_at      INTEGER,                                         -- NULL：payload 中省略
-    supplier_lot_no TEXT CHECK (supplier_lot_no IS NULL OR supplier_lot_no <> ''), -- NULL：payload 中省略
-    UNIQUE (source_seq, source_line_no)
+    lot_id           TEXT PRIMARY KEY
+                     CHECK (length(lot_id) = 36 AND lot_id = lower(lot_id) AND substr(lot_id, 15, 1) = '7'),
+    item_id          TEXT NOT NULL REFERENCES items(id) DEFERRABLE INITIALLY DEFERRED,
+    origin           TEXT NOT NULL CHECK (origin IN ('RECEIPT', 'PRODUCTION', 'COUNT_GAIN')),
+    source_event_seq INTEGER NOT NULL REFERENCES store_events(seq),  -- 建批次的事件
+    source_line_no   INTEGER NOT NULL CHECK (source_line_no >= 0),    -- 原 payload 下标；生产 output 为 0
+    remaining_qty    INTEGER NOT NULL CHECK (remaining_qty >= 0),
+    expires_at       INTEGER,                                         -- NULL：payload 中省略
+    supplier_lot_no  TEXT CHECK (supplier_lot_no IS NULL OR supplier_lot_no <> ''), -- NULL：payload 中省略
+    UNIQUE (source_event_seq, source_line_no)
 ) STRICT;
 
 CREATE INDEX idx_inventory_lots_item ON inventory_lots(item_id);
@@ -103,9 +104,10 @@ CREATE TABLE inventory_unallocated (
 -- 库存流水：每条库存影响按批次展开，一行一条。数量带符号，增加为正。
 -- nominal_qty 是按申报内容应有的变动量，qty_delta 是实际作用于账面的变动量。
 -- lot_id 为 NULL：被吸收，或作用于账外缺口。
+-- movement_no 是事件内的展开编号，从 0 连续，展开顺序见 docs/domain.md「投影表」。
 CREATE TABLE inventory_movements (
     event_seq            INTEGER NOT NULL REFERENCES store_events(seq),
-    line_no              INTEGER NOT NULL CHECK (line_no >= 0),
+    movement_no          INTEGER NOT NULL CHECK (movement_no >= 0),
     item_id              TEXT NOT NULL REFERENCES items(id) DEFERRABLE INITIALLY DEFERRED,
     lot_id               TEXT REFERENCES inventory_lots(lot_id) DEFERRABLE INITIALLY DEFERRED,
     kind                 TEXT NOT NULL CHECK (kind IN ('RECEIPT', 'PRODUCE', 'CONSUME', 'WASTE', 'ADJUST')),
@@ -116,7 +118,7 @@ CREATE TABLE inventory_movements (
     absorbed_by_event_id TEXT REFERENCES store_events(id),           -- 直接取自 payload
     physical_at          INTEGER NOT NULL,                           -- 实物时点 t(e)
     business_date        TEXT NOT NULL CHECK (date(business_date) IS business_date),
-    PRIMARY KEY (event_seq, line_no),
+    PRIMARY KEY (event_seq, movement_no),
     CHECK ((absorbed_by_event_id IS NULL AND alloc_source <> 'ABSORBED' AND qty_delta = nominal_qty)
         OR (absorbed_by_event_id IS NOT NULL AND alloc_source = 'ABSORBED' AND qty_delta = 0
             AND lot_id IS NULL)),
