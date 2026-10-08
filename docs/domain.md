@@ -201,7 +201,7 @@ occurred_at = recorded_at − lag
 - 写命令成功的 `data` 是 `{"receipt": 行}`；行为 `receipt_id`、`supplier_id`、`lines`（与 payload 的 `lines` 相同）、`business_date`、`occurred_at`、`recorded_at`、`actor_id`、`device_id`。
 - **取值**：不满足时 `400 VALIDATION_FAILED`，`details` 为 `{}`。
   - `lines` 非空。同一物料可以有多行，各行分别建批次。
-  - `input.qty`、`input.base_qty_per_unit` 是正整数；`input.unit_code` 非空、首尾不能有空白字符。`input.qty × input.base_qty_per_unit` 超出 `i64`。
+  - `input.qty`、`input.base_qty_per_unit` 是正整数；`input.unit_code` 非空、首尾不能有空白字符。`input.qty × input.base_qty_per_unit` 不超出 `i64`。
   - `line_cost_cents` 是该行总金额（分），`>= 0`。
   - `supplier_lot_no` 可以省略；出现时非空、首尾不能有空白字符、最多 64 个字符（按 Unicode 字符计），不接受 `null`。
   - `produced_on`（生产日期）、`expires_on`（到期日）必填，是包装标签上的门店当地日期，格式 `'YYYY-MM-DD'`（真实日期），`produced_on <= expires_on`。标签只印保质期时长时，由客户端按日历推算 `expires_on`。
