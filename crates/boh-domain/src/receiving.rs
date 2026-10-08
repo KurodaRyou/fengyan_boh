@@ -1,9 +1,11 @@
 //! Receipt commands and the frozen GOODS_RECEIVED@1 payload.
 
-use jiff::civil::Date;
+use jiff::civil::{Date, date as civil_date};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{AggregateId, CommandId, DomainError, UnixMillis};
+
+const LAST_EXPIRES_ON: Date = civil_date(9998, 12, 31);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -171,7 +173,12 @@ fn validate_line(
     {
         return Err(DomainError::InvalidField("manufacturer_lot_no"));
     }
-    if date(produced_on, "produced_on")? > date(expires_on, "expires_on")? {
+    let expires_on = date(expires_on, "expires_on")?;
+    // expires_at is derived from the next local midnight, which must stay in range.
+    if expires_on > LAST_EXPIRES_ON {
+        return Err(DomainError::InvalidField("expires_on"));
+    }
+    if date(produced_on, "produced_on")? > expires_on {
         return Err(DomainError::InvalidField("produced_on"));
     }
     Ok(())

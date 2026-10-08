@@ -12,6 +12,7 @@ use boh_storage::{StorageError, Writer};
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use super::missing_reference;
 use crate::{
     AppState,
     actor::Actor,
@@ -33,15 +34,6 @@ fn normalized(
 
 fn response(key: &str, row: &impl Serialize) -> Result<String, ApiError> {
     serde_json::to_string(&ok(json!({key: row})).0).map_err(ApiError::internal)
-}
-
-fn missing(entity: &str, id: AggregateId) -> ApiError {
-    ApiError::new(
-        StatusCode::NOT_FOUND,
-        "REFERENCE_NOT_FOUND",
-        "master data not found",
-    )
-    .with_details(json!({"entity": entity, "id": id}))
 }
 
 fn revision(current: i64, submitted: i64) -> Result<(), ApiError> {
@@ -92,7 +84,7 @@ fn item_reference(tx: &Transaction<'_>, id: AggregateId) -> Result<(), ApiError>
         )
         .map_err(StorageError::from)?;
     if !found {
-        return Err(missing("ITEM", id));
+        return Err(missing_reference("ITEM", id));
     }
     Ok(())
 }
@@ -245,7 +237,7 @@ pub async fn update_item(
         "item.update",
         request,
         move |write| {
-            let mut row = read_item(write.tx, id)?.ok_or_else(|| missing("ITEM", id))?;
+            let mut row = read_item(write.tx, id)?.ok_or_else(|| missing_reference("ITEM", id))?;
             revision(row.revision, command.base_revision)?;
             let snapshot = command.snapshot(&row.snapshot);
             snapshot.validate().map_err(|_| ApiError::validation())?;
@@ -316,7 +308,8 @@ pub async fn update_recipe(
         "recipe.update",
         request,
         move |write| {
-            let mut row = read_recipe(write.tx, id)?.ok_or_else(|| missing("RECIPE", id))?;
+            let mut row =
+                read_recipe(write.tx, id)?.ok_or_else(|| missing_reference("RECIPE", id))?;
             revision(row.revision, command.base_revision)?;
             if row.snapshot.name != command.name || row.snapshot.active != command.active {
                 row.revision = next(row.revision)?;
@@ -351,7 +344,8 @@ pub async fn add_recipe_version(
         "recipe.add_version",
         request,
         move |write| {
-            let mut row = read_recipe(write.tx, id)?.ok_or_else(|| missing("RECIPE", id))?;
+            let mut row =
+                read_recipe(write.tx, id)?.ok_or_else(|| missing_reference("RECIPE", id))?;
             revision(row.revision, command.base_revision)?;
             line_references(write.tx, &command.lines)?;
             let latest = row
@@ -426,7 +420,7 @@ pub async fn update_supplier(
     let request = normalized(&command, Some(("supplier_id", id)))?;
     execute(state, actor, command.command_id, "supplier.update", request, move |write| {
         let mut row = write.tx.query_row("SELECT id, code, name, contact_phone, active, revision FROM suppliers WHERE id = ?1", [id.to_string()], read_supplier)
-            .optional().map_err(StorageError::from)?.ok_or_else(|| missing("SUPPLIER", id))?;
+            .optional().map_err(StorageError::from)?.ok_or_else(|| missing_reference("SUPPLIER", id))?;
         revision(row.revision, command.base_revision)?;
         let snapshot = command.snapshot(&row.snapshot);
         if snapshot != row.snapshot {
@@ -494,7 +488,7 @@ pub async fn update_waste_reason(
                 )
                 .optional()
                 .map_err(StorageError::from)?
-                .ok_or_else(|| missing("WASTE_REASON", id))?;
+                .ok_or_else(|| missing_reference("WASTE_REASON", id))?;
             revision(row.revision, command.base_revision)?;
             let snapshot = command.snapshot(&row.snapshot);
             if snapshot != row.snapshot {

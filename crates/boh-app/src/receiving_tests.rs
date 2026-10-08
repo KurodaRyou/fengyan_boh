@@ -236,3 +236,24 @@ async fn receipt_dates_use_configured_timezone_and_replay_preserves_the_saved_ex
         .unwrap();
     node.storage.writer_handle.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn expiry_past_9998_is_a_value_error_checked_before_idempotency() {
+    let node = node(true).await;
+    let (item, supplier) = seed(&node).await;
+    let accepted = request(3, &supplier, &item, &["9998-12-31"]);
+    let (status, response) = send(node.router.clone(), Method::POST, URI, accepted.clone()).await;
+    assert_eq!(status, 200, "{response}");
+    let counts = receipt_counts(&node).await;
+    for command in [
+        request(3, &supplier, &item, &["9999-01-01"]),
+        request(4, &supplier, &item, &["9999-12-31"]),
+    ] {
+        let (status, response) = send(node.router.clone(), Method::POST, URI, command).await;
+        assert_eq!(status, 400, "{response}");
+        assert_eq!(response["error"]["code"], "VALIDATION_FAILED");
+        assert_eq!(response["error"]["details"], json!({}));
+    }
+    assert_eq!(receipt_counts(&node).await, counts);
+    node.storage.writer_handle.shutdown().await.unwrap();
+}

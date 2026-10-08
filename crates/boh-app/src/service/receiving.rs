@@ -11,6 +11,7 @@ use boh_storage::ledger::{self, Command, Event};
 use boh_storage::rusqlite::{OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 
+use super::missing_reference;
 use crate::AppState;
 use crate::actor::Actor;
 use crate::http::{ApiError, WarningBody, ok};
@@ -179,15 +180,6 @@ pub async fn create(
         })
         .await?;
     super::parse_response(&response)
-}
-
-fn missing_reference(entity: &'static str, id: AggregateId) -> ApiError {
-    ApiError::new(
-        StatusCode::NOT_FOUND,
-        "REFERENCE_NOT_FOUND",
-        "referenced entity not found",
-    )
-    .with_details(json!({ "entity": entity, "id": id }))
 }
 
 fn validate_unit(tx: &Transaction<'_>, index: usize, line: &ReceiptLine) -> Result<(), ApiError> {

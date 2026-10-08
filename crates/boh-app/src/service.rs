@@ -123,14 +123,7 @@ pub async fn update(
                         )
                         .optional()
                         .map_err(StorageError::from)?
-                        .ok_or_else(|| {
-                            ApiError::new(
-                                StatusCode::NOT_FOUND,
-                                "REFERENCE_NOT_FOUND",
-                                "equipment not found",
-                            )
-                            .with_details(json!({ "entity": "EQUIPMENT", "id": id.to_string() }))
-                        })?;
+                        .ok_or_else(|| missing_reference("EQUIPMENT", id))?;
                     if current.revision != command.base_revision {
                         return Err(ApiError::new(
                             StatusCode::CONFLICT,
@@ -226,14 +219,7 @@ pub async fn log_temperature(
                         )
                         .map_err(StorageError::from)?;
                     if !exists {
-                        return Err(ApiError::new(
-                            StatusCode::NOT_FOUND,
-                            "REFERENCE_NOT_FOUND",
-                            "equipment not found",
-                        )
-                        .with_details(json!({
-                            "entity": "EQUIPMENT", "id": command.equipment_id.to_string()
-                        })));
+                        return Err(missing_reference("EQUIPMENT", command.equipment_id));
                     }
                     let id = AggregateId::from_parts(recorded_at, ledger::entropy(tx)?)
                         .map_err(StorageError::from)?;
@@ -368,6 +354,15 @@ fn equipment(id: AggregateId, snapshot: EquipmentSnapshot, revision: i64) -> Equ
         active: snapshot.active,
         revision,
     }
+}
+
+fn missing_reference(entity: &str, id: AggregateId) -> ApiError {
+    ApiError::new(
+        StatusCode::NOT_FOUND,
+        "REFERENCE_NOT_FOUND",
+        "referenced entity not found",
+    )
+    .with_details(json!({ "entity": entity, "id": id }))
 }
 
 fn normalized(command: &impl Serialize, id: Option<AggregateId>) -> Result<String, ApiError> {
