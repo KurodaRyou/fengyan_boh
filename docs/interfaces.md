@@ -62,6 +62,7 @@ pub use rusqlite;
   - 有读事务未结束、等满 `busy_timeout` 仍无法截断 WAL 时，记 `warn` 并返回 `Ok`；之后重新 `open` 能读到全部已提交的数据。其他错误照常返回 `Err`。
 - `Readers::call`：借出一个只读连接，在一个 DEFERRED 读事务中执行 `f`，`f` 内的读取看到同一个快照；在 `spawn_blocking` 上运行。
 - `StorageError` 的变体由实现决定；锁定测试只依赖 `UnsupportedSchemaVersion { found: i64, supported: i64 }`。
+  - 迁移 SQL 执行失败时，错误的 `source()` 链保留 SQLite 的原始错误；锁定测试按链上的文本核对迁移中约束的名字（如迁移 007 的前置检查）。
 - `open_writer`、`open_reader`、`migrate`、`spawn_writer`、`checkpoint_truncate`、`Readers::open` 都是 `pub(crate)`。
 
 ### boh_storage::testing
