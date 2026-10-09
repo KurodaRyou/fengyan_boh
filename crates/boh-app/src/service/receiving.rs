@@ -3,6 +3,8 @@
 use std::collections::BTreeMap;
 
 use axum::http::StatusCode;
+use boh_domain::lot::LotId;
+use boh_domain::master_data::ItemCategory;
 use boh_domain::receiving::{CreateReceipt, GoodsReceived, Receipt, ReceiptLine, ReceivedLine};
 use boh_domain::time::{CaptureTimes, business_date, calibrate, end_of_local_date, local_date};
 use boh_domain::{AggregateId, EventId, UnixMillis};
@@ -51,6 +53,9 @@ pub async fn create(
                     )?;
                     let calendar_date =
                         local_date(calibrated.occurred_at, &state.timezone)?.to_string();
+                    let lot_date = calendar_date
+                        .parse()
+                        .map_err(|error| StorageError::external("解析批次日期", error))?;
                     let supplier_exists: bool = tx
                         .query_row(
                             "SELECT EXISTS(SELECT 1 FROM suppliers WHERE id = ?1)",
@@ -72,9 +77,10 @@ pub async fn create(
                         });
                     }
                     let mut earlier_expiries: BTreeMap<AggregateId, UnixMillis> = BTreeMap::new();
+                    let mut last_serials: BTreeMap<AggregateId, i64> = BTreeMap::new();
                     let mut lines = Vec::with_capacity(command.lines.len());
                     for (index, line) in command.lines.into_iter().enumerate() {
-                        validate_unit(tx, index, &line)?;
+                        let (code, category) = validate_item(tx, index, &line)?;
                         // Both strings are canonical YYYY-MM-DD dates, so their
                         // ordering equals calendar ordering, including year 0000.
                         let reason = if line.produced_on > calendar_date {
@@ -99,13 +105,44 @@ pub async fn create(
                             .parse()
                             .map_err(|_| ApiError::validation())?;
                         let expires_at = end_of_local_date(expires_on, &state.timezone)?;
-                        let lot_id = AggregateId::from_parts(recorded_at, ledger::entropy(tx)?)
+                        let last_serial = match last_serials.get(&line.item_id) {
+                            Some(serial) => *serial,
+                            None => tx
+                                .query_row(
+                                    "SELECT coalesce(max(lot_serial), 0) FROM inventory_lots
+                                     WHERE item_id = ?1 AND lot_date = ?2",
+                                    params![line.item_id.to_string(), calendar_date],
+                                    |row| row.get::<_, i64>(0),
+                                )
+                                .map_err(|error| StorageError::sqlite("查询批次流水号", error))?,
+                        };
+                        let serial = last_serial
+                            .checked_add(1)
+                            .filter(|serial| *serial <= 999)
+                            .ok_or_else(|| {
+                                ApiError::new(
+                                    StatusCode::CONFLICT,
+                                    "LOT_SERIAL_EXHAUSTED",
+                                    "lot serials exhausted for this item and date",
+                                )
+                                .with_details(json!({
+                                    "line": index, "item_id": line.item_id, "lot_date": calendar_date
+                                }))
+                            })?;
+                        last_serials.insert(line.item_id, serial);
+                        let lot_id = LotId::from_parts(category, &code, lot_date, serial)
                             .map_err(StorageError::from)?;
                         let older_expires_later: bool = tx
                             .query_row(
                                 "SELECT EXISTS(SELECT 1 FROM inventory_lots
-                                 WHERE item_id = ?1 AND remaining_qty > 0 AND expires_at > ?2)",
-                                params![line.item_id.to_string(), expires_at.0],
+                                 WHERE item_id = ?1 AND remaining_qty > 0 AND expires_at > ?2
+                                   AND (lot_date < ?3 OR (lot_date = ?3 AND lot_serial < ?4)))",
+                                params![
+                                    line.item_id.to_string(),
+                                    expires_at.0,
+                                    calendar_date,
+                                    serial
+                                ],
                                 |row| row.get(0),
                             )
                             .map_err(|error| StorageError::sqlite("查询库存批次", error))?;
@@ -163,7 +200,7 @@ pub async fn create(
                         id: EventId::from_parts(recorded_at, ledger::entropy(tx)?)
                             .map_err(StorageError::from)?,
                         event_type: "GOODS_RECEIVED".into(),
-                        schema_version: 1,
+                        schema_version: 2,
                         aggregate_type: "RECEIPT".into(),
                         aggregate_id: receipt_id,
                         aggregate_version: 1,
@@ -187,18 +224,23 @@ pub async fn create(
     super::parse_response(&response)
 }
 
-fn validate_unit(tx: &Transaction<'_>, index: usize, line: &ReceiptLine) -> Result<(), ApiError> {
-    let current: Option<(String, Option<i64>)> = tx
+fn validate_item(
+    tx: &Transaction<'_>,
+    index: usize,
+    line: &ReceiptLine,
+) -> Result<(String, ItemCategory), ApiError> {
+    let current: Option<(String, Option<i64>, String, String)> = tx
         .query_row(
-            "SELECT items.base_unit, item_units.base_qty_per_unit FROM items
+            "SELECT items.base_unit, item_units.base_qty_per_unit, items.code, items.category FROM items
              LEFT JOIN item_units ON item_units.item_id = items.id AND item_units.unit_code = ?2
              WHERE items.id = ?1",
             params![line.item_id.to_string(), line.input.unit_code],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
         .map_err(|error| StorageError::sqlite("查询物料", error))?;
-    let (base_unit, factor) = current.ok_or_else(|| missing_reference("ITEM", line.item_id))?;
+    let (base_unit, factor, code, category) =
+        current.ok_or_else(|| missing_reference("ITEM", line.item_id))?;
     let factor = if line.input.unit_code == base_unit {
         1
     } else {
@@ -224,5 +266,8 @@ fn validate_unit(tx: &Transaction<'_>, index: usize, line: &ReceiptLine) -> Resu
             "base_qty_per_unit": factor
         })));
     }
-    Ok(())
+    Ok((
+        code,
+        ItemCategory::parse(&category).map_err(StorageError::from)?,
+    ))
 }

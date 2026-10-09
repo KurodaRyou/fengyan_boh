@@ -103,7 +103,7 @@
 1. **Write path 与基础设施**：时钟模块、相对校准、营业日纯函数；`Readers::call` 包读事务、写线程任务计时；信封加 `warnings`；`boh_storage::open()` 收口。
 2. **Walking skeleton 与首批切片**：
    设备主数据（walking skeleton：`ledger::execute` / `Ledger::append` / `projections::apply` 骨架与 `rebuild-projections`、`Actor` 开发桩、`boh-server init`、`EQUIPMENT` 写接口、迁移 002：`equipment`；打通 write path、幂等、重放、golden payload）
-   → 温度记录（迁移 003：`temperature_readings`）→ 备份模块与恢复演练测试、`/health` 字段（迁移 004：`store_events(recorded_at)` 索引）→ 005：其余主数据与库存投影表 → 收货（迁移 006：批号列改名为 `manufacturer_lot_no`）→ 报损（FIFO、指定批次、账外缺口、库存明细查询）→ 不变量自检 → 盘点（含盘点吸收：已有的收货、报损一并实现吸收判定）→ 局域网 HTTPS → 员工认证。
+   → 温度记录（迁移 003：`temperature_readings`）→ 备份模块与恢复演练测试、`/health` 字段（迁移 004：`store_events(recorded_at)` 索引）→ 005：其余主数据与库存投影表 → 收货（迁移 006：批号列改名为 `manufacturer_lot_no`）→ 批次号与库存明细查询（迁移 007：重建 `inventory_lots`、`inventory_movements`，批次号为主键、余量可为负；`GOODS_RECEIVED@2`）→ 报损（指定批次与确认、FIFO、账外缺口）→ 不变量自检 → 盘点（含盘点吸收：已有的报损一并实现吸收判定）→ 局域网 HTTPS → 员工认证。
    - 设备主数据切片的 `init` 只写 `store_meta`；预置报损原因随 005 加入；`EMPLOYEE`（`employees` 投影、写接口、golden 样本）与第一个店长随认证切片加入。
 3. **扩展**：生产 → 纠错（冲销、数量更正）→ 补录入口 → 销售导入。每一步配对应的验收用例。
 
@@ -212,13 +212,14 @@ scripts/        CI 扫描脚本。
 
 ### ID 与时间
 - 所有实体 / 事件主键用 **UUIDv7**（`TEXT`，36 位小写带连字符，版本位 `7`，变体位 `8`–`b`）。禁止自增整数 ID。
-  唯一例外：`store_events.seq`（门店内提交顺序，由 SQLite 分配）。投影表中的 `line_no`、`source_line_no`、`movement_no` 是行号或展开编号，不是自增键。
-- 客户端提交的 ID（如 `command_id`，含请求体、路径参数、查询参数和开发桩请求头中的 ID）在 `boh-domain` 中校验必须是 v7，文本只接受与存储相同的 36 位小写带连字符形式；大写、无连字符、花括号、`urn:` 前缀都按取值非法处理。
+  例外：`store_events.seq`（门店内提交顺序，由 SQLite 分配）；批次以人可读的批次号 `lot_id` 为主键（格式与生成规则见 `docs/domain.md`「批次」，生成后不变）。投影表中的 `line_no`、`source_line_no`、`movement_no` 是行号或展开编号，不是自增键。
+- 客户端提交的 ID（如 `command_id`，含请求体、路径参数、查询参数和开发桩请求头中的 ID）在 `boh-domain` 中校验必须是 v7，文本只接受与存储相同的 36 位小写带连字符形式；大写、无连字符、花括号、`urn:` 前缀都按取值非法处理。客户端提交的批次号按 `docs/domain.md`「批次」的格式校验。
 - 服务端生成的 UUIDv7 在写事务内构造：时间部分取该命令的 `recorded_at`（负值按 0），随机部分取 SQLite `randomblob(10)`，由 `boh-domain` 的纯函数拼装。不用 `Uuid::now_v7()`。
   - `now_v7()` 在 uuid crate 内部读系统时钟，绕过时钟模块，`disallowed-methods` 也拦不住。
 - 时间戳一律 `INTEGER`，UTC Unix **毫秒**。禁止存格式化的日期时间字符串。
-  例外：表示门店当地日期的业务字段——`business_date`（营业日）、采购单的 `deliver_on`（要求到货日）、收货行的 `produced_on`（生产日期）和 `expires_on`（到期日），格式 `'YYYY-MM-DD'`，它们是业务概念而不是时间点。
-- **事件间顺序只看 `seq`**：重放、同步按 `seq`；FIFO 先扣盘盈批次，再按来源事件的 `seq` 升序，同一来源事件内按原 payload 的行序（`source_line_no`）升序。不按任何时间戳。
+  例外：表示门店当地日期的业务字段——`business_date`（营业日）、采购单的 `deliver_on`（要求到货日）、收货行的 `produced_on`（生产日期）和 `expires_on`（到期日）、批次日期，格式 `'YYYY-MM-DD'`（批次号中为 `YYYYMMDD`），它们是业务概念而不是时间点。
+- **事件间顺序只看 `seq`**：重放、同步按 `seq`，不按任何时间戳。
+- **批次间的 FIFO 顺序看批次号**：同一物料内先比批次日期，再比流水号。批次日期在建批次时由 `occurred_at` 确定，写进 payload 中的批次号，之后不重算。
 - `recorded_at` 取系统时钟原值，**不做单调钳制**。
   - 顺序已由 `seq` 保证；钳制会让一次跳到未来的时钟把之后的时间全部卡在未来。
 - `occurred_at` 由相对校准计算（或补录时显式给出），`business_date` 由 `occurred_at` 计算（`SALES_IMPORTED` 例外，由命令显式给出）。规则见 `docs/domain.md`「时间」。
@@ -236,6 +237,7 @@ scripts/        CI 扫描脚本。
 - 主数据也走事件流（`MASTER_DATA_CHANGED`），主数据表是投影。
   例外：员工凭据、设备注册、会话等认证状态表不进事件流、不同步、不参与重建。
 - 事件 payload 结构一旦发布不得修改：改结构只能升 `schema_version`，再写 upcast。
+  - 例外：`GOODS_RECEIVED@1` 缺少生成批次号所需的信息，不能 upcast，也不推测；账本中有 `@1` 收货时，迁移 007 报错、节点拒绝启动（见 `docs/domain.md`「收货接口」）。
 
 ### 幂等
 - 每个写命令必须带客户端生成的 `command_id`（UUIDv7）。超时或结果未知时，客户端**必须用原 ID、原内容重试**。
@@ -389,7 +391,7 @@ ARM 门店机改用 `aarch64-unknown-linux-musl`。部署文件见 `deploy/`。
 - 上行同步的实现：总部接收接口、批量大小、mTLS 证书下发与轮换、失败的重试分类（哪些错误可重试）。**延后**；契约见「上行同步」。
 - 局域网 HTTPS：证书签发与平板信任方式（见 `docs/domain.md` Q9）。**认证切片的前置条件。**
 - 异地备份复制的实现。
-- 备份恢复：恢复入口与操作步骤，以及恢复后的上行同步（恢复到旧备份会让 `seq` 回退，与总部已接收的事件冲突）。原则已定：恢复时清空会话、PIN 重置授权、设备注册、设备解锁码、锁定状态与失败计数，平板重新注册；员工 PIN 哈希保留。认证幂等记录不得绕过恢复后的设备注册校验。**延后**；恢复演练测试照常要求。
+- 门店节点恢复与业务连续性：恢复入口与操作步骤（方向：数据库备份 + 纸面业务凭据 + 人工补录 + 盘点核对），覆盖收货、生产、报损、盘点、幂等重试，以及恢复后的上行同步（恢复到旧备份会让 `seq` 回退，与总部已接收的事件冲突）。恢复后不得重用已贴在货物上的批次号。原则已定：恢复时清空会话、PIN 重置授权、设备注册、设备解锁码、锁定状态与失败计数，平板重新注册；员工 PIN 哈希保留。认证幂等记录不得绕过恢复后的设备注册校验。**延后**；恢复演练测试照常要求。
 
 ---
 

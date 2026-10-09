@@ -39,11 +39,11 @@
 | Business date | 营业日 | 门店当地日期，早于日切时刻（默认 `04:00`）的发生时间算前一营业日 | domain「时间」 |
 | Relative calibration | 相对校准 | 用平板同一时钟的 `sent_at − captured_at` 加上节点的 `recorded_at`，算出 `occurred_at`，抵消平板时钟偏差 | domain「时间」 |
 | Backfill | 补录 | 经显式入口直接提交过去的 `occurred_at`，不走相对校准 | domain「时间」 |
-| Lot | 批次 | 一次收货行、生产产出或盘盈形成的一份库存，以 `lot_id` 标识 | domain「批次」 |
+| Lot | 批次 | 一次收货行或生产产出形成的一份库存，以批次号标识 | domain「批次」 |
+| Lot number | 批次号 | 批次的唯一标识 `lot_id`，格式 `类型-编码-YYYYMMDD-流水号`，印在标签上，人和程序都用它识别同一批实物；生成后不变 | domain「批次」 |
 | Manufacturer lot number | 生产商批号 | 包装上由生产商印的批号（`manufacturer_lot_no`），可选，不作批次主键；不是供应商的批号 | domain「批次」 |
-| Count-gain lot | 盘盈批次 | 盘点发现实物多于账面时新建的批次，FIFO 分配时最先扣 | domain「批次」 |
 | Allocation | 分配 | 把一笔扣减落到具体批次（或账外缺口）的结果，写进 payload 的 `alloc`，重放时不重新计算 | domain「批次」 |
-| Off-book shortfall | 账外缺口 | 扣减超过全部批次余量时，未落到批次的不足部分；下一次盘点该物料时清零 | domain「批次」 |
-| Count absorption | 盘点吸收 | 实物发生在某次盘点观察时点之前、却在盘点之后才入账的库存影响，已被盘点数计入，因此不再改动库存，只更正报表 | domain「盘点吸收」 |
+| Off-book shortfall | 账外缺口 | 未指定批次的扣减超过全部正余量批次时，未落到批次的不足部分；下一次盘点该物料时清零 | domain「批次」 |
+| Count absorption | 盘点吸收 | 实物发生在某次盘点观察时点之前、却在盘点之后才入账的扣减（及对盘点时已存在批次的纠错），已被盘点数计入，因此不再改动库存，只更正报表 | domain「盘点吸收」 |
 | Reversal | 冲销 | 追加一条 `EVENT_REVERSED`，整条抵消原事件 | domain「纠错」 |
 | Quantity correction | 数量更正 | 追加一条 `QUANTITY_CORRECTED`，只改数量并保持原批次 | domain「纠错」 |

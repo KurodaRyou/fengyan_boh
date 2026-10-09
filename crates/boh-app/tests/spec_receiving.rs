@@ -14,7 +14,7 @@ use boh_storage::clock::ManualClock;
 use boh_storage::rusqlite::types::Value as SqlValue;
 use serde_json::{Value, json};
 use spec_support::{
-    Actor, JsonReply, MANAGER, STAFF, assert_error, assert_success, is_uuid_v7,
+    Actor, JsonReply, MANAGER, STAFF, assert_error, assert_success, is_lot_number, is_uuid_v7,
     non_canonical_uuids, raw_request, request, send,
 };
 use tempfile::TempDir;
@@ -65,11 +65,13 @@ fn node() -> Node {
 
 type Rows<T> = Result<T, Box<dyn Error>>;
 
-/// `inventory_lots` 的一行：(lot_id, item_id, origin, source_event_seq, source_line_no, remaining_qty,
-/// expires_at, manufacturer_lot_no)。
+/// `inventory_lots` 的一行：(lot_id, item_id, lot_date, lot_serial, origin, source_event_seq, source_line_no,
+/// remaining_qty, expires_at, manufacturer_lot_no)。
 type LotRow = (
     String,
     String,
+    String,
+    i64,
     String,
     i64,
     i64,
@@ -249,8 +251,8 @@ impl Node {
     fn lots(&self) -> Rows<Vec<LotRow>> {
         let reader = spec_support::reader(&self.db_path)?;
         let mut statement = reader.prepare(
-            "SELECT lot_id, item_id, origin, source_event_seq, source_line_no, remaining_qty,
-                    expires_at, manufacturer_lot_no
+            "SELECT lot_id, item_id, lot_date, lot_serial, origin, source_event_seq, source_line_no,
+                    remaining_qty, expires_at, manufacturer_lot_no
              FROM inventory_lots ORDER BY source_event_seq, source_line_no",
         )?;
         let rows = statement
@@ -264,6 +266,8 @@ impl Node {
                     r.get(5)?,
                     r.get(6)?,
                     r.get(7)?,
+                    r.get(8)?,
+                    r.get(9)?,
                 ))
             })?
             .collect::<Result<_, _>>()?;
@@ -397,20 +401,17 @@ fn timed_body(
     })
 }
 
-/// 成功响应的 `data.receipt`；校验收货 ID 和每行的 `lot_id` 是 UUIDv7。
 #[allow(clippy::unwrap_used)] // 测试夹具：成功响应缺少这些字段已违反接口约定，直接终止测试。
-/// 取出成功响应中的收货行，并校验服务端生成的 ID：规范 UUIDv7，时间部分等于该命令的 `recorded_at`
-/// （AGENTS.md「ID 与时间」：不用 `Uuid::now_v7()`）。
+/// 取出成功响应中的收货行，并校验服务端生成的标识：收货 ID 是规范 UUIDv7，时间部分等于该命令的 `recorded_at`
+/// （AGENTS.md「ID 与时间」：不用 `Uuid::now_v7()`）；每行的 `lot_id` 是批次号（domain.md「批次」）。
 fn receipt(reply: &JsonReply) -> &Value {
     let receipt = &assert_success(reply)["receipt"];
     let recorded_at = receipt["recorded_at"].as_i64().unwrap();
-    let assert_id = |id: &str| {
-        assert!(is_uuid_v7(id), "{receipt}");
-        assert_eq!(uuid_v7_millis(id), recorded_at, "{id}");
-    };
-    assert_id(receipt["receipt_id"].as_str().unwrap());
+    let receipt_id = receipt["receipt_id"].as_str().unwrap();
+    assert!(is_uuid_v7(receipt_id), "{receipt}");
+    assert_eq!(uuid_v7_millis(receipt_id), recorded_at, "{receipt_id}");
     for line in receipt["lines"].as_array().unwrap() {
-        assert_id(line["lot_id"].as_str().unwrap());
+        assert!(is_lot_number(line["lot_id"].as_str().unwrap()), "{receipt}");
     }
     receipt
 }
@@ -462,9 +463,11 @@ fn assert_warnings(reply: &JsonReply, expected: &[(&str, Value)]) {
 // 写入成功
 // ---------------------------------------------------------------------------------------------
 
-// 收货接口「新建」：普通员工即可收货；一个命令写一条 GOODS_RECEIVED（新的 RECEIPT 聚合，version 1）和一行
+// 收货接口「新建」：普通员工即可收货；一个命令写一条 GOODS_RECEIVED@2（新的 RECEIPT 聚合，version 1）和一行
 // processed_commands；每行建一个批次并写一条流水。
 // - qty = input.qty × base_qty_per_unit；expires_at = expires_on 当日最后一毫秒（Asia/Shanghai）。
+// - 批次号 <类型>-<编码>-<批次日期>-<流水号>：面粉的两行按行序取 001、002，黄油另从 001 开始；批次日期是 occurred_at
+//   （10-06 08:50）的当地日期；投影的 lot_date、lot_serial 由批次号拆出。
 // - 同一物料的两行分别建批次，source_line_no 为原下标（「来源行序」）；用基本单位提交时系数为 1。
 // - payload 的键顺序锁定在 golden 样本中；这里按 JSON 值比对。manufacturer_lot_no 省略时 payload、投影、响应都没有它。
 // - 相对校准抵消平板时钟偏差；规范化请求保留 captured_at，剥离 command_id、sent_at。
@@ -492,10 +495,14 @@ async fn receive_writes_event_lots_movements_and_command() {
     let receipt = receipt(&reply).clone();
     let receipt_id = receipt["receipt_id"].as_str().unwrap().to_owned();
     let lots = lot_ids(&receipt);
-    assert_eq!(lots.len(), 3);
-    assert_ne!(lots[0], lots[1]);
-    assert_ne!(lots[0], lots[2]);
-    assert_ne!(lots[1], lots[2]);
+    assert_eq!(
+        lots,
+        [
+            "RAW-FLOUR-20261006-001",
+            "RAW-BUTTER-20261006-001",
+            "RAW-FLOUR-20261006-002"
+        ]
+    );
     let occurred_at = NOW - 10 * MINUTE;
     let payload_lines = json!([
         {
@@ -544,7 +551,7 @@ async fn receive_writes_event_lots_movements_and_command() {
         [Event {
             seq,
             event_type: "GOODS_RECEIVED".into(),
-            schema_version: 1,
+            schema_version: 2,
             aggregate_type: "RECEIPT".into(),
             aggregate_id: receipt_id,
             aggregate_version: 1,
@@ -563,6 +570,8 @@ async fn receive_writes_event_lots_movements_and_command() {
             (
                 lots[0].clone(),
                 flour.clone(),
+                "2026-10-06".into(),
+                1,
                 "RECEIPT".into(),
                 seq,
                 0,
@@ -573,6 +582,8 @@ async fn receive_writes_event_lots_movements_and_command() {
             (
                 lots[1].clone(),
                 butter.clone(),
+                "2026-10-06".into(),
+                1,
                 "RECEIPT".into(),
                 seq,
                 1,
@@ -583,6 +594,8 @@ async fn receive_writes_event_lots_movements_and_command() {
             (
                 lots[2].clone(),
                 flour.clone(),
+                "2026-10-06".into(),
+                2,
                 "RECEIPT".into(),
                 seq,
                 2,
@@ -801,7 +814,8 @@ async fn relative_calibration_applies() {
 // 到期提醒与日期校验（验收用例「到期早于先扣的批次」「到货即过期」「凌晨收当天生产的货」）
 // ---------------------------------------------------------------------------------------------
 
-// domain「批次」EXPIRES_BEFORE_OLDER_STOCK：已有批次 A 余量 5、到期 10-20，B 余量 5、到期 10-25；一次收货
+// domain「批次」EXPIRES_BEFORE_OLDER_STOCK：同一天已有批次 A（RAW-FLOUR-20261006-001）余量 5、到期 10-20，
+// B（…-002）余量 5、到期 10-25；一次收货的四行依次建 …-003～…-006，批次号都排在 A、B 之后：
 // lines[0] 到期 10-15（早于 A、B），lines[1] 到期 10-25（不早于任何先扣的批次），lines[2] 到期 10-22（早于 B 和同次的 lines[1]）。
 // 每个命中的行恰好一条警告（早于多个批次也只一条），按 line 升序，details 为 {line, item_id, lot_id}（新批次）；各行都入账。
 // 另一物料的批次、到期相同的批次都不触发；CAPTURE_TIME_ADJUSTED 排在最前。
@@ -856,6 +870,15 @@ async fn expiry_before_stock_used_first_warns_per_line() {
         .await;
 
     let lots = lot_ids(receipt(&reply));
+    assert_eq!(
+        lots,
+        [
+            "RAW-FLOUR-20261006-003",
+            "RAW-FLOUR-20261006-004",
+            "RAW-FLOUR-20261006-005",
+            "RAW-FLOUR-20261006-006"
+        ]
+    );
     assert_warnings(
         &reply,
         &[
@@ -1389,7 +1412,8 @@ async fn out_of_range_times_are_validation_failed() {
 // ---------------------------------------------------------------------------------------------
 
 // 验收用例「同次收货重复提交」「幂等」：一小时后用原 command_id、原内容重发（sent_at 不同，包括会超过 72 小时的值），
-// 原样返回首次响应（含 warnings、原批次 ID），seq 不增加，批次与流水不变；不重新计算到期提醒。
+// 原样返回首次响应（含 warnings、原批次号 …-001、…-002），seq 不增加，批次与流水不变；不重新计算到期提醒，
+// 也不重新分配流水号。
 // 幂等检查先于业务校验：首次成功后换算系数变了，原内容重试仍返回首次响应，不是 409 UNIT_CONVERSION_CHANGED。
 #[tokio::test]
 async fn retries_return_the_original_response() {
@@ -1408,6 +1432,7 @@ async fn retries_return_the_original_response() {
         )
         .await;
     let lots = lot_ids(receipt(&first));
+    assert_eq!(lots, ["RAW-FLOUR-20261006-001", "RAW-FLOUR-20261006-002"]);
     assert_warnings(
         &first,
         &[

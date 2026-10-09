@@ -128,6 +128,14 @@ async fn failures_after_partial_projection_or_at_command_save_roll_back_every_ro
     let (status, response) = send(node.router.clone(), Method::POST, URI, original).await;
     assert_eq!(status, 200, "{response}");
     assert_eq!(receipt_counts(&node).await, (3, 3, 2, 2, 3));
+    assert_eq!(
+        response["data"]["receipt"]["lines"][0]["lot_id"],
+        "RAW-FLOUR-20261006-001"
+    );
+    assert_eq!(
+        response["data"]["receipt"]["lines"][1]["lot_id"],
+        "RAW-FLOUR-20261006-002"
+    );
     node.storage.writer_handle.shutdown().await.unwrap();
 }
 
@@ -220,6 +228,10 @@ async fn receipt_dates_use_configured_timezone_and_replay_preserves_the_saved_ex
     let (status, reply) = send(router, Method::POST, URI, body).await;
     assert_eq!(status, 200, "{reply}");
     assert_eq!(reply["data"]["receipt"]["business_date"], "2026-10-05");
+    assert_eq!(
+        reply["data"]["receipt"]["lines"][0]["lot_id"],
+        "RAW-FLOUR-20261005-001"
+    );
     // NOW is October 6 01:00 UTC; the next Los Angeles midnight is 07:00 UTC.
     let expires_at = NOW + 6 * 3_600_000 - 1;
     assert_eq!(
@@ -261,5 +273,125 @@ async fn expiry_past_9998_is_a_value_error_checked_before_idempotency() {
         assert_eq!(response["error"]["details"], json!({}));
     }
     assert_eq!(receipt_counts(&node).await, counts);
+    node.storage.writer_handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_receipts_get_distinct_serials_even_when_the_clock_moves_backwards() {
+    let node = node(true).await;
+    let (item, supplier) = seed(&node).await;
+    let (first, second) = tokio::join!(
+        send(
+            node.router.clone(),
+            Method::POST,
+            URI,
+            request(3, &supplier, &item, &["2026-10-20"])
+        ),
+        send(
+            node.router.clone(),
+            Method::POST,
+            URI,
+            request(4, &supplier, &item, &["2026-10-20"])
+        ),
+    );
+    assert_eq!(first.0, 200, "{first:?}");
+    assert_eq!(second.0, 200, "{second:?}");
+    let mut lots = [
+        first.1["data"]["receipt"]["lines"][0]["lot_id"]
+            .as_str()
+            .unwrap(),
+        second.1["data"]["receipt"]["lines"][0]["lot_id"]
+            .as_str()
+            .unwrap(),
+    ];
+    lots.sort_unstable();
+    assert_eq!(lots, ["RAW-FLOUR-20261006-001", "RAW-FLOUR-20261006-002"]);
+    node.clock.set(UnixMillis(NOW - 60_000));
+    let third = send(
+        node.router.clone(),
+        Method::POST,
+        URI,
+        request(5, &supplier, &item, &["2026-10-20"]),
+    )
+    .await;
+    assert_eq!(third.0, 200, "{third:?}");
+    assert_eq!(
+        third.1["data"]["receipt"]["lines"][0]["lot_id"],
+        "RAW-FLOUR-20261006-003"
+    );
+    assert_eq!(third.1["data"]["receipt"]["recorded_at"], NOW - 60_000);
+    assert_eq!(receipt_counts(&node).await, (5, 5, 3, 3, 5));
+    node.storage.writer_handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn inventory_includes_negative_lots_and_shortfalls_and_lookup_retains_zero_lots() {
+    let node = node(true).await;
+    let (item, supplier) = seed(&node).await;
+    let (status, receipt) = send(
+        node.router.clone(),
+        Method::POST,
+        URI,
+        request(
+            3,
+            &supplier,
+            &item,
+            &["2026-10-20", "2026-10-20", "2026-10-20"],
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{receipt}");
+    let fixture_item = item.clone();
+    node.storage.writer.call(move |tx| -> Result<(), StorageError> {
+        // These projection states become reachable through later waste/count slices.
+        tx.execute("UPDATE inventory_lots SET remaining_qty = 0 WHERE lot_serial = 1", [])
+            .map_err(|error| StorageError::sqlite("设置零余量查询夹具", error))?;
+        tx.execute("UPDATE inventory_lots SET remaining_qty = -3, expires_at = NULL WHERE lot_serial = 2", [])
+            .map_err(|error| StorageError::sqlite("设置负余量查询夹具", error))?;
+        tx.execute("INSERT INTO inventory_unallocated (item_id, qty) VALUES (?1, -2)", [fixture_item])
+            .map_err(|error| StorageError::sqlite("设置账外缺口查询夹具", error))?;
+        Ok(())
+    }).await.unwrap();
+    let (status, inventory) = send(
+        node.router.clone(),
+        Method::GET,
+        "/api/v1/inventory",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{inventory}");
+    let row = &inventory["data"]["items"][0];
+    assert_eq!(row["item_id"], item);
+    assert_eq!(row["on_hand_qty"], 0);
+    assert_eq!(row["unallocated_qty"], -2);
+    assert_eq!(row["lots"].as_array().unwrap().len(), 2);
+    let negative = &row["lots"][0];
+    assert_eq!(
+        negative,
+        &json!({
+            "lot_id": "RAW-FLOUR-20261006-002", "origin": "RECEIPT", "remaining_qty": -3,
+            "source_occurred_at": NOW,
+        })
+    );
+    let (status, lookup) = send(
+        node.router.clone(),
+        Method::GET,
+        "/api/v1/lots/RAW-FLOUR-20261006-002",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{lookup}");
+    let mut expected = negative.clone();
+    expected["item_id"] = json!(item);
+    assert_eq!(lookup["data"]["lot"], expected);
+    let (status, zero) = send(
+        node.router.clone(),
+        Method::GET,
+        "/api/v1/lots/RAW-FLOUR-20261006-001",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{zero}");
+    assert_eq!(zero["data"]["lot"]["remaining_qty"], 0);
     node.storage.writer_handle.shutdown().await.unwrap();
 }

@@ -1,8 +1,9 @@
-//! Receipt commands and the frozen GOODS_RECEIVED@1 payload.
+//! Receipt commands and the frozen GOODS_RECEIVED@2 payload.
 
 use jiff::civil::{Date, date as civil_date};
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::lot::LotId;
 use crate::{AggregateId, CommandId, DomainError, UnixMillis};
 
 const LAST_EXPIRES_ON: Date = civil_date(9998, 12, 31);
@@ -90,7 +91,7 @@ pub struct ReceivedLine {
     pub item_id: AggregateId,
     pub qty: i64,
     pub input: ReceiptInput,
-    pub lot_id: AggregateId,
+    pub lot_id: LotId,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",

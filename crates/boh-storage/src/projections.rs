@@ -1,6 +1,7 @@
 //! Event-only projections shared by online appends and replay.
 
 use boh_domain::equipment::EquipmentType;
+use boh_domain::lot::LotId;
 use boh_domain::receiving::{GoodsReceived, ReceiptInput, ReceivedLine};
 use boh_domain::temperature::TemperatureLogged;
 use boh_domain::{AggregateId, CommandId, EventId, UnixMillis};
@@ -37,7 +38,7 @@ pub(crate) fn apply(tx: &Transaction<'_>, event: &Event) -> Result<(), StorageEr
             crate::master_data::apply(tx, event)
         }
         ("TEMPERATURE_LOGGED", 1, "TEMPERATURE_READING") => apply_temperature(tx, event),
-        ("GOODS_RECEIVED", 1, "RECEIPT") => apply_receipt(tx, event),
+        ("GOODS_RECEIVED", 2, "RECEIPT") => apply_receipt(tx, event),
         _ => Err(StorageError::InvalidEvent(
             "unsupported event type or version".into(),
         )),
@@ -187,12 +188,14 @@ fn apply_receipt(tx: &Transaction<'_>, event: &Event) -> Result<(), StorageError
         let index = i64::try_from(index)
             .map_err(|_| StorageError::InvalidEvent("receipt line number overflow".into()))?;
         tx.execute(
-            "INSERT INTO inventory_lots (lot_id, item_id, origin, source_event_seq,
+            "INSERT INTO inventory_lots (lot_id, item_id, lot_date, lot_serial, origin, source_event_seq,
                  source_line_no, remaining_qty, expires_at, manufacturer_lot_no)
-             VALUES (?1, ?2, 'RECEIPT', ?3, ?4, ?5, ?6, ?7)",
+             VALUES (?1, ?2, ?3, ?4, 'RECEIPT', ?5, ?6, ?7, ?8, ?9)",
             params![
                 line.lot_id.to_string(),
                 line.item_id.to_string(),
+                line.lot_id.date().to_string(),
+                line.lot_id.serial(),
                 seq,
                 index,
                 line.qty,
@@ -312,7 +315,7 @@ fn read_received_line(row: &Row<'_>) -> rusqlite::Result<ReceivedLine> {
             unit_code: row.get(3)?,
             base_qty_per_unit: row.get(4)?,
         },
-        lot_id: row_id(row, 5, AggregateId::parse)?,
+        lot_id: row_id(row, 5, LotId::parse)?,
         manufacturer_lot_no: row.get(6)?,
         produced_on: row.get(7)?,
         expires_on: row.get(8)?,
@@ -387,7 +390,7 @@ mod tests {
     async fn receipt_decoder_rejects_coerced_types_missing_keys_and_non_object_lines() {
         let dir = tempfile::tempdir().unwrap();
         let storage = open(&dir.path().join("boh.db"), NonZeroUsize::MIN).unwrap();
-        let good = r#"{"supplier_id":"01890a5d-ac96-774b-bcce-b302099a8601","lines":[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8602","qty":5,"input":{"qty":5,"unit_code":"g","base_qty_per_unit":1},"lot_id":"01890a5d-ac96-774b-bcce-b302099a8701","produced_on":"2026-10-01","expires_on":"2026-10-20","expires_at":1792511999999,"line_cost_cents":0}]}"#;
+        let good = r#"{"supplier_id":"01890a5d-ac96-774b-bcce-b302099a8601","lines":[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8602","qty":5,"input":{"qty":5,"unit_code":"g","base_qty_per_unit":1},"lot_id":"RAW-FLOUR-20261006-001","produced_on":"2026-10-01","expires_on":"2026-10-20","expires_at":1792511999999,"line_cost_cents":0}]}"#;
         storage
             .writer
             .call(move |tx| -> Result<(), StorageError> {

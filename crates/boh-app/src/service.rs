@@ -1,5 +1,6 @@
 //! Command orchestration. Business checks execute after ledger idempotency.
 
+pub(crate) mod inventory;
 pub(crate) mod master_data;
 pub(crate) mod receiving;
 

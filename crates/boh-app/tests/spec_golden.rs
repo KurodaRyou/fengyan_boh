@@ -275,16 +275,15 @@ async fn master_data_changed_items_recipes_suppliers_and_waste_reasons() {
     );
 }
 
-/// 收货 golden 样本中的供应商 ID 和批次 ID（物料 ID 沿用 `GOLDEN_FLOUR_ID`）：比对前把服务端生成的实际 ID 替换成它们。
+/// 收货 golden 样本中的供应商 ID（物料 ID 沿用 `GOLDEN_FLOUR_ID`）：比对前把服务端生成的实际 ID 替换成它。
 const GOLDEN_SUPPLIER_ID: &str = "01890a5d-ac96-774b-bcce-b302099a8601";
-const GOLDEN_LOT_IDS: [&str; 2] = [
-    "01890a5d-ac96-774b-bcce-b302099a8701",
-    "01890a5d-ac96-774b-bcce-b302099a8702",
-];
 
-// GOODS_RECEIVED@1：行的 manufacturer_lot_no 出现与省略各一份样本，省略时不写 null；键顺序见 domain.md「收货接口」。
+// GOODS_RECEIVED@2：行的 manufacturer_lot_no 出现与省略各一份样本，省略时不写 null；键顺序与 @1 相同。
+// lot_id 是批次号（10-06 收货，面粉两次收货依次为 001、002），不做替换，逐字节比对。
 // expires_at 是 expires_on 在 Asia/Shanghai 的当日最后一毫秒；非 ASCII 文本不转义、引号转义一并锁定。
-// 被吸收分支（absorbed_by_event_id 代替 lot_id）的样本随盘点切片加入：在那之前没有写入口能产生它。
+// 收货行新建批次，不被吸收（domain.md「盘点吸收」），没有吸收分支。
+// GOODS_RECEIVED@1 不再由系统产生；golden/GOODS_RECEIVED@1/ 的样本保留为 @1 的历史结构，
+// 用作「账本中有 @1 收货」的输入（schema.rs 的迁移 007、spec_replay.rs 的重建）。
 #[tokio::test]
 async fn goods_received_with_and_without_manufacturer_lot_no() {
     let cmd = |n: u16| format!("01890a5d-ac96-774b-bcce-b30209b2{n:04x}");
@@ -313,7 +312,6 @@ async fn goods_received_with_and_without_manufacturer_lot_no() {
         .as_str()
         .unwrap()
         .to_owned();
-    let mut lots = Vec::new();
     for (command_id, line) in [
         (
             cmd(3),
@@ -342,12 +340,7 @@ async fn goods_received_with_and_without_manufacturer_lot_no() {
         )
         .await
         .unwrap();
-        lots.push(
-            assert_success(&reply)["receipt"]["lines"][0]["lot_id"]
-                .as_str()
-                .unwrap()
-                .to_owned(),
-        );
+        assert_success(&reply);
     }
 
     let payloads: Vec<String> = payloads(&db_path).unwrap()[2..]
@@ -356,18 +349,16 @@ async fn goods_received_with_and_without_manufacturer_lot_no() {
             payload
                 .replace(&flour, GOLDEN_FLOUR_ID)
                 .replace(&supplier, GOLDEN_SUPPLIER_ID)
-                .replace(&lots[0], GOLDEN_LOT_IDS[0])
-                .replace(&lots[1], GOLDEN_LOT_IDS[1])
         })
         .collect();
     assert_eq!(
         payloads,
         [
             golden(include_str!(
-                "golden/GOODS_RECEIVED@1/WITH_MANUFACTURER_LOT_NO.json"
+                "golden/GOODS_RECEIVED@2/WITH_MANUFACTURER_LOT_NO.json"
             )),
             golden(include_str!(
-                "golden/GOODS_RECEIVED@1/WITHOUT_MANUFACTURER_LOT_NO.json"
+                "golden/GOODS_RECEIVED@2/WITHOUT_MANUFACTURER_LOT_NO.json"
             )),
         ]
     );
