@@ -1,11 +1,15 @@
 //! 锁定测试：关闭时 WAL 截断因读事务未结束而失败，只记警告、正常返回，已提交的数据不丢。
 //! 规则见 AGENTS.md「Rust」优雅关闭顺序，接口见 docs/interfaces.md（`WriterHandle::shutdown`）。
 
+use std::error::Error;
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
+use boh_storage::open;
 use boh_storage::rusqlite::params;
-use boh_storage::{StorageError, open};
+
+// 闭包错误类型：满足 `E: From<StorageError>`，rusqlite 错误经 `?` 直接转换，不依赖 StorageError 的构造方式。
+type TestError = Box<dyn Error + Send + Sync>;
 
 const STORE: &str = "01890a5d-ac96-774b-bcce-b302099a8050";
 const CREATED_AT: i64 = 1_791_248_400_000;
@@ -20,7 +24,7 @@ async fn checkpoint_busy_at_shutdown_still_succeeds_and_keeps_committed_data() {
     let storage = open(&path, NonZeroUsize::MIN).unwrap();
     storage
         .writer
-        .call(|tx| -> Result<(), StorageError> {
+        .call(|tx| -> Result<(), TestError> {
             tx.execute(
                 "INSERT INTO store_meta (id, store_id, created_at) VALUES (1, ?1, ?2)",
                 params![STORE, CREATED_AT],
@@ -54,7 +58,7 @@ async fn checkpoint_busy_at_shutdown_still_succeeds_and_keeps_committed_data() {
     let reopened = open(&path, NonZeroUsize::MIN).unwrap();
     let stored: (String, i64) = reopened
         .readers
-        .call(|conn| -> Result<_, StorageError> {
+        .call(|conn| -> Result<_, TestError> {
             Ok(
                 conn.query_row("SELECT store_id, created_at FROM store_meta", [], |r| {
                     Ok((r.get(0)?, r.get(1)?))
