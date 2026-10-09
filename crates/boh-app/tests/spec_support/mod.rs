@@ -258,6 +258,25 @@ pub fn is_uuid_v7(text: &str) -> bool {
         && matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
 }
 
+/// domain.md「批次」的批次号：`<类型>-<编码>-<YYYYMMDD>-<流水号>`，类型为 RAW / SEMI / FINISHED，编码非空且只含 A–Z、0–9、_，
+/// 日期 8 位数字，流水号 `001`–`999`。只检查形状，不检查日期是否真实。
+pub fn is_lot_number(text: &str) -> bool {
+    let parts: Vec<&str> = text.split('-').collect();
+    let [category, code, date, serial] = parts.as_slice() else {
+        return false;
+    };
+    ["RAW", "SEMI", "FINISHED"].contains(category)
+        && !code.is_empty()
+        && code
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        && date.len() == 8
+        && date.bytes().all(|b| b.is_ascii_digit())
+        && serial.len() == 3
+        && serial.bytes().all(|b| b.is_ascii_digit())
+        && *serial != "000"
+}
+
 /// 同一个 UUIDv7 的非规范文本形式：大写、无连字符、花括号、`urn:` 前缀（AGENTS.md「ID 与时间」：都按取值非法处理）。
 /// 放进路径时，调用方把花括号写成 `%7B` / `%7D`。
 pub fn non_canonical_uuids(id: &str) -> [String; 4] {

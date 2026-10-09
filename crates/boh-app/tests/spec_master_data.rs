@@ -203,7 +203,7 @@ async fn node(entity: &'static Entity) -> Node {
     let router = spec_support::router(&db_path, clock.clock()).unwrap();
     let mut refs = Refs::default();
     if entity.name == "RECIPE" {
-        for (n, code) in [(0xff01, "REF-FLOUR"), (0xff02, "REF-TOAST")] {
+        for (n, code) in [(0xff01, "REF_FLOUR"), (0xff02, "REF_TOAST")] {
             let reply = spec_support::post(
                 &router,
                 "/api/v1/items",
@@ -219,7 +219,7 @@ async fn node(entity: &'static Entity) -> Node {
                 .as_str()
                 .unwrap()
                 .to_owned();
-            if code == "REF-FLOUR" {
+            if code == "REF_FLOUR" {
                 refs.flour = id;
             } else {
                 refs.toast = id;
@@ -974,6 +974,7 @@ async fn validation_precedes_the_idempotency_check() {
 }
 
 // 主数据接口「查询」：含停用的行，按 code 的字节序升序（大写在小写之前，"A1" 在 "A10" 之前）；没有行时为空数组。
+// ITEM 的 code 不能有小写字母（domain「主数据」），用 "_0" 代替 "a0"：'_' 同样排在大写字母之后。
 #[tokio::test]
 async fn list_returns_all_rows_ordered_by_code_bytes() {
     for entity in ENTITIES {
@@ -986,7 +987,8 @@ async fn list_returns_all_rows_ordered_by_code_bytes() {
         );
 
         let b2 = node.create_ok(&cmd(1), "B2").await;
-        let lower = node.create_ok(&cmd(2), "a0").await;
+        let last_code = if entity.name == "ITEM" { "_0" } else { "a0" };
+        let lower = node.create_ok(&cmd(2), last_code).await;
         let a1 = node.create_ok(&cmd(3), "A1").await;
         let a10 = node.create_ok(&cmd(4), "A10").await;
         assert_success(&node.update(&b2, &node.update_body(&cmd(5), 1)).await);
@@ -997,7 +999,7 @@ async fn list_returns_all_rows_ordered_by_code_bytes() {
                 node.row(&a1, "A1", false, 1),
                 node.row(&a10, "A10", false, 1),
                 node.row(&b2, "B2", true, 2),
-                node.row(&lower, "a0", false, 1),
+                node.row(&lower, last_code, false, 1),
             ] }),
             "{}",
             entity.name

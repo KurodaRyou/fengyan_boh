@@ -1,4 +1,4 @@
-//! 锁定测试：物料特有的字段规则（基本单位、分类、默认保质期、单位换算）与 items / item_units 投影。
+//! 锁定测试：物料特有的字段规则（编码字符集、基本单位、分类、默认保质期、单位换算）与 items / item_units 投影。
 //! 规则见 docs/domain.md「主数据」「主数据接口」物料、「单位」；共用的接口行为见 spec_master_data.rs。
 
 mod spec_support;
@@ -294,6 +294,45 @@ async fn units_may_be_empty_and_are_ordered_by_bytes() {
     assert_eq!(items[0]["code"], json!("CREAM"));
     assert_eq!(items[1]["units"], json!([]));
     assert!(items[1].get("default_shelf_life_ms").is_none(), "{items}");
+}
+
+// domain「主数据」：ITEM 的 code 只能由 A–Z、0–9 和 _ 组成（它是批次号的一段）。小写、混合大小写、-、内部空格、中文、全角字母、
+// 其他标点都是 400 VALIDATION_FAILED，不落库；只有 _ 或只有数字的编码照常受理。其他实体的 code 不受此限（见 spec_master_data.rs）。
+#[tokio::test]
+async fn item_code_uses_only_uppercase_letters_digits_and_underscores() {
+    let node = node();
+    let before = (node.counts(), node.items().unwrap());
+
+    for code in [
+        "flour",
+        "Flour",
+        "FL-OUR",
+        "FL OUR",
+        "面粉",
+        "ＦＬＯＵＲ",
+        "FLOUR.1",
+        "FLOUR/1",
+        "É",
+    ] {
+        let mut body = flour(&cmd(1));
+        body["code"] = json!(code);
+        let reply = node.create(&body).await;
+        assert_error(&reply, 400, "VALIDATION_FAILED");
+    }
+    assert_eq!((node.counts(), node.items().unwrap()), before);
+
+    for (n, code) in ["A_1", "_", "0", "FLOUR_T65", "T65"].iter().enumerate() {
+        let mut body = flour(&cmd(n as u16 + 2));
+        body["code"] = json!(code);
+        let id = node.create_ok(&body).await;
+        assert!(
+            node.items()
+                .unwrap()
+                .iter()
+                .any(|row| row.0 == id && row.1 == *code),
+            "{code}"
+        );
+    }
 }
 
 // 主数据接口「物料」取值：base_unit、category 不在枚举内（区分大小写）；default_shelf_life_ms 不是正整数或为 null；

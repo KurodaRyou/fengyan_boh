@@ -678,9 +678,12 @@ async fn receive(
 
 // 收货的账本（同一物料两行、带生产商批号、单位换算、负 lag 的警告、前一营业日）：在线写入后篡改库存投影
 // （删批次及其流水、改余量与来源行序、改流水数量），重建后全部投影与在线写入逐行一致，账本、processed_commands 和 store_meta 不变；
-// 重建可重复执行。验收用例「来源行序重建」：同次收货的 A、B 重建后 source_line_no 仍为 0、1。
+// 重建可重复执行。验收用例「批次号重建」：同次收货的 A、B 重建后仍为 RAW-FLOUR-20261006-001、…-002，source_line_no 仍为 0、1；
+// occurred_at 为 10-06 03:00 的黄油批次属于前一营业日，批次日期仍是当地日历日期 10-06（RAW-BUTTER-20261006-002）。
+// 之后黄油改为 SEMI：重建时黄油的当前分类与建批次时不同，两个 RAW-BUTTER 批次号照原样恢复，不按当前分类重新拼装。
 // 重建不影响幂等回执：之后用原 command_id、原内容（sent_at 不同）重发，原样返回首次响应（含 warnings），不新增事件。
-// 重建后的批次能继续支撑新的写命令：新批次早于 A 到期时返回 EXPIRES_BEFORE_OLDER_STOCK。
+// 重建后的批次能继续支撑新的写命令：面粉新批次的流水号接着重建出的批次取 …-004；它早于 A 到期，返回 EXPIRES_BEFORE_OLDER_STOCK；
+// 同次的黄油行取当前分类，流水号接着 RAW-BUTTER 批次取 SEMI-BUTTER-20261006-003，到期晚于已有黄油批次，不警告。
 #[tokio::test]
 async fn rebuild_restores_receipt_projections() {
     let dir = tempfile::tempdir().unwrap();
@@ -763,14 +766,44 @@ async fn rebuild_restores_receipt_projections() {
         .as_str()
         .unwrap()
         .to_owned();
-    // lag 6 小时：occurred_at 为 03:00，归前一营业日。
-    receive(
+    assert_eq!(
+        [a.as_str(), b.as_str(), butter_lot.as_str()],
+        [
+            "RAW-FLOUR-20261006-001",
+            "RAW-FLOUR-20261006-002",
+            "RAW-BUTTER-20261006-001"
+        ]
+    );
+    assert_eq!(
+        second.body["data"]["receipt"]["lines"][1]["lot_id"],
+        json!("RAW-FLOUR-20261006-003")
+    );
+    // lag 6 小时：occurred_at 为 03:00，归前一营业日；批次日期仍是 10-06。
+    let third = receive(
         &router,
         &cmd(6),
         &supplier,
         vec![receipt_line(&butter, 3, "g", 1, "2026-10-20")],
         6 * 3_600_000,
         SENT,
+    )
+    .await;
+    assert_eq!(
+        third.body["data"]["receipt"]["business_date"],
+        json!("2026-10-05")
+    );
+    assert_eq!(
+        third.body["data"]["receipt"]["lines"][0]["lot_id"],
+        json!("RAW-BUTTER-20261006-002")
+    );
+    write(
+        &router,
+        "PUT",
+        &format!("/api/v1/items/{butter}"),
+        json!({
+            "command_id": cmd(8), "base_revision": 1, "name": "黄油", "category": "SEMI",
+            "units": [], "active": true,
+        }),
     )
     .await;
 
@@ -797,7 +830,7 @@ async fn rebuild_restores_receipt_projections() {
     assert_ne!(projections(&db_path).unwrap(), online);
 
     for _ in 0..2 {
-        assert_eq!(spec_support::rebuild_projections(&mut writer).unwrap(), 6);
+        assert_eq!(spec_support::rebuild_projections(&mut writer).unwrap(), 7);
         assert_eq!(projections(&db_path).unwrap(), online);
         assert_eq!(ledger(&db_path).unwrap(), ledger_before);
     }
@@ -834,12 +867,20 @@ async fn rebuild_restores_receipt_projections() {
         &router,
         &cmd(7),
         &supplier,
-        vec![receipt_line(&flour, 1, "g", 1, "2026-10-18")],
+        vec![
+            receipt_line(&flour, 1, "g", 1, "2026-10-18"),
+            receipt_line(&butter, 1, "g", 1, "2026-10-25"),
+        ],
         0,
         SENT,
     )
     .await;
     let lot = reply.body["data"]["receipt"]["lines"][0]["lot_id"].clone();
+    assert_eq!(lot, json!("RAW-FLOUR-20261006-004"));
+    assert_eq!(
+        reply.body["data"]["receipt"]["lines"][1]["lot_id"],
+        json!("SEMI-BUTTER-20261006-003")
+    );
     assert_eq!(
         reply.body["warnings"],
         json!([{
@@ -848,4 +889,78 @@ async fn rebuild_restores_receipt_projections() {
             "details": { "line": 0, "item_id": flour, "lot_id": lot },
         }])
     );
+}
+
+// domain「收货接口」：GOODS_RECEIVED@1 不支持。账本中有 @1 收货（golden 样本 GOODS_RECEIVED@1，由测试经 open_writer
+// 直接写入账本）时重建返回错误；全部投影保持重建前的状态，账本、processed_commands、store_meta 不变。
+#[tokio::test]
+async fn rebuild_refuses_goods_received_v1() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("boh.db");
+    let router = spec_support::router(&db_path, ManualClock::new(NOW).clock()).unwrap();
+    let flour = write(
+        &router,
+        "POST",
+        "/api/v1/items",
+        json!({
+            "command_id": cmd(1), "code": "FLOUR", "name": "面粉", "base_unit": "g",
+            "category": "RAW", "units": [{ "unit_code": "袋", "base_qty_per_unit": 25000 }],
+            "active": true,
+        }),
+    )
+    .await["item"]["item_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let supplier = write(
+        &router,
+        "POST",
+        "/api/v1/suppliers",
+        json!({ "command_id": cmd(2), "code": "S1", "name": "S1", "active": true }),
+    )
+    .await["supplier"]["supplier_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    receive(
+        &router,
+        &cmd(3),
+        &supplier,
+        vec![receipt_line(&flour, 5, "g", 1, "2026-10-20")],
+        0,
+        SENT,
+    )
+    .await;
+    drop(router);
+
+    // @1 样本的 item_id、supplier_id 换成本库的实际 ID，其余原样写入。
+    let payload = include_str!("golden/GOODS_RECEIVED@1/WITH_MANUFACTURER_LOT_NO.json")
+        .trim_end()
+        .replace("01890a5d-ac96-774b-bcce-b302099a8501", &flour)
+        .replace("01890a5d-ac96-774b-bcce-b302099a8601", &supplier);
+    let mut writer = spec_support::writer(&db_path).unwrap();
+    let tx = writer.transaction().unwrap();
+    tx.execute(
+        "INSERT INTO processed_commands (command_id, command_type, request, response, recorded_at)
+         VALUES (?1, 'receipt.create', '{}', '{}', ?2)",
+        rusqlite::params![cmd(90), NOW.0],
+    )
+    .unwrap();
+    tx.execute(
+        "INSERT INTO store_events (id, event_type, schema_version, aggregate_type, aggregate_id,
+             aggregate_version, command_id, actor_id, device_id, business_date, occurred_at,
+             recorded_at, payload)
+         VALUES ('01890a5d-ac96-774b-bcce-b30209a9f003', 'GOODS_RECEIVED', 1, 'RECEIPT',
+             '01890a5d-ac96-774b-bcce-b30209a9f004', 1, ?1, ?2, ?3, '2026-10-06', ?4, ?4, ?5)",
+        rusqlite::params![cmd(90), STAFF.employee_id, STAFF.device_id, NOW.0, payload],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    let online = projections(&db_path).unwrap();
+    let ledger_before = ledger(&db_path).unwrap();
+
+    assert!(spec_support::rebuild_projections(&mut writer).is_err());
+
+    assert_eq!(projections(&db_path).unwrap(), online);
+    assert_eq!(ledger(&db_path).unwrap(), ledger_before);
 }

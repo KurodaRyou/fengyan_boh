@@ -1,4 +1,4 @@
-//! 锁定迁移 001、002、003、004、005、006 的表结构；每项测试注明对应的规则（AGENTS.md / docs/domain.md）或迁移文件。
+//! 锁定迁移 001、002、003、004、005、006、007 的表结构；每项测试注明对应的规则（AGENTS.md / docs/domain.md）或迁移文件。
 
 use std::fmt::Debug;
 
@@ -20,6 +20,8 @@ const MIGRATION_005_FNV1A_64: u64 = 0x4191_3449_6be8_86c9;
 const MIGRATION_006: &str =
     include_str!("../../../migrations/006_inventory_lots_manufacturer_lot_no.sql");
 const MIGRATION_006_FNV1A_64: u64 = 0x3773_286d_a4b7_9106;
+const MIGRATION_007: &str = include_str!("../../../migrations/007_lot_numbers.sql");
+const MIGRATION_007_FNV1A_64: u64 = 0x0676_d9dd_8cea_52c1;
 const STORE: &str = "01890a5d-ac96-774b-bcce-b302099a8050";
 const ACTOR: &str = "01890a5d-ac96-774b-bcce-b302099a8051";
 const CMD: &str = "01890a5d-ac96-774b-bcce-b302099a8057";
@@ -193,10 +195,16 @@ fn migration_006_matches_frozen_checksum() {
     assert_eq!(fnv1a_64(MIGRATION_006), MIGRATION_006_FNV1A_64);
 }
 
+// AGENTS「迁移」不可修改：按 UTF-8 原始字节锁定 007 完整 SQL（包括注释）。
+#[test]
+fn migration_007_matches_frozen_checksum() {
+    assert_eq!(fnv1a_64(MIGRATION_007), MIGRATION_007_FNV1A_64);
+}
+
 // AGENTS「迁移」：程序支持的版本就是已锁定迁移文件的个数。
 #[test]
 fn latest_schema_version_counts_locked_migrations() {
-    assert_eq!(LATEST_SCHEMA_VERSION, 6);
+    assert_eq!(LATEST_SCHEMA_VERSION, 7);
 }
 
 // AGENTS「迁移」：重复执行迁移不改变版本，也不丢失已有数据。
@@ -1293,9 +1301,12 @@ const SUPPLIER: &str = "01890a5d-ac96-774b-bcce-b302099a8701";
 const SUPPLIER2: &str = "01890a5d-ac96-774b-bcce-b302099a8702";
 const REASON: &str = "01890a5d-ac96-774b-bcce-b302099a8801";
 const REASON2: &str = "01890a5d-ac96-774b-bcce-b302099a8802";
-const LOT: &str = "01890a5d-ac96-774b-bcce-b302099a8901";
-const LOT2: &str = "01890a5d-ac96-774b-bcce-b302099a8902";
-const LOT3: &str = "01890a5d-ac96-774b-bcce-b302099a8903";
+const LOT: &str = "RAW-FLOUR-20261005-001";
+const LOT2: &str = "RAW-FLOUR-20261005-002";
+const LOT3: &str = "RAW-FLOUR-20261005-003";
+/// 迁移 007 之前（005、006）的 UUID 批次标识。
+const UUID_LOT: &str = "01890a5d-ac96-774b-bcce-b302099a8901";
+const UUID_LOT2: &str = "01890a5d-ac96-774b-bcce-b302099a8902";
 
 /// 一行的全部列：(列名, SQL 字面量)。
 type Row = Vec<(&'static str, String)>;
@@ -1398,16 +1409,41 @@ fn waste_reason_row(id: &str, code: &str) -> Row {
     ]
 }
 
+/// 一个收货批次：批次日期与流水号从批次号末尾的 `YYYYMMDD-NNN` 拆出；批次号格式不对时 panic（测试写错）。
 fn lot_row(lot_id: &str, source_event_seq: i64, source_line_no: i64) -> Row {
+    let tail = &lot_id[lot_id.len() - 12..];
+    let serial: i64 = tail[9..]
+        .parse()
+        .unwrap_or_else(|_| panic!("not a lot number: {lot_id}"));
     vec![
         ("lot_id", lit(lot_id)),
         ("item_id", lit(ITEM)),
+        (
+            "lot_date",
+            lit(&format!("{}-{}-{}", &tail[0..4], &tail[4..6], &tail[6..8])),
+        ),
+        ("lot_serial", serial.to_string()),
         ("origin", lit("RECEIPT")),
         ("source_event_seq", source_event_seq.to_string()),
         ("source_line_no", source_line_no.to_string()),
         ("remaining_qty", "10".into()),
         ("expires_at", "NULL".into()),
         ("manufacturer_lot_no", "NULL".into()),
+    ]
+}
+
+/// 迁移 007 之前（005、006）的批次行：UUID 批次标识，由 seq 1 的第 `source_line_no` 行建立；
+/// `lot_number_column` 是生产商批号的列名（005 为 supplier_lot_no，006 改名为 manufacturer_lot_no）。
+fn uuid_lot_row(lot_id: &str, source_line_no: i64, lot_number_column: &'static str) -> Row {
+    vec![
+        ("lot_id", lit(lot_id)),
+        ("item_id", lit(ITEM)),
+        ("origin", lit("RECEIPT")),
+        ("source_event_seq", "1".into()),
+        ("source_line_no", source_line_no.to_string()),
+        ("remaining_qty", "10".into()),
+        ("expires_at", "NULL".into()),
+        (lot_number_column, lit("B-2026-10")),
     ]
 }
 
@@ -1480,6 +1516,20 @@ fn inventory_db() -> (TempDir, Connection) {
     (dir, conn)
 }
 
+/// 依次执行给定的迁移 SQL（从 001 开始），user_version 设为迁移个数；不经 `migrate`。
+#[allow(clippy::disallowed_methods)] // 锁定测试经 boh_storage::testing 取得原始连接。
+#[allow(clippy::unwrap_used)] // 测试夹具：建库或迁移失败时测试无法开始，直接终止。
+fn db_at_version(migrations: &[&str]) -> (TempDir, Connection) {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = open_writer(&dir.path().join("boh.db")).unwrap();
+    for sql in migrations {
+        conn.execute_batch(sql).unwrap();
+    }
+    conn.pragma_update(None, "user_version", migrations.len() as i64)
+        .unwrap();
+    (dir, conn)
+}
+
 fn count_rows(conn: &Connection, table: &str) -> rusqlite::Result<i64> {
     conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
         row.get(0)
@@ -1546,41 +1596,37 @@ fn upgrades_a_version_4_database_without_losing_data() {
     assert_eq!(count_rows(&conn, "inventory_on_hand").unwrap(), 0);
 }
 
-// 006 + AGENTS「迁移」：已有 005 数据的库升级到 006，inventory_lots 的批号列改名为 manufacturer_lot_no，
-// 各行取值不变；改名后的列仍拒绝空串。
+// 006：已有 005 数据的库执行 006，inventory_lots 的批号列改名为 manufacturer_lot_no，各行取值不变；改名后的列仍拒绝空串。
+// 迁移 007 会重建批次表，这里只执行到 006。
 #[test]
 #[allow(clippy::disallowed_methods)] // 锁定测试经 boh_storage::testing 取得原始连接。
-fn upgrades_a_version_5_database_renaming_the_lot_number_column() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut conn = open_writer(&dir.path().join("boh.db")).unwrap();
-    for sql in [
+fn migration_006_renames_the_lot_number_column() {
+    let (_dir, conn) = db_at_version(&[
         MIGRATION_001,
         MIGRATION_002,
         MIGRATION_003,
         MIGRATION_004,
         MIGRATION_005,
-    ] {
-        conn.execute_batch(sql).unwrap();
-    }
-    conn.pragma_update(None, "user_version", 5).unwrap();
+    ]);
     insert_meta(&conn, 1, STORE).unwrap();
     insert_command(&conn, CMD, "{}").unwrap();
     Event::new(EVT).insert(&conn).unwrap();
     insert(&conn, "items", &item_row(ITEM, "FLOUR")).unwrap();
-    let mut old_lot = lot_row(LOT, 1, 0);
-    old_lot.pop();
-    old_lot.push(("supplier_lot_no", lit("B-2026-10")));
-    insert(&conn, "inventory_lots", &old_lot).unwrap();
+    insert(
+        &conn,
+        "inventory_lots",
+        &uuid_lot_row(UUID_LOT, 0, "supplier_lot_no"),
+    )
+    .unwrap();
     let before = table_rows(&conn, "inventory_lots").unwrap();
 
-    migrate(&mut conn).unwrap();
+    conn.execute_batch(MIGRATION_006).unwrap();
 
-    assert_eq!(schema_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
     assert_eq!(table_rows(&conn, "inventory_lots").unwrap(), before);
     let stored: String = conn
         .query_row(
             "SELECT manufacturer_lot_no FROM inventory_lots WHERE lot_id = ?1",
-            [LOT],
+            [UUID_LOT],
             |row| row.get(0),
         )
         .unwrap();
@@ -1593,15 +1639,19 @@ fn upgrades_a_version_5_database_renaming_the_lot_number_column() {
         insert(
             &conn,
             "inventory_lots",
-            &with(lot_row(LOT2, 1, 1), "manufacturer_lot_no", "''"),
+            &with(
+                uuid_lot_row(UUID_LOT2, 1, "manufacturer_lot_no"),
+                "manufacturer_lot_no",
+                "''",
+            ),
         ),
         ffi::SQLITE_CONSTRAINT_CHECK,
     );
 }
 
-// 005 + AGENTS「ID 与时间」：items、recipes、suppliers、waste_reasons 的主键与批次 lot_id 是 UUIDv7。
+// 005 + AGENTS「ID 与时间」：items、recipes、suppliers、waste_reasons 的主键是 UUIDv7（批次号见 007 的测试）。
 #[test]
-fn master_data_and_lot_ids_reject_v4_uppercase_and_wrong_length() {
+fn master_data_ids_reject_v4_uppercase_and_wrong_length() {
     let (_dir, conn) = master_db();
     for invalid in INVALID_IDS {
         let value = lit(invalid);
@@ -1613,7 +1663,6 @@ fn master_data_and_lot_ids_reject_v4_uppercase_and_wrong_length() {
                 "waste_reasons",
                 with(waste_reason_row(REASON, "X"), "id", &value),
             ),
-            ("inventory_lots", with(lot_row(LOT, 1, 0), "lot_id", &value)),
         ] {
             assert_sqlite_error(insert(&conn, table, &row), ffi::SQLITE_CONSTRAINT_CHECK);
         }
@@ -1622,7 +1671,6 @@ fn master_data_and_lot_ids_reject_v4_uppercase_and_wrong_length() {
     insert(&conn, "recipes", &recipe_row(RECIPE, "X")).unwrap();
     insert(&conn, "suppliers", &supplier_row(SUPPLIER, "X")).unwrap();
     insert(&conn, "waste_reasons", &waste_reason_row(REASON, "X")).unwrap();
-    insert(&conn, "inventory_lots", &lot_row(LOT, 1, 0)).unwrap();
 }
 
 // domain「主数据」：code 在同一实体内唯一，停用的行也占用 code；不同实体可以用相同的 code。
@@ -1910,45 +1958,88 @@ fn supplier_contact_phone_is_null_or_non_empty() {
     .unwrap();
 }
 
-// domain「批次」「投影表」：origin 枚举、source_line_no 从 0 开始、余量非负、(source_event_seq, source_line_no) 唯一，
-// manufacturer_lot_no 为 NULL 或非空；source_event_seq 立即引用账本中的事件，item_id 延迟引用物料。
+// 007 + domain「批次」「投影表」：origin 只有 RECEIPT / PRODUCTION（盘点不新建批次）；source_line_no 从 0 开始；余量可以为负；
+// (source_event_seq, source_line_no) 唯一；同一物料、同一批次日期内流水号唯一（改分类后类型段不同也不能重号），
+// 不同物料或不同日期可以同号；manufacturer_lot_no 为 NULL 或非空；source_event_seq 立即引用账本中的事件，item_id 延迟引用物料。
 #[test]
 fn inventory_lots_are_checked() {
     let (_dir, mut conn) = master_db();
-    for (n, origin) in ["RECEIPT", "PRODUCTION", "COUNT_GAIN"].iter().enumerate() {
-        let id = format!("01890a5d-ac96-774b-bcce-b302099a891{n}");
-        let row = with(lot_row(&id, 2, n as i64), "origin", &lit(origin));
+    for (n, origin) in ["RECEIPT", "PRODUCTION"].iter().enumerate() {
+        let lot = format!("RAW-FLOUR-20261005-00{}", n + 1);
+        let row = with(lot_row(&lot, 2, n as i64), "origin", &lit(origin));
         insert(&conn, "inventory_lots", &row).unwrap();
     }
     assert_sqlite_error(
-        insert(&conn, "inventory_lots", &lot_row(LOT, 2, 0)),
+        insert(&conn, "inventory_lots", &lot_row(LOT3, 2, 0)),
         ffi::SQLITE_CONSTRAINT_UNIQUE,
     );
+    assert_sqlite_error(
+        insert(
+            &conn,
+            "inventory_lots",
+            &lot_row("SEMI-FLOUR-20261005-001", 3, 0),
+        ),
+        ffi::SQLITE_CONSTRAINT_UNIQUE,
+    );
+    assert_sqlite_error(
+        insert(
+            &conn,
+            "inventory_lots",
+            &with(lot_row(LOT, 3, 0), "item_id", &lit(ITEM2)),
+        ),
+        ffi::SQLITE_CONSTRAINT_PRIMARYKEY,
+    );
+    insert(
+        &conn,
+        "inventory_lots",
+        &with(
+            lot_row("RAW-TOAST-20261005-001", 3, 0),
+            "item_id",
+            &lit(ITEM2),
+        ),
+    )
+    .unwrap();
+    insert(
+        &conn,
+        "inventory_lots",
+        &lot_row("RAW-FLOUR-20261006-001", 3, 1),
+    )
+    .unwrap();
     for (column, value) in [
+        ("origin", "'COUNT_GAIN'"),
         ("origin", "'receipt'"),
         ("origin", "'TRANSFER'"),
         ("source_line_no", "-1"),
-        ("remaining_qty", "-1"),
         ("manufacturer_lot_no", "''"),
     ] {
         assert_sqlite_error(
             insert(
                 &conn,
                 "inventory_lots",
-                &with(lot_row(LOT, 1, 0), column, value),
+                &with(lot_row(LOT3, 1, 0), column, value),
             ),
             ffi::SQLITE_CONSTRAINT_CHECK,
         );
     }
     for seq in [0, 4] {
         assert_sqlite_error(
-            insert(&conn, "inventory_lots", &lot_row(LOT, seq, 0)),
+            insert(&conn, "inventory_lots", &lot_row(LOT3, seq, 0)),
             ffi::SQLITE_CONSTRAINT_FOREIGNKEY,
         );
     }
+    insert(
+        &conn,
+        "inventory_lots",
+        &with(lot_row(LOT3, 1, 0), "remaining_qty", "-3"),
+    )
+    .unwrap();
     let full = with(
         with(
-            with(lot_row(LOT, 1, 0), "remaining_qty", "0"),
+            with(
+                lot_row("RAW-FLOUR-20261005-004", 1, 1),
+                "remaining_qty",
+                "0",
+            ),
             "expires_at",
             &TS.to_string(),
         ),
@@ -1957,7 +2048,11 @@ fn inventory_lots_are_checked() {
     );
     insert(&conn, "inventory_lots", &full).unwrap();
 
-    let orphan = with(lot_row(LOT2, 3, 0), "item_id", &lit(ITEM3));
+    let orphan = with(
+        lot_row("RAW-BUTTER-20261005-001", 3, 2),
+        "item_id",
+        &lit(ITEM3),
+    );
     let tx = immediate(&mut conn).unwrap();
     insert(&tx, "inventory_lots", &orphan).unwrap();
     assert_sqlite_error(tx.commit(), ffi::SQLITE_CONSTRAINT_FOREIGNKEY);
@@ -1965,7 +2060,117 @@ fn inventory_lots_are_checked() {
     insert(&tx, "inventory_lots", &orphan).unwrap();
     insert(&tx, "items", &item_row(ITEM3, "BUTTER")).unwrap();
     tx.commit().unwrap();
-    assert_eq!(count_rows(&conn, "inventory_lots").unwrap(), 5);
+    assert_eq!(count_rows(&conn, "inventory_lots").unwrap(), 7);
+}
+
+// 007 + domain「批次」批次号 <类型>-<编码>-<YYYYMMDD>-<流水号>：类型只有 RAW / SEMI / FINISHED（区分大小写）；
+// 编码非空，只含 A–Z、0–9、_；末尾的日期和流水号等于 lot_date（真实日期）与三位补零的 lot_serial（1～999）。
+// UUID 批次标识、首尾空白都被拒绝。
+#[test]
+fn lot_id_is_a_lot_number_matching_its_date_and_serial() {
+    let (_dir, conn) = master_db();
+    let lot_id = |text: &str| with(lot_row(LOT, 1, 0), "lot_id", &lit(text));
+    let rejected: Vec<(&str, Row)> = vec![
+        ("lowercase type", lot_row("raw-FLOUR-20261005-001", 1, 0)),
+        ("unknown type", lot_row("PKG-FLOUR-20261005-001", 1, 0)),
+        ("missing type", lot_row("FLOUR-20261005-001", 1, 0)),
+        (
+            "type without separator",
+            lot_row("RAWFLOUR-20261005-001", 1, 0),
+        ),
+        ("empty code", lot_row("RAW--20261005-001", 1, 0)),
+        ("lowercase code", lot_row("RAW-flour-20261005-001", 1, 0)),
+        ("hyphen in code", lot_row("RAW-FL-OUR-20261005-001", 1, 0)),
+        ("space in code", lot_row("RAW-FL OUR-20261005-001", 1, 0)),
+        ("non-ASCII code", lot_row("RAW-面粉-20261005-001", 1, 0)),
+        (
+            "date differs",
+            with(lot_row(LOT, 1, 0), "lot_date", "'2026-10-06'"),
+        ),
+        (
+            "serial differs",
+            with(lot_row(LOT, 1, 0), "lot_serial", "2"),
+        ),
+        ("serial 000", lot_row("RAW-FLOUR-20261005-000", 1, 0)),
+        (
+            "serial 1000",
+            with(lot_row(LOT, 1, 0), "lot_serial", "1000"),
+        ),
+        ("not a real date", lot_row("RAW-FLOUR-20260230-001", 1, 0)),
+        ("two-digit serial", lot_id("RAW-FLOUR-20261005-01")),
+        ("four-digit serial", lot_id("RAW-FLOUR-20261005-0001")),
+        ("dashed date", lot_id("RAW-FLOUR-2026-10-05-001")),
+        ("leading space", lot_id(" RAW-FLOUR-20261005-001")),
+        ("trailing space", lot_id("RAW-FLOUR-20261005-001 ")),
+        ("uuid", lot_id(UUID_LOT)),
+    ];
+    for (name, row) in &rejected {
+        match insert(&conn, "inventory_lots", row) {
+            Err(rusqlite::Error::SqliteFailure(error, _)) => {
+                assert_eq!(error.extended_code, ffi::SQLITE_CONSTRAINT_CHECK, "{name}")
+            }
+            other => panic!("{name}: expected a CHECK failure, got {other:?}"),
+        }
+    }
+    for (n, lot) in [
+        LOT,
+        "SEMI-A_1-20261005-999",
+        "FINISHED-_-99991231-010",
+        "RAW-0-00010101-001",
+    ]
+    .iter()
+    .enumerate()
+    {
+        insert(&conn, "inventory_lots", &lot_row(lot, 1, n as i64)).unwrap();
+    }
+}
+
+// 007 + domain「批次」FIFO 与流水号：idx_inventory_lots_fifo 是 (item_id, lot_date, lot_serial) 上的唯一索引；
+// 按 FIFO 顺序列出物料的批次、取同一物料同一日期的最大流水号，都用它查找，不排序。
+#[test]
+fn fifo_index_serves_allocation_and_serial_queries() {
+    let (_dir, conn) = master_db();
+    let columns: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_index_info('idx_inventory_lots_fifo') ORDER BY seqno")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(columns, ["item_id", "lot_date", "lot_serial"]);
+    let unique: i64 = conn
+        .query_row(
+            "SELECT \"unique\" FROM pragma_index_list('inventory_lots')
+             WHERE name = 'idx_inventory_lots_fifo'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(unique, 1);
+    for sql in [
+        "EXPLAIN QUERY PLAN
+         SELECT lot_id FROM inventory_lots WHERE item_id = ?1 AND remaining_qty > 0
+         ORDER BY lot_date, lot_serial",
+        "EXPLAIN QUERY PLAN
+         SELECT max(lot_serial) FROM inventory_lots WHERE item_id = ?1 AND lot_date = '2026-10-05'",
+    ] {
+        let plan: Vec<String> = conn
+            .prepare(sql)
+            .unwrap()
+            .query_map([ITEM], |r| r.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("INDEX idx_inventory_lots_fifo")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|step| step.contains("TEMP B-TREE")),
+            "{plan:?}"
+        );
+    }
 }
 
 // domain「批次」账外缺口：每个物料至多一行，qty <= 0；item_id 延迟引用物料。
@@ -2189,7 +2394,8 @@ fn count_index_serves_the_absorption_query() {
     );
 }
 
-// domain「批次」「投影表」：账面数（视图 inventory_on_hand）= 批次余量之和 + 账外缺口；每个物料一行，没有库存为 0。
+// domain「批次」「投影表」：账面数（视图 inventory_on_hand）= 批次余量之和（含负余量）+ 账外缺口；每个物料一行，没有库存为 0。
+// 迁移 007 重建了这个视图。
 #[test]
 fn inventory_on_hand_sums_lots_and_shortfall() {
     let (_dir, conn) = inventory_db();
@@ -2203,7 +2409,17 @@ fn inventory_on_hand_sums_lots_and_shortfall() {
     insert(
         &conn,
         "inventory_lots",
-        &with(lot_row(LOT3, 2, 1), "remaining_qty", "0"),
+        &with(lot_row(LOT3, 2, 1), "remaining_qty", "-3"),
+    )
+    .unwrap();
+    insert(
+        &conn,
+        "inventory_lots",
+        &with(
+            lot_row("RAW-FLOUR-20261005-004", 2, 2),
+            "remaining_qty",
+            "0",
+        ),
     )
     .unwrap();
     insert(&conn, "inventory_unallocated", &unallocated_row(ITEM, -2)).unwrap();
@@ -2218,7 +2434,7 @@ fn inventory_on_hand_sums_lots_and_shortfall() {
         .unwrap();
     assert_eq!(
         on_hand,
-        [(ITEM.into(), 15), (ITEM2.into(), -5), (ITEM3.into(), 0)]
+        [(ITEM.into(), 12), (ITEM2.into(), -5), (ITEM3.into(), 0)]
     );
 }
 
@@ -2262,6 +2478,7 @@ fn tables_005_are_strict() {
             "inventory_lots",
             lot_row(LOT2, 2, 0),
             &[
+                "lot_serial",
                 "source_event_seq",
                 "source_line_no",
                 "remaining_qty",
@@ -2344,5 +2561,193 @@ fn tables_005_can_be_cleared_and_rewritten() {
     tx.commit().unwrap();
     for table in TABLES_005 {
         assert!(count_rows(&conn, table).unwrap() >= 1, "{table}");
+    }
+}
+
+// ---- 007：批次号 ----
+
+const MIGRATIONS_001_TO_006: [&str; 6] = [
+    MIGRATION_001,
+    MIGRATION_002,
+    MIGRATION_003,
+    MIGRATION_004,
+    MIGRATION_005,
+    MIGRATION_006,
+];
+/// 收货 golden 样本 GOODS_RECEIVED@1：迁移 007 之前在线写入的 @1 收货，批次标识是 UUID。
+const GOODS_RECEIVED_V1: &str =
+    include_str!("../../boh-app/tests/golden/GOODS_RECEIVED@1/WITH_MANUFACTURER_LOT_NO.json");
+/// 上面样本中的物料 ID 与批次 ID。
+const GOODS_RECEIVED_V1_ITEM: &str = ITEM;
+const GOODS_RECEIVED_V1_LOT: &str = "01890a5d-ac96-774b-bcce-b302099a8701";
+const INSERT_RECEIPT_EVENT: &str =
+    "INSERT INTO store_events (id, event_type, schema_version, aggregate_type, aggregate_id,
+         aggregate_version, command_id, actor_id, device_id, business_date,
+         occurred_at, recorded_at, payload)
+     VALUES (?1, 'GOODS_RECEIVED', ?2, ?3, ?4, ?5, ?6, ?7, 'device-1', ?8, ?9, ?10, ?11)";
+
+/// 迁移会改动的全部内容：表结构（含视图、索引）与各表的行。
+fn whole_database(conn: &Connection) -> rusqlite::Result<Vec<Vec<rusqlite::types::Value>>> {
+    let mut statement = conn.prepare(
+        "SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite\\_%' ESCAPE '\\'
+         ORDER BY name",
+    )?;
+    let columns = statement.column_count();
+    let mut content: Vec<Vec<rusqlite::types::Value>> = statement
+        .query_map([], |row| (0..columns).map(|i| row.get(i)).collect())?
+        .collect::<rusqlite::Result<_>>()?;
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY name")?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for table in tables {
+        content.extend(table_rows(conn, &table)?);
+    }
+    Ok(content)
+}
+
+/// 错误及其全部 source 的文本，用 " | " 连接。
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        text.push_str(" | ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
+}
+
+/// 迁移到 006 的库：门店身份、一条命令、seq 1 的报损事件（schema_version 1）、物料 FLOUR。
+#[allow(clippy::unwrap_used)] // 测试夹具：前置数据写入失败时测试无法开始，直接终止。
+fn version_6_db() -> (TempDir, Connection) {
+    let (dir, conn) = db_at_version(&MIGRATIONS_001_TO_006);
+    insert_meta(&conn, 1, STORE).unwrap();
+    insert_command(&conn, CMD, "{}").unwrap();
+    Event::new(EVT).insert(&conn).unwrap();
+    insert(&conn, "items", &item_row(ITEM, "FLOUR")).unwrap();
+    (dir, conn)
+}
+
+// AGENTS「迁移」+ 007：账本中没有 @1 收货、物料编码都合规的 006 库升级到 007：原有表逐行不变（含其他事件类型的
+// schema_version 1 事件、账外缺口、盘点投影）；inventory_lots 与 inventory_movements 重建为新结构且为空，
+// 视图 inventory_on_hand 照常按物料给出账面数。编码 A_1、0、_ 都合规。
+#[test]
+#[allow(clippy::disallowed_methods)] // 锁定测试经 boh_storage::testing 取得原始连接。
+fn upgrades_a_version_6_database_rebuilding_the_lot_tables() {
+    let (_dir, mut conn) = version_6_db();
+    for (id, code) in [(ITEM2, "A_1"), (ITEM3, "0")] {
+        insert(&conn, "items", &item_row(id, code)).unwrap();
+    }
+    insert(
+        &conn,
+        "items",
+        &item_row("01890a5d-ac96-774b-bcce-b302099a8504", "_"),
+    )
+    .unwrap();
+    insert_equipment(&conn, EQUIPMENT, "F1", "Walk-in", "FREEZER", 1, 1).unwrap();
+    Reading::new(READING, 1).insert(&conn).unwrap();
+    insert(&conn, "inventory_unallocated", &unallocated_row(ITEM, -2)).unwrap();
+    insert(&conn, "inventory_counts", &count_row(1, ITEM)).unwrap();
+    let kept = [
+        "store_meta",
+        "processed_commands",
+        "store_events",
+        "equipment",
+        "temperature_readings",
+        "items",
+        "inventory_unallocated",
+        "inventory_counts",
+    ];
+    let before: Vec<_> = kept.iter().map(|t| table_rows(&conn, t).unwrap()).collect();
+
+    migrate(&mut conn).unwrap();
+
+    assert_eq!(schema_version(&conn).unwrap(), 7);
+    let after: Vec<_> = kept.iter().map(|t| table_rows(&conn, t).unwrap()).collect();
+    assert_eq!(after, before);
+    assert_eq!(count_rows(&conn, "inventory_lots").unwrap(), 0);
+    assert_eq!(count_rows(&conn, "inventory_movements").unwrap(), 0);
+    conn.prepare(
+        "SELECT lot_id, item_id, lot_date, lot_serial, origin, source_event_seq, source_line_no,
+                remaining_qty, expires_at, manufacturer_lot_no FROM inventory_lots",
+    )
+    .unwrap();
+    let on_hand: i64 = conn
+        .query_row(
+            "SELECT qty FROM inventory_on_hand WHERE item_id = ?1",
+            [ITEM],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(on_hand, -2);
+    assert_eq!(count_rows(&conn, "inventory_on_hand").unwrap(), 4);
+    insert(&conn, "inventory_lots", &lot_row(LOT, 1, 0)).unwrap();
+    insert(&conn, "inventory_movements", &movement_row(1, 0)).unwrap();
+}
+
+// 007 + domain「收货接口」：账本中有 GOODS_RECEIVED@1（golden 样本中的 @1 收货）时迁移 007 报错，错误信息指出 @1 收货；
+// 迁移整体回滚：user_version 仍为 6，表结构和全部行（含 UUID 批次及其流水）不变，没有遗留临时表。
+// 节点经 boh_storage::open() 迁移，所以拒绝启动。
+#[test]
+#[allow(clippy::disallowed_methods)] // 锁定测试经 boh_storage::testing 取得原始连接。
+fn migration_007_refuses_a_ledger_with_goods_received_v1() {
+    let (_dir, mut conn) = version_6_db();
+    assert_eq!(GOODS_RECEIVED_V1_ITEM, ITEM);
+    let receipt = Event {
+        aggregate_type: "RECEIPT",
+        payload: GOODS_RECEIVED_V1.trim_end(),
+        ..Event::new(EVT2)
+    };
+    receipt.execute_insert(&conn, INSERT_RECEIPT_EVENT).unwrap();
+    insert(
+        &conn,
+        "inventory_lots",
+        &with(
+            uuid_lot_row(GOODS_RECEIVED_V1_LOT, 0, "manufacturer_lot_no"),
+            "source_event_seq",
+            "2",
+        ),
+    )
+    .unwrap();
+    insert(
+        &conn,
+        "inventory_movements",
+        &with(movement_row(2, 0), "lot_id", &lit(GOODS_RECEIVED_V1_LOT)),
+    )
+    .unwrap();
+    let before = whole_database(&conn).unwrap();
+
+    let error = migrate(&mut conn).expect_err("migration 007 must refuse GOODS_RECEIVED@1");
+
+    assert!(
+        error_chain(&error).contains("GOODS_RECEIVED@1"),
+        "{}",
+        error_chain(&error)
+    );
+    assert_eq!(schema_version(&conn).unwrap(), 6);
+    assert_eq!(whole_database(&conn).unwrap(), before);
+    assert_eq!(count_rows(&conn, "sqlite_temp_master").unwrap(), 0);
+}
+
+// 007 + domain「主数据」：items 中有不合规的物料编码（小写、-、空格、中文、尾部空格）时迁移 007 报错，错误信息指出 items.code；
+// 迁移整体回滚，user_version 仍为 6，表结构和全部行不变。
+#[test]
+#[allow(clippy::disallowed_methods)] // 锁定测试经 boh_storage::testing 取得原始连接。
+fn migration_007_refuses_non_conforming_item_codes() {
+    for code in ["flour", "FL-OUR", "FL OUR", "面粉", "FLOUR2 "] {
+        let (_dir, mut conn) = version_6_db();
+        insert(&conn, "items", &item_row(ITEM2, code)).unwrap();
+        let before = whole_database(&conn).unwrap();
+
+        let error = migrate(&mut conn).expect_err("migration 007 must refuse the item code");
+
+        assert!(
+            error_chain(&error).contains("items.code"),
+            "{code}: {}",
+            error_chain(&error)
+        );
+        assert_eq!(schema_version(&conn).unwrap(), 6, "{code}");
+        assert_eq!(whole_database(&conn).unwrap(), before, "{code}");
     }
 }
