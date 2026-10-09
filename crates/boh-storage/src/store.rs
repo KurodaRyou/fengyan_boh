@@ -23,7 +23,8 @@ pub fn initialize(
     tx.execute(
         "INSERT INTO store_meta (id, store_id, created_at) VALUES (1, ?1, ?2)",
         params![store_id.to_string(), created_at.0],
-    )?;
+    )
+    .map_err(|error| StorageError::sqlite("插入门店身份", error))?;
     Ok(())
 }
 
@@ -41,9 +42,9 @@ pub fn initialize_if_empty(
 }
 
 fn current(tx: &Transaction<'_>) -> Result<Option<String>, StorageError> {
-    Ok(tx
-        .query_row("SELECT store_id FROM store_meta WHERE id = 1", [], |r| {
-            r.get(0)
-        })
-        .optional()?)
+    tx.query_row("SELECT store_id FROM store_meta WHERE id = 1", [], |r| {
+        r.get(0)
+    })
+    .optional()
+    .map_err(|error| StorageError::sqlite("查询门店身份", error))
 }

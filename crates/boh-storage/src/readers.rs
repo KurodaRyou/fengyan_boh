@@ -44,35 +44,44 @@ impl Readers {
             .await
             .map_err(|_| E::from(StorageError::ReaderPoolInvariant("semaphore closed")))?;
         let inner = Arc::clone(&self.inner);
-        tokio::task::spawn_blocking(move || -> Result<T, E> {
-            let _permit = permit;
-            let mut conn = lock(&inner.idle)
-                .pop()
-                .ok_or(StorageError::ReaderPoolInvariant(
-                    "permit without connection",
-                ))?;
-            let result = (|| {
-                let tx = conn
-                    .transaction_with_behavior(TransactionBehavior::Deferred)
-                    .map_err(StorageError::from)?;
-                match f(&tx) {
-                    Ok(out) => {
-                        tx.commit().map_err(StorageError::from)?;
-                        Ok(out)
-                    }
-                    Err(err) => {
-                        tx.rollback().map_err(StorageError::from)?;
-                        Err(err)
-                    }
-                }
-            })();
-            ensure_read_finished(&conn);
-            // release 构建为 panic = "abort"，f 不会 unwind，因此无需在 panic 时归还连接。
-            lock(&inner.idle).push(conn);
-            result
+        let span = tracing::Span::current();
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        tokio::task::spawn_blocking(move || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                span.in_scope(|| -> Result<T, E> {
+                    let _permit = permit;
+                    let mut conn =
+                        lock(&inner.idle)
+                            .pop()
+                            .ok_or(StorageError::ReaderPoolInvariant(
+                                "permit without connection",
+                            ))?;
+                    let result = (|| {
+                        let tx = conn
+                            .transaction_with_behavior(TransactionBehavior::Deferred)
+                            .map_err(|error| StorageError::sqlite("开始读事务", error))?;
+                        match f(&tx) {
+                            Ok(out) => {
+                                tx.commit()
+                                    .map_err(|error| StorageError::sqlite("提交读事务", error))?;
+                                Ok(out)
+                            }
+                            Err(err) => {
+                                tx.rollback()
+                                    .map_err(|error| StorageError::sqlite("回滚读事务", error))?;
+                                Err(err)
+                            }
+                        }
+                    })();
+                    ensure_read_finished(&conn);
+                    // release 构建为 panic = "abort"，f 不会 unwind，因此无需在 panic 时归还连接。
+                    lock(&inner.idle).push(conn);
+                    result
+                })
+            })
         })
         .await
-        .map_err(|e| E::from(StorageError::Join(e.to_string())))?
+        .map_err(|e| E::from(StorageError::join("等待读查询任务", e)))?
     }
 }
 
@@ -126,18 +135,20 @@ mod tests {
         let result = storage
             .readers
             .call(|conn| -> Result<(), StorageError> {
-                conn.execute_batch("SELECT * FROM nonexistent_table")?;
+                conn.execute_batch("SELECT * FROM nonexistent_table")
+                    .map_err(|error| StorageError::sqlite("执行nonexistent_table", error))?;
                 Ok(())
             })
             .await;
-        assert!(matches!(result, Err(StorageError::Sqlite(_))));
+        assert!(matches!(result, Err(StorageError::Sqlite { .. })));
         // Force commit/rollback errors by ending the transaction inside the callback.
         // Autocommit has already been restored: these errors must not abort the node.
         for sql in ["COMMIT", "ROLLBACK"] {
             let result = storage
                 .readers
                 .call(move |conn| -> Result<(), StorageError> {
-                    conn.execute_batch(sql)?;
+                    conn.execute_batch(sql)
+                        .map_err(|error| StorageError::sqlite("执行数据库", error))?;
                     if sql == "ROLLBACK" {
                         Err(StorageError::InvalidEvent("query failed".into()))
                     } else {
@@ -145,12 +156,13 @@ mod tests {
                     }
                 })
                 .await;
-            assert!(matches!(result, Err(StorageError::Sqlite(_))));
+            assert!(matches!(result, Err(StorageError::Sqlite { .. })));
             let value = storage
                 .readers
                 .call(|conn| -> Result<i64, StorageError> {
                     assert!(!conn.is_autocommit());
-                    Ok(conn.query_row("SELECT 1", [], |r| r.get(0))?)
+                    conn.query_row("SELECT 1", [], |r| r.get(0))
+                        .map_err(|error| StorageError::sqlite("查询查询结果", error))
                 })
                 .await
                 .unwrap();

@@ -18,7 +18,7 @@ pub mod testing;
 use std::num::NonZeroUsize;
 use std::path::Path;
 
-pub use error::StorageError;
+pub use error::{BackupStage, Diagnostic, StorageError};
 pub use migrate::{LATEST_SCHEMA_VERSION, schema_version};
 pub use readers::Readers;
 pub use writer::{Writer, WriterHandle};

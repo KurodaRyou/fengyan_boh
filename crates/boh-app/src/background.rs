@@ -104,11 +104,21 @@ fn next_hour(after: UnixMillis) -> Result<UnixMillis, StorageError> {
         .checked_add(1)
         .and_then(|h| h.checked_mul(3_600_000))
         .map(UnixMillis)
-        .ok_or_else(|| StorageError::Backup("hourly trigger is out of range".into()))
+        .ok_or_else(|| {
+            StorageError::backup(
+                boh_storage::BackupStage::Schedule,
+                None,
+                StorageError::Message("hourly trigger is out of range"),
+            )
+        })
 }
 
 fn schedule_error(error: boh_domain::time::TimeError) -> StorageError {
-    StorageError::Backup(error.to_string())
+    StorageError::backup(
+        boh_storage::BackupStage::Schedule,
+        None,
+        StorageError::external("计算闭店备份触发时间", error),
+    )
 }
 
 impl BackupTasks {
@@ -146,7 +156,7 @@ impl BackupTasks {
         self.stop.stop();
         self.task
             .await
-            .map_err(|error| StorageError::Join(error.to_string()))
+            .map_err(|error| StorageError::join("等待备份任务", error))
     }
 }
 
@@ -180,7 +190,7 @@ async fn run(
                 }
                 Err(error) => {
                     if !schedule_failed {
-                        tracing::error!(%error, "cannot calculate backup trigger");
+                        tracing::error!(error = %boh_storage::Diagnostic(&error), "cannot calculate backup trigger");
                         schedule_failed = true;
                     }
                     // Keep draining accepted work, but do not spin on a stale deadline.
@@ -211,7 +221,7 @@ async fn run(
             } => {
                 active = None;
                 if let Err(error) = result {
-                    health.record(&Err(StorageError::Join(error.to_string())), clock.now());
+                    health.record(&Err(StorageError::backup(boh_storage::BackupStage::Worker, None, StorageError::join("等待备份任务", error))), clock.now());
                 }
             }
             _ = changes.changed(deadline), if !stopping => {}

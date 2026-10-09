@@ -81,6 +81,11 @@ impl ApiError {
         self
     }
 
+    #[track_caller]
+    pub fn internal_message(message: &'static str) -> Self {
+        Self::internal(StorageError::Message(message))
+    }
+
     pub fn validation() -> Self {
         Self::new(
             StatusCode::BAD_REQUEST,
@@ -89,8 +94,14 @@ impl ApiError {
         )
     }
 
-    pub fn internal(error: impl std::fmt::Display) -> Self {
-        tracing::error!(error = %error, "internal error");
+    #[track_caller]
+    pub fn internal(error: impl std::error::Error + 'static) -> Self {
+        let caller = std::panic::Location::caller();
+        let location = (&error as &dyn std::error::Error)
+            .downcast_ref::<StorageError>()
+            .and_then(StorageError::location)
+            .unwrap_or(caller);
+        tracing::error!(error = %boh_storage::Diagnostic(&error), %location, "internal error");
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
@@ -116,6 +127,7 @@ impl IntoResponse for ApiError {
 }
 
 impl From<StorageError> for ApiError {
+    #[track_caller]
     fn from(err: StorageError) -> Self {
         Self::internal(err)
     }
@@ -427,12 +439,13 @@ struct Health {
 async fn health(State(state): State<AppState>) -> Result<Json<Envelope<Health>>, ApiError> {
     let (version, latest) = state
         .readers
-        .call(|conn| -> Result<_, StorageError> {
+        .call(|conn| -> Result<_, ApiError> {
             Ok((
                 schema_version(conn)?,
                 conn.query_row("SELECT max(recorded_at) FROM store_events", [], |r| {
                     r.get::<_, Option<i64>>(0)
-                })?,
+                })
+                .map_err(|error| StorageError::sqlite("查询事件账本", error))?,
             ))
         })
         .await?;
@@ -440,14 +453,19 @@ async fn health(State(state): State<AppState>) -> Result<Json<Envelope<Health>>,
     let clock_regression_ms = clock_regression(latest, now);
     let mut wal_path = state.db_path.into_os_string();
     wal_path.push("-wal");
-    let wal_size_bytes = tokio::task::spawn_blocking(move || match std::fs::metadata(wal_path) {
-        Ok(metadata) => Ok(metadata.len()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
-        Err(error) => Err(error),
+    let span = tracing::Span::current();
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
+    let wal_size_bytes = tokio::task::spawn_blocking(move || {
+        tracing::dispatcher::with_default(&dispatch, || {
+            span.in_scope(|| match std::fs::metadata(wal_path) {
+                Ok(metadata) => Ok(metadata.len()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+                Err(error) => Err(ApiError::from(StorageError::io("读取 WAL 文件大小", error))),
+            })
+        })
     })
     .await
-    .map_err(ApiError::internal)?
-    .map_err(ApiError::internal)?;
+    .map_err(|error| ApiError::from(StorageError::join("等待 WAL 文件查询", error)))??;
     let backup = state.backup_health.snapshot();
     Ok(ok(Health {
         status: if clock_regression_ms > 300_000 || backup.last_failed_at.is_some() {
@@ -497,8 +515,11 @@ mod tests {
 
     #[tokio::test]
     async fn storage_error_envelope_hides_internal_details() {
-        let response =
-            ApiError::from(StorageError::Join("private SQL details".into())).into_response();
+        let response = ApiError::from(StorageError::io(
+            "读取 WAL 文件",
+            std::io::Error::other("private SQL details"),
+        ))
+        .into_response();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await

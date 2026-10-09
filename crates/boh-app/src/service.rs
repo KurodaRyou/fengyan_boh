@@ -26,6 +26,7 @@ use crate::{
 };
 
 impl From<ExecuteError> for ApiError {
+    #[track_caller]
     fn from(error: ExecuteError) -> Self {
         match error {
             ExecuteError::Storage(error) => error.into(),
@@ -39,6 +40,7 @@ impl From<ExecuteError> for ApiError {
     }
 }
 
+#[tracing::instrument(name = "command", skip_all, fields(command_type = "equipment.create", command_id = %command.command_id, actor_id = %actor.employee_id, device_id = %actor.device_id))]
 pub async fn create(
     state: AppState,
     actor: Actor,
@@ -65,7 +67,7 @@ pub async fn create(
                             |r| r.get(0),
                         )
                         .optional()
-                        .map_err(StorageError::from)?;
+                        .map_err(|error| StorageError::sqlite("查询设备", error))?;
                     if let Some(id) = existing {
                         return Err(ApiError::new(
                             StatusCode::CONFLICT,
@@ -94,6 +96,7 @@ pub async fn create(
     parse_response(&response)
 }
 
+#[tracing::instrument(name = "command", skip_all, fields(command_type = "equipment.update", command_id = %command.command_id, actor_id = %actor.employee_id, device_id = %actor.device_id))]
 pub async fn update(
     state: AppState,
     actor: Actor,
@@ -122,7 +125,7 @@ pub async fn update(
                             read_equipment,
                         )
                         .optional()
-                        .map_err(StorageError::from)?
+                        .map_err(|error| StorageError::sqlite("查询设备", error))?
                         .ok_or_else(|| missing_reference("EQUIPMENT", id))?;
                     if current.revision != command.base_revision {
                         return Err(ApiError::new(
@@ -139,7 +142,7 @@ pub async fn update(
                     let revision = current
                         .revision
                         .checked_add(1)
-                        .ok_or_else(|| ApiError::internal("equipment revision overflow"))?;
+                        .ok_or_else(|| ApiError::internal_message("equipment revision overflow"))?;
                     let row = equipment(id, snapshot, revision);
                     append(
                         ledger,
@@ -167,16 +170,17 @@ pub async fn list(state: AppState) -> Result<Vec<Equipment>, ApiError> {
                     "SELECT id, code, name, equipment_type, active, revision
                      FROM equipment ORDER BY code COLLATE BINARY",
                 )
-                .map_err(StorageError::from)?;
+                .map_err(|error| StorageError::sqlite("准备查询设备", error))?;
             Ok(statement
                 .query_map([], read_equipment)
-                .map_err(StorageError::from)?
+                .map_err(|error| StorageError::sqlite("查询设备", error))?
                 .collect::<Result<_, _>>()
-                .map_err(StorageError::from)?)
+                .map_err(|error| StorageError::sqlite("读取设备", error))?)
         })
         .await
 }
 
+#[tracing::instrument(name = "command", skip_all, fields(command_type = "temperature.log", command_id = %command.command_id, actor_id = %actor.employee_id, device_id = %actor.device_id))]
 pub async fn log_temperature(
     state: AppState,
     actor: Actor,
@@ -217,7 +221,7 @@ pub async fn log_temperature(
                             [command.equipment_id.to_string()],
                             |row| row.get(0),
                         )
-                        .map_err(StorageError::from)?;
+                        .map_err(|error| StorageError::sqlite("查询设备", error))?;
                     if !exists {
                         return Err(missing_reference("EQUIPMENT", command.equipment_id));
                     }
@@ -228,7 +232,9 @@ pub async fn log_temperature(
                         celsius_x10: command.celsius_x10,
                         note: command.note.clone(),
                     })
-                    .map_err(ApiError::internal)?;
+                    .map_err(|error| {
+                        ApiError::from(StorageError::external("序列化温度事件", error))
+                    })?;
                     let row = TemperatureReading {
                         temperature_reading_id: id,
                         equipment_id: command.equipment_id,
@@ -265,7 +271,9 @@ pub async fn log_temperature(
                         });
                     }
                     // Save the entire envelope so retries preserve the original warning and times.
-                    serde_json::to_string(&response).map_err(ApiError::internal)
+                    serde_json::to_string(&response).map_err(|error| {
+                        ApiError::from(StorageError::external("保存温度命令响应", error))
+                    })
                 },
             )
         })
@@ -288,7 +296,7 @@ pub async fn list_temperature_readings(
                      WHERE business_date = ?1 AND (?2 IS NULL OR equipment_id = ?2)
                      ORDER BY occurred_at, event_seq",
                 )
-                .map_err(StorageError::from)?;
+                .map_err(|error| StorageError::sqlite("准备查询温度记录", error))?;
             Ok(statement
                 .query_map(
                     params![
@@ -297,9 +305,9 @@ pub async fn list_temperature_readings(
                     ],
                     read_temperature,
                 )
-                .map_err(StorageError::from)?
+                .map_err(|error| StorageError::sqlite("查询温度记录", error))?
                 .collect::<Result<_, _>>()
-                .map_err(StorageError::from)?)
+                .map_err(|error| StorageError::sqlite("读取温度记录", error))?)
         })
         .await
 }
@@ -366,22 +374,26 @@ fn missing_reference(entity: &str, id: AggregateId) -> ApiError {
 }
 
 fn normalized(command: &impl Serialize, id: Option<AggregateId>) -> Result<String, ApiError> {
-    let mut value = serde_json::to_value(command).map_err(ApiError::internal)?;
+    let mut value = serde_json::to_value(command)
+        .map_err(|error| ApiError::from(StorageError::external("规范化设备命令", error)))?;
     let object = value.as_object_mut().ok_or_else(ApiError::validation)?;
     object.remove("command_id");
     object.remove("sent_at");
     if let Some(id) = id {
         object.insert("equipment_id".into(), json!(id));
     }
-    serde_json::to_string(&value).map_err(ApiError::internal)
+    serde_json::to_string(&value)
+        .map_err(|error| ApiError::from(StorageError::external("规范化设备命令", error)))
 }
 
 fn response(row: &Equipment) -> Result<String, ApiError> {
-    serde_json::to_string(&ok(json!({ "equipment": row })).0).map_err(ApiError::internal)
+    serde_json::to_string(&ok(json!({ "equipment": row })).0)
+        .map_err(|error| ApiError::from(StorageError::external("序列化设备响应", error)))
 }
 
 fn parse_response(response: &str) -> Result<Value, ApiError> {
-    serde_json::from_str(response).map_err(ApiError::internal)
+    serde_json::from_str(response)
+        .map_err(|error| ApiError::from(StorageError::external("解码已保存的命令响应", error)))
 }
 
 fn append(
@@ -394,13 +406,13 @@ fn append(
     row: &Equipment,
 ) -> Result<(), ApiError> {
     let date = business_date(recorded_at, &state.timezone, state.business_day_cutoff)
-        .map_err(ApiError::internal)?;
+        .map_err(|error| ApiError::from(StorageError::external("计算设备事件营业日", error)))?;
     let payload = serde_json::to_string(&EquipmentChanged {
         entity: EquipmentEntity::Equipment,
         source: MasterDataSource::Local,
         snapshot: row.snapshot(),
     })
-    .map_err(ApiError::internal)?;
+    .map_err(|error| ApiError::from(StorageError::external("序列化设备事件", error)))?;
     ledger.append(&Event {
         id: EventId::from_parts(recorded_at, ledger::entropy(tx)?).map_err(StorageError::from)?,
         event_type: "MASTER_DATA_CHANGED".into(),

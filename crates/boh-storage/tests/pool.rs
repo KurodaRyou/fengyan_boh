@@ -22,14 +22,16 @@ fn insert_command(conn: &Connection, command_id: &str) -> Result<(), StorageErro
         "INSERT INTO processed_commands (command_id, command_type, request, response, recorded_at)
          VALUES (?1, 'test', '{}', '{}', 0)",
         params![command_id],
-    )?;
+    )
+    .map_err(|error| StorageError::sqlite("插入幂等响应", error))?;
     Ok(())
 }
 
 async fn count_commands(readers: &Readers) -> Result<i64, StorageError> {
     readers
         .call(|conn| -> Result<i64, StorageError> {
-            Ok(conn.query_row("SELECT COUNT(*) FROM processed_commands", [], |r| r.get(0))?)
+            conn.query_row("SELECT COUNT(*) FROM processed_commands", [], |r| r.get(0))
+                .map_err(|error| StorageError::sqlite("查询幂等响应", error))
         })
         .await
 }
@@ -100,7 +102,7 @@ async fn calls_after_shutdown_fail_with_writer_closed() {
 async fn readers_cannot_write() {
     let (_dir, _writer, _handle, readers) = setup().unwrap();
     let result = readers.call(|conn| insert_command(conn, CMD)).await;
-    assert!(matches!(result, Err(StorageError::Sqlite(_))));
+    assert!(matches!(result, Err(StorageError::Sqlite { .. })));
     assert_eq!(count_commands(&readers).await.unwrap(), 0);
 }
 
@@ -118,10 +120,12 @@ async fn reader_keeps_one_snapshot_across_a_concurrent_commit() {
                     let read = || {
                         conn.query_row("SELECT count(*) FROM processed_commands", [], |r| r.get(0))
                     };
-                    let first = read()?;
+                    let first =
+                        read().map_err(|error| StorageError::sqlite("读取第一份快照", error))?;
                     first_read_tx.send(()).unwrap();
                     committed_rx.recv().unwrap();
-                    let second = read()?;
+                    let second =
+                        read().map_err(|error| StorageError::sqlite("读取第二份快照", error))?;
                     Ok((first, second))
                 })
                 .await
@@ -146,7 +150,7 @@ async fn reader_error_rolls_back_before_reusing_the_connection() {
             conn.query_row("SELECT count(*) FROM processed_commands", [], |r| {
                 r.get::<_, i64>(0)
             })
-            .map_err(StorageError::from)?;
+            .map_err(|error| StorageError::sqlite("查询幂等响应", error))?;
             Err(TestError::Rejected)
         })
         .await;
@@ -226,7 +230,8 @@ async fn dropping_all_writer_owners_exits_the_thread() {
     drop(writer);
     clone
         .call(|tx| -> Result<(), StorageError> {
-            tx.query_row("SELECT 1", [], |_| Ok(()))?;
+            tx.query_row("SELECT 1", [], |_| Ok(()))
+                .map_err(|error| StorageError::sqlite("查询查询结果", error))?;
             Ok(())
         })
         .await

@@ -18,6 +18,9 @@ use crate::{AppState, http};
 #[path = "receiving_tests.rs"]
 mod receiving;
 
+#[path = "diagnostic_tests.rs"]
+mod diagnostics;
+
 struct Node {
     _dir: tempfile::TempDir,
     storage: Storage,
@@ -87,12 +90,13 @@ async fn counts(node: &Node) -> (i64, i64, i64) {
     node.storage
         .readers
         .call(|conn| -> Result<_, StorageError> {
-            Ok(conn.query_row(
+            conn.query_row(
                 "SELECT (SELECT count(*) FROM store_events),
             (SELECT count(*) FROM processed_commands), (SELECT count(*) FROM equipment)",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )?)
+            )
+            .map_err(|error| StorageError::sqlite("查询事件账本", error))
         })
         .await
         .unwrap()
@@ -127,7 +131,8 @@ async fn revision_overflow_is_internal_and_does_not_commit() {
     node.storage
         .writer
         .call(|tx| -> Result<(), StorageError> {
-            tx.execute("UPDATE equipment SET revision = ?1", [i64::MAX])?;
+            tx.execute("UPDATE equipment SET revision = ?1", [i64::MAX])
+                .map_err(|error| StorageError::sqlite("更新设备", error))?;
             Ok(())
         })
         .await
@@ -276,7 +281,8 @@ async fn projection_failure_rolls_back_event_and_command_then_allows_original_re
             tx.execute_batch(
                 "CREATE TRIGGER injected_failure BEFORE INSERT ON equipment
             BEGIN SELECT RAISE(ABORT, 'private SQL failure'); END;",
-            )?;
+            )
+            .map_err(|error| StorageError::sqlite("执行数据库", error))?;
             Ok(())
         })
         .await
@@ -295,7 +301,8 @@ async fn projection_failure_rolls_back_event_and_command_then_allows_original_re
     node.storage
         .writer
         .call(|tx| -> Result<(), StorageError> {
-            tx.execute_batch("DROP TRIGGER injected_failure")?;
+            tx.execute_batch("DROP TRIGGER injected_failure")
+                .map_err(|error| StorageError::sqlite("执行数据库", error))?;
             Ok(())
         })
         .await
@@ -315,7 +322,8 @@ async fn projection_failure_rolls_back_event_and_command_then_allows_original_re
         .readers
         .call(|conn| -> Result<(), StorageError> {
             assert_eq!(
-                conn.query_row("SELECT seq FROM store_events", [], |r| r.get::<_, i64>(0))?,
+                conn.query_row("SELECT seq FROM store_events", [], |r| r.get::<_, i64>(0))
+                    .map_err(|error| StorageError::sqlite("查询事件账本", error))?,
                 1
             );
             Ok(())
@@ -355,7 +363,8 @@ async fn public_rebuild_matches_online_state_and_keeps_original_replies() {
     node.storage
         .writer
         .call(|tx| -> Result<(), StorageError> {
-            tx.execute("UPDATE equipment SET name = 'corrupted'", [])?;
+            tx.execute("UPDATE equipment SET name = 'corrupted'", [])
+                .map_err(|error| StorageError::sqlite("更新设备", error))?;
             Ok(())
         })
         .await
@@ -424,7 +433,8 @@ async fn clock_regression_keeps_raw_time_and_does_not_break_retries() {
                     "SELECT recorded_at FROM store_events WHERE seq = 2",
                     [],
                     |r| r.get::<_, i64>(0)
-                )?,
+                )
+                .map_err(|error| StorageError::sqlite("查询事件账本", error))?,
                 -1
             );
             Ok(())
@@ -446,14 +456,15 @@ async fn temperature_counts(node: &Node) -> (i64, i64, i64, i64) {
     node.storage
         .readers
         .call(|conn| -> Result<_, StorageError> {
-            Ok(conn.query_row(
+            conn.query_row(
                 "SELECT (SELECT count(*) FROM store_events),
                         (SELECT count(*) FROM processed_commands),
                         (SELECT count(*) FROM temperature_readings),
                         (SELECT coalesce(max(seq), 0) FROM store_events)",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )?)
+            )
+            .map_err(|error| StorageError::sqlite("查询事件账本", error))
         })
         .await
         .unwrap()
@@ -515,7 +526,8 @@ async fn temperature_projection_and_receipt_failures_rollback_and_allow_original
                 tx.execute_batch(&format!(
                     "CREATE TRIGGER injected_temperature_failure BEFORE INSERT ON {table}
                      BEGIN SELECT RAISE(ABORT, 'private temperature failure'); END;"
-                ))?;
+                ))
+                .map_err(|error| StorageError::sqlite("执行数据库", error))?;
                 Ok(())
             })
             .await
@@ -525,7 +537,8 @@ async fn temperature_projection_and_receipt_failures_rollback_and_allow_original
         node.storage
             .writer
             .call(|tx| -> Result<(), StorageError> {
-                tx.execute_batch("DROP TRIGGER injected_temperature_failure")?;
+                tx.execute_batch("DROP TRIGGER injected_temperature_failure")
+                    .map_err(|error| StorageError::sqlite("执行数据库", error))?;
                 Ok(())
             })
             .await
@@ -621,7 +634,8 @@ async fn child_projection_failures_restore_complete_snapshots_and_allow_original
             tx.execute_batch(
                 "CREATE TRIGGER injected_item_failure BEFORE INSERT ON item_units
             WHEN NEW.unit_code = 'box' BEGIN SELECT RAISE(ABORT, 'private child failure'); END;",
-            )?;
+            )
+            .map_err(|error| StorageError::sqlite("执行数据库", error))?;
             Ok(())
         })
         .await
@@ -647,7 +661,8 @@ async fn child_projection_failures_restore_complete_snapshots_and_allow_original
     node.storage
         .writer
         .call(|tx| -> Result<(), StorageError> {
-            tx.execute_batch("DROP TRIGGER injected_item_failure")?;
+            tx.execute_batch("DROP TRIGGER injected_item_failure")
+                .map_err(|error| StorageError::sqlite("执行数据库", error))?;
             Ok(())
         })
         .await
@@ -681,7 +696,8 @@ async fn child_projection_failures_restore_complete_snapshots_and_allow_original
             tx.execute_batch(
                 "CREATE TRIGGER injected_recipe_failure BEFORE INSERT ON recipe_lines
             WHEN NEW.version = 2 BEGIN SELECT RAISE(ABORT, 'private child failure'); END;",
-            )?;
+            )
+            .map_err(|error| StorageError::sqlite("执行数据库", error))?;
             Ok(())
         })
         .await
@@ -704,7 +720,8 @@ async fn child_projection_failures_restore_complete_snapshots_and_allow_original
     node.storage
         .writer
         .call(|tx| -> Result<(), StorageError> {
-            tx.execute_batch("DROP TRIGGER injected_recipe_failure")?;
+            tx.execute_batch("DROP TRIGGER injected_recipe_failure")
+                .map_err(|error| StorageError::sqlite("执行数据库", error))?;
             Ok(())
         })
         .await
@@ -719,10 +736,11 @@ async fn child_projection_failures_restore_complete_snapshots_and_allow_original
     node.storage
         .readers
         .call(|conn| -> Result<(), StorageError> {
-            let (n, max): (i64, i64) =
-                conn.query_row("SELECT count(*), max(seq) FROM store_events", [], |r| {
+            let (n, max): (i64, i64) = conn
+                .query_row("SELECT count(*), max(seq) FROM store_events", [], |r| {
                     Ok((r.get(0)?, r.get(1)?))
-                })?;
+                })
+                .map_err(|error| StorageError::sqlite("查询事件账本", error))?;
             assert_eq!((n, max), (4, 4));
             Ok(())
         })
@@ -805,7 +823,8 @@ async fn remaining_master_data_revision_overflows_do_not_commit_partial_changes(
                 tx.execute(
                     &format!("UPDATE {table} SET revision = ?1 WHERE id = ?2"),
                     boh_storage::rusqlite::params![i64::MAX, id_owned],
-                )?;
+                )
+                .map_err(|error| StorageError::sqlite("更新数据库", error))?;
                 Ok(())
             })
             .await

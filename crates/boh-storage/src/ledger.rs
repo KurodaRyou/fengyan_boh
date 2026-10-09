@@ -33,7 +33,7 @@ where
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()
-        .map_err(StorageError::from)
+        .map_err(|error| StorageError::sqlite("查询幂等响应", error))
         .map_err(ExecuteError::from)?;
     if let Some((kind, request, response)) = saved {
         if kind != command.command_type {
@@ -58,22 +58,26 @@ where
             command.recorded_at.0
         ],
     )
-    .map_err(StorageError::from)
+    .map_err(|error| StorageError::sqlite("保存幂等响应", error))
     .map_err(ExecuteError::from)?;
     Ok(response)
 }
 
 fn differing_fields(tx: &Transaction<'_>, a: &str, b: &str) -> Result<Vec<String>, StorageError> {
-    let mut statement = tx.prepare(
-        "WITH a AS (SELECT key, value, type FROM json_each(?1)),
+    let mut statement = tx
+        .prepare(
+            "WITH a AS (SELECT key, value, type FROM json_each(?1)),
               b AS (SELECT key, value, type FROM json_each(?2)),
               keys AS (SELECT key FROM a UNION SELECT key FROM b)
          SELECT keys.key FROM keys LEFT JOIN a USING(key) LEFT JOIN b USING(key)
          WHERE a.type IS NOT b.type OR a.value IS NOT b.value ORDER BY keys.key COLLATE BINARY",
-    )?;
-    Ok(statement
-        .query_map(params![a, b], |r| r.get(0))?
-        .collect::<Result<_, _>>()?)
+        )
+        .map_err(|error| StorageError::sqlite("准备比较幂等请求", error))?;
+    statement
+        .query_map(params![a, b], |r| r.get(0))
+        .map_err(|error| StorageError::sqlite("比较幂等请求", error))?
+        .collect::<Result<_, _>>()
+        .map_err(|error| StorageError::sqlite("读取幂等差异字段", error))
 }
 
 pub struct Event {
@@ -106,14 +110,16 @@ impl Ledger<'_> {
                 event.aggregate_id.to_string(), event.aggregate_version, event.command_id.to_string(),
                 event.actor_id.to_string(), event.device_id.to_string(), event.business_date,
                 event.occurred_at.0, event.recorded_at.0, event.payload],
-        )?;
+        ).map_err(|error| StorageError::sqlite("插入事件账本", error))?;
         projections::apply(self.tx, event)
     }
 }
 
 /// SQLite supplies entropy; UUID layout is built by the pure domain function.
 pub fn entropy(tx: &Transaction<'_>) -> Result<[u8; 10], StorageError> {
-    let bytes: Vec<u8> = tx.query_row("SELECT randomblob(10)", [], |r| r.get(0))?;
+    let bytes: Vec<u8> = tx
+        .query_row("SELECT randomblob(10)", [], |r| r.get(0))
+        .map_err(|error| StorageError::sqlite("查询ID 随机字节", error))?;
     bytes
         .try_into()
         .map_err(|_| StorageError::InvalidEvent("invalid ID entropy length".into()))

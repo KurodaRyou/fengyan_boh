@@ -23,17 +23,20 @@ fn normalized(
     command: &impl Serialize,
     path: Option<(&str, AggregateId)>,
 ) -> Result<String, ApiError> {
-    let mut value = serde_json::to_value(command).map_err(ApiError::internal)?;
+    let mut value = serde_json::to_value(command)
+        .map_err(|error| ApiError::from(StorageError::external("规范化主数据命令", error)))?;
     let object = value.as_object_mut().ok_or_else(ApiError::validation)?;
     object.remove("command_id");
     if let Some((key, id)) = path {
         object.insert(key.into(), json!(id));
     }
-    serde_json::to_string(&value).map_err(ApiError::internal)
+    serde_json::to_string(&value)
+        .map_err(|error| ApiError::from(StorageError::external("规范化主数据命令", error)))
 }
 
 fn response(key: &str, row: &impl Serialize) -> Result<String, ApiError> {
-    serde_json::to_string(&ok(json!({key: row})).0).map_err(ApiError::internal)
+    serde_json::to_string(&ok(json!({key: row})).0)
+        .map_err(|error| ApiError::from(StorageError::external("序列化主数据响应", error)))
 }
 
 fn revision(current: i64, submitted: i64) -> Result<(), ApiError> {
@@ -51,7 +54,7 @@ fn revision(current: i64, submitted: i64) -> Result<(), ApiError> {
 fn next(current: i64) -> Result<i64, ApiError> {
     current
         .checked_add(1)
-        .ok_or_else(|| ApiError::internal("master data version overflow"))
+        .ok_or_else(|| ApiError::internal_message("master data version overflow"))
 }
 
 // Table and field arguments are fixed by the caller, never supplied by a client.
@@ -63,7 +66,7 @@ fn check_code(tx: &Transaction<'_>, table: &str, id_key: &str, code: &str) -> Re
             |r| r.get(0),
         )
         .optional()
-        .map_err(StorageError::from)?;
+        .map_err(|error| StorageError::sqlite("查询主数据编码是否已占用", error))?;
     if let Some(id) = existing {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -82,7 +85,7 @@ fn item_reference(tx: &Transaction<'_>, id: AggregateId) -> Result<(), ApiError>
             [id.to_string()],
             |r| r.get(0),
         )
-        .map_err(StorageError::from)?;
+        .map_err(|error| StorageError::sqlite("查询物料", error))?;
     if !found {
         return Err(missing_reference("ITEM", id));
     }
@@ -130,7 +133,7 @@ impl Write<'_> {
             &self.state.timezone,
             self.state.business_day_cutoff,
         )
-        .map_err(ApiError::internal)?;
+        .map_err(|error| ApiError::from(StorageError::external("计算主数据事件营业日", error)))?;
         self.ledger.append(&Event {
             id: EventId::from_parts(self.recorded_at, ledger::entropy(self.tx)?)
                 .map_err(StorageError::from)?,
@@ -145,7 +148,9 @@ impl Write<'_> {
             business_date: date.to_string(),
             occurred_at: self.recorded_at,
             recorded_at: self.recorded_at,
-            payload: serde_json::to_string(&payload).map_err(ApiError::internal)?,
+            payload: serde_json::to_string(&payload).map_err(|error| {
+                ApiError::from(StorageError::external("序列化主数据事件", error))
+            })?,
         })?;
         Ok(())
     }
@@ -187,9 +192,11 @@ where
             )
         })
         .await?;
-    serde_json::from_str(&saved).map_err(ApiError::internal)
+    serde_json::from_str(&saved)
+        .map_err(|error| ApiError::from(StorageError::external("解码已保存的命令响应", error)))
 }
 
+#[tracing::instrument(name = "command", skip_all, fields(command_type = "item.create", command_id = %command.command_id, actor_id = %actor.employee_id, device_id = %actor.device_id))]
 pub async fn create_item(
     state: AppState,
     actor: Actor,
@@ -223,6 +230,7 @@ pub async fn create_item(
     .await
 }
 
+#[tracing::instrument(name = "command", skip_all, fields(command_type = "item.update", command_id = %command.command_id, actor_id = %actor.employee_id, device_id = %actor.device_id))]
 pub async fn update_item(
     state: AppState,
     actor: Actor,
@@ -259,6 +267,7 @@ pub async fn update_item(
     .await
 }
 
+#[tracing::instrument(name = "command", skip_all, fields(command_type = "recipe.create", command_id = %command.command_id, actor_id = %actor.employee_id, device_id = %actor.device_id))]
 pub async fn create_recipe(
     state: AppState,
     actor: Actor,
@@ -294,6 +303,7 @@ pub async fn create_recipe(
     .await
 }
 
+#[tracing::instrument(name = "command", skip_all, fields(command_type = "recipe.update", command_id = %command.command_id, actor_id = %actor.employee_id, device_id = %actor.device_id))]
 pub async fn update_recipe(
     state: AppState,
     actor: Actor,
@@ -330,6 +340,7 @@ pub async fn update_recipe(
     .await
 }
 
+#[tracing::instrument(name = "command", skip_all, fields(command_type = "recipe.add_version", command_id = %command.command_id, actor_id = %actor.employee_id, device_id = %actor.device_id))]
 pub async fn add_recipe_version(
     state: AppState,
     actor: Actor,
@@ -352,7 +363,7 @@ pub async fn add_recipe_version(
                 .snapshot
                 .versions
                 .last()
-                .ok_or_else(|| ApiError::internal("recipe has no versions"))?;
+                .ok_or_else(|| ApiError::internal_message("recipe has no versions"))?;
             if latest.output_qty_per_batch != command.output_qty_per_batch
                 || latest.lines != command.lines
             {
@@ -378,6 +389,7 @@ pub async fn add_recipe_version(
     .await
 }
 
+#[tracing::instrument(name = "command", skip_all, fields(command_type = "supplier.create", command_id = %command.command_id, actor_id = %actor.employee_id, device_id = %actor.device_id))]
 pub async fn create_supplier(
     state: AppState,
     actor: Actor,
@@ -411,6 +423,7 @@ pub async fn create_supplier(
     .await
 }
 
+#[tracing::instrument(name = "command", skip_all, fields(command_type = "supplier.update", command_id = %command.command_id, actor_id = %actor.employee_id, device_id = %actor.device_id))]
 pub async fn update_supplier(
     state: AppState,
     actor: Actor,
@@ -420,7 +433,7 @@ pub async fn update_supplier(
     let request = normalized(&command, Some(("supplier_id", id)))?;
     execute(state, actor, command.command_id, "supplier.update", request, move |write| {
         let mut row = write.tx.query_row("SELECT id, code, name, contact_phone, active, revision FROM suppliers WHERE id = ?1", [id.to_string()], read_supplier)
-            .optional().map_err(StorageError::from)?.ok_or_else(|| missing_reference("SUPPLIER", id))?;
+            .optional().map_err(|error| StorageError::sqlite("查询供应商", error))?.ok_or_else(|| missing_reference("SUPPLIER", id))?;
         revision(row.revision, command.base_revision)?;
         let snapshot = command.snapshot(&row.snapshot);
         if snapshot != row.snapshot {
@@ -432,6 +445,7 @@ pub async fn update_supplier(
     }).await
 }
 
+#[tracing::instrument(name = "command", skip_all, fields(command_type = "waste_reason.create", command_id = %command.command_id, actor_id = %actor.employee_id, device_id = %actor.device_id))]
 pub async fn create_waste_reason(
     state: AppState,
     actor: Actor,
@@ -465,6 +479,7 @@ pub async fn create_waste_reason(
     .await
 }
 
+#[tracing::instrument(name = "command", skip_all, fields(command_type = "waste_reason.update", command_id = %command.command_id, actor_id = %actor.employee_id, device_id = %actor.device_id))]
 pub async fn update_waste_reason(
     state: AppState,
     actor: Actor,
@@ -487,7 +502,7 @@ pub async fn update_waste_reason(
                     read_waste_reason,
                 )
                 .optional()
-                .map_err(StorageError::from)?
+                .map_err(|error| StorageError::sqlite("查询报损原因", error))?
                 .ok_or_else(|| missing_reference("WASTE_REASON", id))?;
             revision(row.revision, command.base_revision)?;
             let snapshot = command.snapshot(&row.snapshot);
@@ -529,10 +544,10 @@ fn read_item(conn: &Connection, id: AggregateId) -> Result<Option<Item>, ApiErro
                 base_unit: BaseUnit::parse(&r.get::<_, String>(3)?).map_err(|e| conversion(3, e))?,
                 category: ItemCategory::parse(&r.get::<_, String>(4)?).map_err(|e| conversion(4, e))?,
                 default_shelf_life_ms: r.get(5)?, active: r.get(6)?, units: Vec::new() },
-        })).optional().map_err(StorageError::from)?;
+        })).optional().map_err(|error| StorageError::sqlite("查询物料", error))?;
     if let Some(row) = &mut row {
         let mut statement = conn.prepare("SELECT unit_code, base_qty_per_unit FROM item_units WHERE item_id = ?1 ORDER BY unit_code COLLATE BINARY")
-            .map_err(StorageError::from)?;
+            .map_err(|error| StorageError::sqlite("准备查询物料单位", error))?;
         row.snapshot.units = statement
             .query_map([id.to_string()], |r| {
                 Ok(ItemUnit {
@@ -540,9 +555,9 @@ fn read_item(conn: &Connection, id: AggregateId) -> Result<Option<Item>, ApiErro
                     base_qty_per_unit: r.get(1)?,
                 })
             })
-            .map_err(StorageError::from)?
+            .map_err(|error| StorageError::sqlite("查询物料单位", error))?
             .collect::<Result<_, _>>()
-            .map_err(StorageError::from)?;
+            .map_err(|error| StorageError::sqlite("读取物料单位", error))?;
     }
     Ok(row)
 }
@@ -567,10 +582,10 @@ fn read_recipe(conn: &Connection, id: AggregateId) -> Result<Option<Recipe>, Api
             },
         )
         .optional()
-        .map_err(StorageError::from)?;
+        .map_err(|error| StorageError::sqlite("查询配方", error))?;
     if let Some(row) = &mut row {
         let mut statement = conn.prepare("SELECT version, output_qty_per_batch FROM recipe_versions WHERE recipe_id = ?1 ORDER BY version")
-            .map_err(StorageError::from)?;
+            .map_err(|error| StorageError::sqlite("准备查询配方版本", error))?;
         let mut versions: Vec<RecipeVersion> = statement
             .query_map([id.to_string()], |r| {
                 Ok(RecipeVersion {
@@ -579,11 +594,11 @@ fn read_recipe(conn: &Connection, id: AggregateId) -> Result<Option<Recipe>, Api
                     lines: Vec::new(),
                 })
             })
-            .map_err(StorageError::from)?
+            .map_err(|error| StorageError::sqlite("查询配方版本", error))?
             .collect::<Result<_, _>>()
-            .map_err(StorageError::from)?;
+            .map_err(|error| StorageError::sqlite("读取配方版本", error))?;
         let mut lines = conn.prepare("SELECT item_id, qty_per_batch FROM recipe_lines WHERE recipe_id = ?1 AND version = ?2 ORDER BY line_no")
-            .map_err(StorageError::from)?;
+            .map_err(|error| StorageError::sqlite("准备查询配方明细", error))?;
         for version in &mut versions {
             version.lines = lines
                 .query_map(params![id.to_string(), version.version], |r| {
@@ -592,9 +607,9 @@ fn read_recipe(conn: &Connection, id: AggregateId) -> Result<Option<Recipe>, Api
                         qty_per_batch: r.get(1)?,
                     })
                 })
-                .map_err(StorageError::from)?
+                .map_err(|error| StorageError::sqlite("查询配方明细", error))?
                 .collect::<Result<_, _>>()
-                .map_err(StorageError::from)?;
+                .map_err(|error| StorageError::sqlite("读取配方明细", error))?;
         }
         row.snapshot.versions = versions;
     }
@@ -631,12 +646,12 @@ fn ids(conn: &Connection, table: &str) -> Result<Vec<AggregateId>, ApiError> {
         .prepare(&format!(
             "SELECT id FROM {table} ORDER BY code COLLATE BINARY"
         ))
-        .map_err(StorageError::from)?;
+        .map_err(|error| StorageError::sqlite("准备查询主数据 ID 列表", error))?;
     Ok(statement
         .query_map([], |r| row_id(r, 0))
-        .map_err(StorageError::from)?
+        .map_err(|error| StorageError::sqlite("查询主数据 ID 列表", error))?
         .collect::<Result<_, _>>()
-        .map_err(StorageError::from)?)
+        .map_err(|error| StorageError::sqlite("读取主数据 ID 列表", error))?)
 }
 
 pub async fn list_items(state: AppState) -> Result<Vec<Item>, ApiError> {
@@ -646,8 +661,9 @@ pub async fn list_items(state: AppState) -> Result<Vec<Item>, ApiError> {
             ids(conn, "items")?
                 .into_iter()
                 .map(|id| {
-                    read_item(conn, id)?
-                        .ok_or_else(|| ApiError::internal("item disappeared from read snapshot"))
+                    read_item(conn, id)?.ok_or_else(|| {
+                        ApiError::internal_message("item disappeared from read snapshot")
+                    })
                 })
                 .collect()
         })
@@ -661,8 +677,9 @@ pub async fn list_recipes(state: AppState) -> Result<Vec<Recipe>, ApiError> {
             ids(conn, "recipes")?
                 .into_iter()
                 .map(|id| {
-                    read_recipe(conn, id)?
-                        .ok_or_else(|| ApiError::internal("recipe disappeared from read snapshot"))
+                    read_recipe(conn, id)?.ok_or_else(|| {
+                        ApiError::internal_message("recipe disappeared from read snapshot")
+                    })
                 })
                 .collect()
         })
@@ -671,15 +688,15 @@ pub async fn list_recipes(state: AppState) -> Result<Vec<Recipe>, ApiError> {
 
 pub async fn list_suppliers(state: AppState) -> Result<Vec<Supplier>, ApiError> {
     state.readers.call(|conn| -> Result<_, ApiError> {
-        let mut statement = conn.prepare("SELECT id, code, name, contact_phone, active, revision FROM suppliers ORDER BY code COLLATE BINARY").map_err(StorageError::from)?;
-        Ok(statement.query_map([], read_supplier).map_err(StorageError::from)?.collect::<Result<_, _>>().map_err(StorageError::from)?)
+        let mut statement = conn.prepare("SELECT id, code, name, contact_phone, active, revision FROM suppliers ORDER BY code COLLATE BINARY").map_err(|error| StorageError::sqlite("准备查询供应商", error))?;
+        Ok(statement.query_map([], read_supplier).map_err(|error| StorageError::sqlite("查询供应商", error))?.collect::<Result<_, _>>().map_err(|error| StorageError::sqlite("读取供应商", error))?)
     }).await
 }
 
 pub async fn list_waste_reasons(state: AppState) -> Result<Vec<WasteReason>, ApiError> {
     state.readers.call(|conn| -> Result<_, ApiError> {
-        let mut statement = conn.prepare("SELECT id, code, name, active, revision FROM waste_reasons ORDER BY code COLLATE BINARY").map_err(StorageError::from)?;
-        Ok(statement.query_map([], read_waste_reason).map_err(StorageError::from)?.collect::<Result<_, _>>().map_err(StorageError::from)?)
+        let mut statement = conn.prepare("SELECT id, code, name, active, revision FROM waste_reasons ORDER BY code COLLATE BINARY").map_err(|error| StorageError::sqlite("准备查询报损原因", error))?;
+        Ok(statement.query_map([], read_waste_reason).map_err(|error| StorageError::sqlite("查询报损原因", error))?.collect::<Result<_, _>>().map_err(|error| StorageError::sqlite("读取报损原因", error))?)
     }).await
 }
 
@@ -708,7 +725,7 @@ pub async fn initialize_store(
                 |ledger| -> Result<String, ExecuteError> {
                     boh_storage::store::initialize(tx, store_id, recorded_at)?;
                     let date = business_date(recorded_at, &timezone, cutoff)
-                        .map_err(|e| StorageError::InvalidEvent(e.to_string()))?;
+                        .map_err(|error| StorageError::external("计算门店初始化营业日", error))?;
                     let actor_id = AggregateId::parse("00000000-0000-7000-8000-000000000000")
                         .map_err(StorageError::from)?;
                     let device_id = AggregateId::parse("00000000-0000-7000-8000-000000000001")
@@ -746,8 +763,9 @@ pub async fn initialize_store(
                             business_date: date.to_string(),
                             occurred_at: recorded_at,
                             recorded_at,
-                            payload: serde_json::to_string(&payload)
-                                .map_err(|e| StorageError::InvalidEvent(e.to_string()))?,
+                            payload: serde_json::to_string(&payload).map_err(|error| {
+                                StorageError::external("序列化预置报损原因事件", error)
+                            })?,
                         })?;
                     }
                     Ok("{}".into())
