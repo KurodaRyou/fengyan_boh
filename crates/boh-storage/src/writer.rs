@@ -35,7 +35,7 @@ pub(crate) fn spawn_writer(conn: Connection) -> Result<(Writer, WriterHandle), S
     let thread = std::thread::Builder::new()
         .name("sqlite-writer".into())
         .spawn(move || run(conn, rx))
-        .map_err(StorageError::Spawn)?;
+        .map_err(|error| StorageError::spawn(error))?;
     Ok((Writer { tx: tx.clone() }, WriterHandle { tx, thread }))
 }
 
@@ -55,7 +55,9 @@ fn run(mut conn: Connection, mut rx: mpsc::Receiver<Msg>) -> Result<(), StorageE
         }
     }
     let checkpoint = checkpoint_truncate(&conn);
-    let closed = conn.close().map_err(|(_, err)| StorageError::from(err));
+    let closed = conn
+        .close()
+        .map_err(|(_, err)| StorageError::sqlite("关闭写连接", err));
     match checkpoint {
         Err(StorageError::CheckpointBusy) => {
             tracing::warn!("WAL checkpoint busy at shutdown; committed data remains in WAL")
@@ -81,9 +83,15 @@ impl Writer {
         E: From<StorageError> + Send + 'static,
     {
         let (reply_tx, reply_rx) = oneshot::channel();
+        let span = tracing::Span::current();
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let job: Job = Box::new(move |conn| {
-            // 调用方已放弃等待时，结果无处可送，丢弃即可（事务已经提交或回滚）。
-            let _ = reply_tx.send(run_in_transaction(conn, f));
+            tracing::dispatcher::with_default(&dispatch, || {
+                span.in_scope(|| {
+                    // 调用方已放弃等待时，结果无处可送，丢弃即可（事务已经提交或回滚）。
+                    let _ = reply_tx.send(run_in_transaction(conn, f));
+                })
+            });
         });
         self.tx
             .send(Msg::Run(job))
@@ -102,9 +110,10 @@ where
 {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(StorageError::from)?;
+        .map_err(|error| StorageError::sqlite("开始写事务", error))?;
     let out = f(&tx)?;
-    tx.commit().map_err(StorageError::from)?;
+    tx.commit()
+        .map_err(|error| StorageError::sqlite("提交写事务", error))?;
     Ok(out)
 }
 
@@ -117,7 +126,7 @@ impl WriterHandle {
         let thread = self.thread;
         tokio::task::spawn_blocking(move || thread.join())
             .await
-            .map_err(|e| StorageError::Join(e.to_string()))?
+            .map_err(|e| StorageError::join("等待写线程关闭", e))?
             .map_err(|_| StorageError::WriterPanicked)?
     }
 }

@@ -10,7 +10,7 @@ use jiff::Timestamp;
 use rusqlite::{Connection, OpenFlags};
 use tokio::sync::Notify;
 
-use crate::{StorageError, clock::Clock, connection::apply_pragmas};
+use crate::{BackupStage, Diagnostic, StorageError, clock::Clock, connection::apply_pragmas};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BackupStatus {
@@ -36,7 +36,11 @@ impl BackupHealth {
                 status.last_failed_at = None;
             }
             Err(error) => {
-                tracing::error!(%error, "backup failed");
+                let (stage, number) = match error {
+                    StorageError::Backup { stage, number, .. } => (Some(*stage), *number),
+                    _ => (None, None),
+                };
+                tracing::error!(error = %Diagnostic(error), backup_stage = ?stage, backup_number = number, "backup failed");
                 status.last_failed_at = Some(now);
             }
         }
@@ -59,7 +63,7 @@ impl Backup {
         store_id: StoreId,
         keep: NonZeroU32,
     ) -> Result<Self, StorageError> {
-        fs::create_dir_all(directory)?;
+        fs::create_dir_all(directory).map_err(|error| StorageError::io("创建备份目录", error))?;
         Ok(Self {
             db_path: db_path.to_owned(),
             directory: directory.to_owned(),
@@ -84,15 +88,37 @@ impl Backup {
     fn run_with_directory_sync(
         &self,
         clock: &Clock,
+        sync: impl FnMut(&Path) -> Result<(), StorageError>,
+    ) -> Result<i64, StorageError> {
+        self.run_with_publication(clock, sync_file, rename_snapshot, sync)
+    }
+
+    fn run_with_publication(
+        &self,
+        clock: &Clock,
+        mut file_sync: impl FnMut(&Path) -> Result<(), StorageError>,
+        mut rename: impl FnMut(&Path, &Path) -> Result<(), StorageError>,
         mut sync: impl FnMut(&Path) -> Result<(), StorageError>,
     ) -> Result<i64, StorageError> {
         let started = clock.now();
-        let source = open_source(&self.db_path)?;
-        let entropy: [u8; 10] = source.query_row("SELECT randomblob(10)", [], |row| row.get(0))?;
-        let id = BackupId::from_parts(started, entropy)?;
+        let source = open_source(&self.db_path)
+            .map_err(|error| StorageError::backup(BackupStage::Generate, None, error))?;
+        let entropy: [u8; 10] = source
+            .query_row("SELECT randomblob(10)", [], |row| row.get(0))
+            .map_err(|error| {
+                StorageError::backup(
+                    BackupStage::Generate,
+                    None,
+                    StorageError::sqlite("生成备份 ID 随机字节", error),
+                )
+            })?;
+        let id = BackupId::from_parts(started, entropy)
+            .map_err(|error| StorageError::backup(BackupStage::Generate, None, error.into()))?;
         let temporary = self
             .directory
             .join(format!("tmp-{}-{id}.db", self.store_id));
+        let mut stage = BackupStage::Generate;
+        let mut number = None;
         let result = (|| {
             let mut files = Vec::new();
             for name in self.names()? {
@@ -106,26 +132,32 @@ impl Backup {
             self.gate.wait();
             let path = temporary
                 .to_str()
-                .ok_or_else(|| StorageError::Backup("snapshot path is not UTF-8".into()))?;
-            source.execute("VACUUM INTO ?1", [path])?;
+                .ok_or_else(|| StorageError::Message("snapshot path is not UTF-8"))?;
+            source.execute("VACUUM INTO ?1", [path]).map_err(|error| StorageError::sqlite("生成备份快照", error))?;
+            stage = BackupStage::Verify;
             let n = verify(&temporary, before)?;
-            File::open(&temporary)?.sync_all()?;
-            let number = files
+            stage = BackupStage::FileSync;
+            file_sync(&temporary)?;
+            stage = BackupStage::AllocateNumber;
+            let allocated = files
                 .iter()
                 .map(|(n, _)| *n)
                 .max()
                 .unwrap_or(0)
                 .checked_add(1)
-                .ok_or_else(|| StorageError::Backup("backup number overflow".into()))?;
+                .ok_or_else(|| StorageError::Message("backup number overflow"))?;
+            number = Some(allocated);
+            stage = BackupStage::Rename;
             let final_path = self.directory.join(format!(
-                "boh-{}-{}-{number}-{id}.db",
+                "boh-{}-{}-{allocated}-{id}.db",
                 self.store_id,
                 utc_label(started)
             ));
-            fs::rename(&temporary, &final_path)?;
+            rename(&temporary, &final_path)?;
+            stage = BackupStage::DirectorySync;
             sync(&self.directory)?;
             // Cleanup starts only after the new file and its directory entry are durable.
-            files.push((number, final_path.clone()));
+            files.push((allocated, final_path.clone()));
             files.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
             for (_, path) in files.into_iter().skip(self.keep.get() as usize) {
                 if path != final_path {
@@ -133,10 +165,10 @@ impl Backup {
                 }
             }
             if let Err(error) = sync(&self.directory) {
-                tracing::warn!(%error, "could not persist old backup cleanup; new backup is durable");
+                tracing::warn!(error = %Diagnostic(&error), backup_stage = %BackupStage::DirectorySync, backup_number = allocated, "could not persist old backup cleanup; new backup is durable");
             }
             Ok(n)
-        })();
+        })().map_err(|error| StorageError::backup(stage, number, error));
         if result.is_err() && temporary.exists() {
             remove_logged(&temporary);
         }
@@ -145,8 +177,14 @@ impl Backup {
 
     fn names(&self) -> Result<Vec<String>, StorageError> {
         let mut names = Vec::new();
-        for entry in fs::read_dir(&self.directory)? {
-            if let Some(name) = entry?.file_name().to_str() {
+        for entry in fs::read_dir(&self.directory)
+            .map_err(|error| StorageError::io("扫描备份目录", error))?
+        {
+            if let Some(name) = entry
+                .map_err(|error| StorageError::io("读取备份目录项", error))?
+                .file_name()
+                .to_str()
+            {
                 names.push(name.to_owned());
             }
         }
@@ -165,17 +203,17 @@ fn open_source(path: &Path) -> Result<Connection, StorageError> {
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
+    )
+    .map_err(|error| StorageError::sqlite("打开备份源库", error))?;
     apply_pragmas(&conn)?;
     Ok(conn)
 }
 
 fn max_seq(conn: &Connection) -> Result<i64, StorageError> {
-    Ok(
-        conn.query_row("SELECT coalesce(max(seq), 0) FROM store_events", [], |r| {
-            r.get(0)
-        })?,
-    )
+    conn.query_row("SELECT coalesce(max(seq), 0) FROM store_events", [], |r| {
+        r.get(0)
+    })
+    .map_err(|error| StorageError::sqlite("查询事件账本", error))
 }
 
 #[allow(clippy::disallowed_methods)] // Verification preserves the snapshot's DELETE journal mode.
@@ -183,29 +221,49 @@ fn verify(path: &Path, before: i64) -> Result<i64, StorageError> {
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    let mut stmt = conn.prepare("PRAGMA integrity_check")?;
+    )
+    .map_err(|error| StorageError::sqlite("打开备份校验连接", error))?;
+    let mut stmt = conn
+        .prepare("PRAGMA integrity_check")
+        .map_err(|error| StorageError::sqlite("准备查询数据库", error))?;
     let results = stmt
-        .query_map([], |r| r.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|error| StorageError::sqlite("查询数据库", error))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| StorageError::sqlite("读取数据库", error))?;
     if results != ["ok"] {
-        return Err(StorageError::Backup(
-            "snapshot integrity check failed".into(),
-        ));
+        return Err(StorageError::Message("snapshot integrity check failed"));
     }
-    let (count, n): (i64, i64) = conn.query_row(
-        "SELECT count(*), coalesce(max(seq), 0) FROM store_events",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
+    let (count, n): (i64, i64) = conn
+        .query_row(
+            "SELECT count(*), coalesce(max(seq), 0) FROM store_events",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|error| StorageError::sqlite("查询事件账本", error))?;
     if n < before || count != n {
-        return Err(StorageError::Backup("snapshot ledger is incomplete".into()));
+        return Err(StorageError::Message("snapshot ledger is incomplete"));
     }
     Ok(n)
 }
 
+fn rename_snapshot(from: &Path, to: &Path) -> Result<(), StorageError> {
+    fs::rename(from, to).map_err(|error| StorageError::io("重命名备份文件", error))
+}
+
+fn sync_file(path: &Path) -> Result<(), StorageError> {
+    File::open(path)
+        .map_err(|error| StorageError::io("打开备份文件以同步", error))?
+        .sync_all()
+        .map_err(|error| StorageError::io("同步备份文件", error))?;
+    Ok(())
+}
+
 fn sync_directory(path: &Path) -> Result<(), StorageError> {
-    File::open(path)?.sync_all()?;
+    File::open(path)
+        .map_err(|error| StorageError::io("打开备份目录以同步", error))?
+        .sync_all()
+        .map_err(|error| StorageError::io("同步备份目录", error))?;
     Ok(())
 }
 
@@ -358,7 +416,10 @@ mod tests {
             let result = backup.run_with_directory_sync(&clock, |path| {
                 calls += 1;
                 if calls == failed_sync {
-                    Err(std::io::Error::other("injected directory fsync failure").into())
+                    Err(StorageError::io(
+                        "同步备份目录",
+                        std::io::Error::other("injected directory fsync failure"),
+                    ))
                 } else {
                     sync_directory(path)
                 }
@@ -366,7 +427,14 @@ mod tests {
             health.record(&result, UnixMillis(2));
             let status = health.snapshot();
             if failed_sync == 1 {
-                assert!(matches!(result, Err(StorageError::Io(_))));
+                assert!(matches!(
+                    result,
+                    Err(StorageError::Backup {
+                        stage: BackupStage::DirectorySync,
+                        number: Some(2),
+                        ..
+                    })
+                ));
                 assert_eq!(calls, 1);
                 assert!(
                     old.exists(),
@@ -388,6 +456,89 @@ mod tests {
             }
             storage.writer_handle.shutdown().await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn file_sync_and_rename_failures_keep_the_phase_and_allocated_number() {
+        for failed in [BackupStage::FileSync, BackupStage::Rename] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("boh.db");
+            let storage = crate::open(&db, NonZeroUsize::MIN).unwrap();
+            let directory = dir.path().join("backups");
+            let backup = Backup::prepare(
+                &db,
+                &directory,
+                StoreId::parse("01890a5d-ac96-774b-bcce-b302099a8050").unwrap(),
+                NonZeroU32::MIN,
+            )
+            .unwrap();
+            let clock = ManualClock::new(UnixMillis(1_791_261_000_000)).clock();
+            let error = backup
+                .run_with_publication(
+                    &clock,
+                    |path| {
+                        if failed == BackupStage::FileSync {
+                            Err(StorageError::io(
+                                "同步备份文件",
+                                std::io::Error::other("injected file sync failure"),
+                            ))
+                        } else {
+                            sync_file(path)
+                        }
+                    },
+                    |from, to| {
+                        if failed == BackupStage::Rename {
+                            Err(StorageError::io(
+                                "重命名备份文件",
+                                std::io::Error::other("injected rename failure"),
+                            ))
+                        } else {
+                            rename_snapshot(from, to)
+                        }
+                    },
+                    sync_directory,
+                )
+                .unwrap_err();
+            let expected_number = if failed == BackupStage::Rename {
+                Some(1)
+            } else {
+                None
+            };
+            assert!(matches!(&error, StorageError::Backup { stage, number, .. }
+                if *stage == failed && *number == expected_number));
+            assert!(std::error::Error::source(&error).is_some());
+            assert_eq!(backup.names().unwrap().len(), 0);
+            storage.writer_handle.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)] // Backup unit test controls the exact VACUUM boundary.
+    async fn vacuum_failure_reports_generation_without_permission_assumptions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("boh.db");
+        let storage = crate::open(&db, NonZeroUsize::MIN).unwrap();
+        let directory = dir.path().join("backups");
+        let backup = Backup::prepare(
+            &db,
+            &directory,
+            StoreId::parse("01890a5d-ac96-774b-bcce-b302099a8050").unwrap(),
+            NonZeroU32::MIN,
+        )
+        .unwrap();
+        let hold = backup.hold();
+        let clock = ManualClock::new(UnixMillis(1_791_261_000_000)).clock();
+        let task = tokio::task::spawn_blocking(move || backup.run(&clock));
+        hold.started().await;
+        fs::remove_dir(&directory).unwrap();
+        fs::write(&directory, b"a file cannot contain the snapshot").unwrap();
+        drop(hold);
+        let error = task.await.unwrap().unwrap_err();
+        assert!(
+            matches!(&error, StorageError::Backup { stage: BackupStage::Generate, number: None, source, .. }
+            if matches!(source.downcast_ref::<StorageError>(), Some(StorageError::Sqlite { operation: "生成备份快照", .. })))
+        );
+        storage.writer_handle.shutdown().await.unwrap();
     }
 
     #[test]
@@ -423,7 +574,10 @@ mod tests {
             .execute("VACUUM INTO ?1", [snapshot.to_str().unwrap()])
             .unwrap();
         assert_eq!(verify(&snapshot, 0).unwrap(), 0);
-        assert!(matches!(verify(&snapshot, 1), Err(StorageError::Backup(_))));
+        assert!(matches!(
+            verify(&snapshot, 1),
+            Err(StorageError::Message(_))
+        ));
         let corrupt = dir.path().join("corrupt.db");
         fs::write(&corrupt, b"not a SQLite database").unwrap();
         assert!(verify(&corrupt, 0).is_err());

@@ -36,8 +36,8 @@ async fn main() -> anyhow::Result<()> {
         "starting"
     );
 
-    let storage =
-        boh_storage::open(&config.db_path, config.reader_pool_size).context("open storage")?;
+    let storage = boh_storage::open(&config.db_path, config.reader_pool_size)
+        .context("open storage and migrate database")?;
     let result = run(operation, config, storage.writer, storage.readers).await;
     let closed = storage
         .writer_handle
@@ -46,7 +46,10 @@ async fn main() -> anyhow::Result<()> {
         .context("close storage");
     match &closed {
         Ok(()) => tracing::info!("storage closed"),
-        Err(error) => tracing::error!(%error, "storage shutdown failed"),
+        Err(error) if result.is_err() => {
+            tracing::error!(error = %boh_storage::Diagnostic(error.as_ref()), "storage shutdown failed")
+        }
+        Err(_) => {}
     }
     // Preserve the original startup/serve error even if shutdown also fails.
     result?;
@@ -109,7 +112,8 @@ async fn run(
         backup_health.clone(),
         config.timezone.clone(),
         config.closing_backup_time,
-    )?;
+    )
+    .context("start backup scheduler")?;
     let stop_backups = tasks.stop_handle();
     let shutdown = async move {
         tokio::select! {
@@ -136,7 +140,10 @@ async fn run(
         .context("http server");
 
     tracing::info!("http stopped, draining backups");
-    let stopped = tasks.shutdown().await;
+    let stopped = tasks
+        .shutdown()
+        .await
+        .context("drain and stop backup tasks");
     tracing::info!("backups stopped, draining writer");
     served?;
     stopped?;

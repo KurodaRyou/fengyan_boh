@@ -44,7 +44,7 @@ async fn receipt_counts(node: &Node) -> (i64, i64, i64, i64, i64) {
     node.storage
         .readers
         .call(|conn| -> Result<_, StorageError> {
-            Ok(conn.query_row(
+            conn.query_row(
                 "SELECT (SELECT count(*) FROM store_events),
                         (SELECT count(*) FROM processed_commands),
                         (SELECT count(*) FROM inventory_lots),
@@ -60,7 +60,8 @@ async fn receipt_counts(node: &Node) -> (i64, i64, i64, i64, i64) {
                         row.get(4)?,
                     ))
                 },
-            )?)
+            )
+            .map_err(|error| StorageError::sqlite("查询事件账本", error))
         })
         .await
         .unwrap()
@@ -106,7 +107,8 @@ async fn failures_after_partial_projection_or_at_command_save_roll_back_every_ro
                 tx.execute_batch(&format!(
                     "CREATE TRIGGER injected_receipt_failure BEFORE INSERT ON {table}
                      WHEN {condition} BEGIN SELECT RAISE(ABORT, 'private receipt failure'); END;"
-                ))?;
+                ))
+                .map_err(|error| StorageError::sqlite("执行数据库", error))?;
                 Ok(())
             })
             .await
@@ -116,7 +118,8 @@ async fn failures_after_partial_projection_or_at_command_save_roll_back_every_ro
         node.storage
             .writer
             .call(|tx| -> Result<(), StorageError> {
-                tx.execute_batch("DROP TRIGGER injected_receipt_failure")?;
+                tx.execute_batch("DROP TRIGGER injected_receipt_failure")
+                    .map_err(|error| StorageError::sqlite("执行数据库", error))?;
                 Ok(())
             })
             .await
@@ -152,7 +155,8 @@ async fn expiry_warnings_skip_depleted_and_undated_lots_and_do_not_look_ahead() 
             tx.execute(
                 "UPDATE inventory_lots SET remaining_qty = 0 WHERE lot_id = ?1",
                 [depleted],
-            )?;
+            )
+            .map_err(|error| StorageError::sqlite("更新库存批次", error))?;
             Ok(())
         })
         .await
@@ -173,7 +177,8 @@ async fn expiry_warnings_skip_depleted_and_undated_lots_and_do_not_look_ahead() 
             tx.execute(
                 "UPDATE inventory_lots SET remaining_qty = 5, expires_at = NULL WHERE lot_id = ?1",
                 [old_lot],
-            )?;
+            )
+            .map_err(|error| StorageError::sqlite("更新库存批次", error))?;
             Ok(())
         })
         .await
@@ -227,7 +232,8 @@ async fn receipt_dates_use_configured_timezone_and_replay_preserves_the_saved_ex
         .call(move |conn| -> Result<(), StorageError> {
             assert_eq!(
                 conn.query_row("SELECT expires_at FROM inventory_lots", [], |row| row
-                    .get::<_, i64>(0))?,
+                    .get::<_, i64>(0))
+                    .map_err(|error| StorageError::sqlite("查询库存批次", error))?,
                 expires_at
             );
             Ok(())

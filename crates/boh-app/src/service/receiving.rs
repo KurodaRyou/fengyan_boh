@@ -16,6 +16,7 @@ use crate::AppState;
 use crate::actor::Actor;
 use crate::http::{ApiError, WarningBody, ok};
 
+#[tracing::instrument(name = "command", skip_all, fields(command_type = "receipt.create", command_id = %command.command_id, actor_id = %actor.employee_id, device_id = %actor.device_id))]
 pub async fn create(
     state: AppState,
     actor: Actor,
@@ -56,7 +57,7 @@ pub async fn create(
                             [command.supplier_id.to_string()],
                             |row| row.get(0),
                         )
-                        .map_err(StorageError::from)?;
+                        .map_err(|error| StorageError::sqlite("查询供应商", error))?;
                     if !supplier_exists {
                         return Err(missing_reference("SUPPLIER", command.supplier_id));
                     }
@@ -107,7 +108,7 @@ pub async fn create(
                                 params![line.item_id.to_string(), expires_at.0],
                                 |row| row.get(0),
                             )
-                            .map_err(StorageError::from)?;
+                            .map_err(|error| StorageError::sqlite("查询库存批次", error))?;
                         if older_expires_later
                             || earlier_expiries
                                 .get(&line.item_id)
@@ -145,7 +146,9 @@ pub async fn create(
                         supplier_id: command.supplier_id,
                         lines,
                     };
-                    let payload = serde_json::to_string(&received).map_err(ApiError::internal)?;
+                    let payload = serde_json::to_string(&received).map_err(|error| {
+                        ApiError::from(StorageError::external("序列化收货事件", error))
+                    })?;
                     let row = Receipt {
                         receipt_id,
                         supplier_id: command.supplier_id,
@@ -174,7 +177,9 @@ pub async fn create(
                     })?;
                     let mut response = ok(json!({ "receipt": row })).0;
                     response.warnings = warnings;
-                    serde_json::to_string(&response).map_err(ApiError::internal)
+                    serde_json::to_string(&response).map_err(|error| {
+                        ApiError::from(StorageError::external("保存收货命令响应", error))
+                    })
                 },
             )
         })
@@ -192,7 +197,7 @@ fn validate_unit(tx: &Transaction<'_>, index: usize, line: &ReceiptLine) -> Resu
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
-        .map_err(StorageError::from)?;
+        .map_err(|error| StorageError::sqlite("查询物料", error))?;
     let (base_unit, factor) = current.ok_or_else(|| missing_reference("ITEM", line.item_id))?;
     let factor = if line.input.unit_code == base_unit {
         1

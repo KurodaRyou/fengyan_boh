@@ -20,14 +20,20 @@ fn object(
     required: &[(&str, &str)],
     optional: &[(&str, &str)],
 ) -> Result<(), StorageError> {
-    let kind: String = tx.query_row("SELECT json_type(?1)", [json], |r| r.get(0))?;
+    let kind: String = tx
+        .query_row("SELECT json_type(?1)", [json], |r| r.get(0))
+        .map_err(|error| StorageError::sqlite("查询事件 JSON", error))?;
     if kind != "object" {
         return Err(invalid());
     }
-    let mut statement = tx.prepare("SELECT key, type FROM json_each(?1)")?;
+    let mut statement = tx
+        .prepare("SELECT key, type FROM json_each(?1)")
+        .map_err(|error| StorageError::sqlite("准备查询事件 JSON", error))?;
     let fields: Vec<(String, String)> = statement
-        .query_map([json], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<Result<_, _>>()?;
+        .query_map([json], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(|error| StorageError::sqlite("查询事件 JSON", error))?
+        .collect::<Result<_, _>>()
+        .map_err(|error| StorageError::sqlite("读取事件 JSON", error))?;
     let mut seen = Vec::new();
     for (key, kind) in &fields {
         let expected = required
@@ -52,16 +58,25 @@ fn object(
 }
 
 fn array(tx: &Transaction<'_>, json: &str, path: &str) -> Result<Vec<String>, StorageError> {
-    let mut statement =
-        tx.prepare("SELECT value, type FROM json_each(?1, ?2) ORDER BY CAST(key AS INTEGER)")?;
-    let mut rows = statement.query(params![json, path])?;
+    let mut statement = tx
+        .prepare("SELECT value, type FROM json_each(?1, ?2) ORDER BY CAST(key AS INTEGER)")
+        .map_err(|error| StorageError::sqlite("准备查询事件 JSON", error))?;
+    let rows = statement
+        .query_map(params![json, path], |row| {
+            let kind: String = row.get(1)?;
+            if kind == "object" {
+                Ok(Some(row.get::<_, String>(0)?))
+            } else {
+                Ok(None)
+            }
+        })
+        .map_err(|error| StorageError::sqlite("查询主数据数组", error))?;
     let mut objects = Vec::new();
-    while let Some(row) = rows.next()? {
-        let kind: String = row.get(1)?;
-        if kind != "object" {
-            return Err(invalid());
-        }
-        objects.push(row.get(0)?);
+    for row in rows {
+        let object = row
+            .map_err(|error| StorageError::sqlite("解码主数据数组", error))?
+            .ok_or_else(invalid)?;
+        objects.push(object);
     }
     Ok(objects)
 }
@@ -80,7 +95,7 @@ pub(crate) fn apply(tx: &Transaction<'_>, event: &Event) -> Result<(), StorageEr
     let (entity, source, snapshot): (String, String, String) = tx.query_row(
         "SELECT json_extract(?1, '$.entity'), json_extract(?1, '$.source'), json_extract(?1, '$.snapshot')",
         [&event.payload], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    )?;
+    ).map_err(|error| StorageError::sqlite("查询事件 JSON", error))?;
     if entity != event.aggregate_type
         || !matches!(source.as_str(), "LOCAL" | "HQ_PACKAGE")
         || event.aggregate_version <= 0
@@ -114,7 +129,7 @@ fn item(tx: &Transaction<'_>, event: &Event, json: &str) -> Result<(), StorageEr
         "SELECT json_extract(?1, '$.code'), json_extract(?1, '$.name'), json_extract(?1, '$.base_unit'),
          json_extract(?1, '$.category'), json_extract(?1, '$.default_shelf_life_ms'), json_extract(?1, '$.active')",
         [json], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
-    )?;
+    ).map_err(|error| StorageError::sqlite("查询事件 JSON", error))?;
     let mut units = Vec::new();
     for unit in array(tx, json, "$.units")? {
         object(
@@ -123,16 +138,19 @@ fn item(tx: &Transaction<'_>, event: &Event, json: &str) -> Result<(), StorageEr
             &[("unit_code", "text"), ("base_qty_per_unit", "integer")],
             &[],
         )?;
-        units.push(tx.query_row(
-            "SELECT json_extract(?1, '$.unit_code'), json_extract(?1, '$.base_qty_per_unit')",
-            [&unit],
-            |r| {
-                Ok(ItemUnit {
-                    unit_code: r.get(0)?,
-                    base_qty_per_unit: r.get(1)?,
-                })
-            },
-        )?);
+        units.push(
+            tx.query_row(
+                "SELECT json_extract(?1, '$.unit_code'), json_extract(?1, '$.base_qty_per_unit')",
+                [&unit],
+                |r| {
+                    Ok(ItemUnit {
+                        unit_code: r.get(0)?,
+                        base_qty_per_unit: r.get(1)?,
+                    })
+                },
+            )
+            .map_err(|error| StorageError::sqlite("查询事件 JSON", error))?,
+        );
     }
     let snapshot = ItemSnapshot {
         code,
@@ -154,19 +172,23 @@ fn item(tx: &Transaction<'_>, event: &Event, json: &str) -> Result<(), StorageEr
         snapshot.active,
         event.aggregate_version
     ];
-    if tx.execute(
-        "UPDATE items SET code = ?2, name = ?3, base_unit = ?4, category = ?5,
+    if tx
+        .execute(
+            "UPDATE items SET code = ?2, name = ?3, base_unit = ?4, category = ?5,
         default_shelf_life_ms = ?6, active = ?7, revision = ?8 WHERE id = ?1",
-        values,
-    )? == 0
+            values,
+        )
+        .map_err(|error| StorageError::sqlite("更新物料", error))?
+        == 0
     {
         tx.execute("INSERT INTO items (id, code, name, base_unit, category, default_shelf_life_ms, active, revision)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", values)?;
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", values).map_err(|error| StorageError::sqlite("插入物料", error))?;
     }
     tx.execute(
         "DELETE FROM item_units WHERE item_id = ?1",
         [event.aggregate_id.to_string()],
-    )?;
+    )
+    .map_err(|error| StorageError::sqlite("删除物料单位", error))?;
     for unit in snapshot.units {
         tx.execute(
             "INSERT INTO item_units (item_id, unit_code, base_qty_per_unit) VALUES (?1, ?2, ?3)",
@@ -175,7 +197,8 @@ fn item(tx: &Transaction<'_>, event: &Event, json: &str) -> Result<(), StorageEr
                 unit.unit_code,
                 unit.base_qty_per_unit
             ],
-        )?;
+        )
+        .map_err(|error| StorageError::sqlite("插入物料单位", error))?;
     }
     Ok(())
 }
@@ -196,7 +219,7 @@ fn recipe(tx: &Transaction<'_>, event: &Event, json: &str) -> Result<(), Storage
     let (code, name, output, active): (String, String, String, bool) = tx.query_row(
         "SELECT json_extract(?1, '$.code'), json_extract(?1, '$.name'), json_extract(?1, '$.output_item_id'),
             json_extract(?1, '$.active')", [json], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-    )?;
+    ).map_err(|error| StorageError::sqlite("查询事件 JSON", error))?;
     let mut versions = Vec::new();
     for version in array(tx, json, "$.versions")? {
         object(
@@ -209,11 +232,13 @@ fn recipe(tx: &Transaction<'_>, event: &Event, json: &str) -> Result<(), Storage
             ],
             &[],
         )?;
-        let (number, output_qty_per_batch): (i64, i64) = tx.query_row(
-            "SELECT json_extract(?1, '$.version'), json_extract(?1, '$.output_qty_per_batch')",
-            [&version],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
+        let (number, output_qty_per_batch): (i64, i64) = tx
+            .query_row(
+                "SELECT json_extract(?1, '$.version'), json_extract(?1, '$.output_qty_per_batch')",
+                [&version],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|error| StorageError::sqlite("查询事件 JSON", error))?;
         let mut lines = Vec::new();
         for line in array(tx, &version, "$.lines")? {
             object(
@@ -222,11 +247,13 @@ fn recipe(tx: &Transaction<'_>, event: &Event, json: &str) -> Result<(), Storage
                 &[("item_id", "text"), ("qty_per_batch", "integer")],
                 &[],
             )?;
-            let (item, qty_per_batch): (String, i64) = tx.query_row(
-                "SELECT json_extract(?1, '$.item_id'), json_extract(?1, '$.qty_per_batch')",
-                [&line],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
+            let (item, qty_per_batch): (String, i64) = tx
+                .query_row(
+                    "SELECT json_extract(?1, '$.item_id'), json_extract(?1, '$.qty_per_batch')",
+                    [&line],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(|error| StorageError::sqlite("查询事件 JSON", error))?;
             lines.push(RecipeLine {
                 item_id: AggregateId::parse(&item)?,
                 qty_per_batch,
@@ -254,28 +281,30 @@ fn recipe(tx: &Transaction<'_>, event: &Event, json: &str) -> Result<(), Storage
         snapshot.active,
         event.aggregate_version
     ];
-    if tx.execute("UPDATE recipes SET code = ?2, name = ?3, output_item_id = ?4, active = ?5, revision = ?6 WHERE id = ?1", values)? == 0 {
-        tx.execute("INSERT INTO recipes (id, code, name, output_item_id, active, revision) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", values)?;
+    if tx.execute("UPDATE recipes SET code = ?2, name = ?3, output_item_id = ?4, active = ?5, revision = ?6 WHERE id = ?1", values).map_err(|error| StorageError::sqlite("更新配方", error))? == 0 {
+        tx.execute("INSERT INTO recipes (id, code, name, output_item_id, active, revision) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", values).map_err(|error| StorageError::sqlite("插入配方", error))?;
     }
     for version in snapshot.versions {
-        let inserted = tx.execute(
-            "INSERT INTO recipe_versions (recipe_id, version, output_qty_per_batch)
+        let inserted = tx
+            .execute(
+                "INSERT INTO recipe_versions (recipe_id, version, output_qty_per_batch)
              SELECT ?1, ?2, ?3 WHERE NOT EXISTS (
                  SELECT 1 FROM recipe_versions WHERE recipe_id = ?1 AND version = ?2
              )",
-            params![
-                event.aggregate_id.to_string(),
-                version.version,
-                version.output_qty_per_batch
-            ],
-        )?;
+                params![
+                    event.aggregate_id.to_string(),
+                    version.version,
+                    version.output_qty_per_batch
+                ],
+            )
+            .map_err(|error| StorageError::sqlite("插入配方版本", error))?;
         if inserted == 0 {
             continue;
         }
         for (index, line) in version.lines.into_iter().enumerate() {
             let line_no = i64::try_from(index).map_err(|_| invalid())?;
             tx.execute("INSERT INTO recipe_lines (recipe_id, version, line_no, item_id, qty_per_batch) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![event.aggregate_id.to_string(), version.version, line_no, line.item_id.to_string(), line.qty_per_batch])?;
+                params![event.aggregate_id.to_string(), version.version, line_no, line.item_id.to_string(), line.qty_per_batch]).map_err(|error| StorageError::sqlite("插入配方明细", error))?;
         }
     }
     Ok(())
@@ -288,19 +317,21 @@ fn supplier(tx: &Transaction<'_>, event: &Event, json: &str) -> Result<(), Stora
         &[("code", "text"), ("name", "text"), ("active", "boolean")],
         &[("contact_phone", "text")],
     )?;
-    let snapshot = tx.query_row(
-        "SELECT json_extract(?1, '$.code'), json_extract(?1, '$.name'),
+    let snapshot = tx
+        .query_row(
+            "SELECT json_extract(?1, '$.code'), json_extract(?1, '$.name'),
         json_extract(?1, '$.contact_phone'), json_extract(?1, '$.active')",
-        [json],
-        |r| {
-            Ok(SupplierSnapshot {
-                code: r.get(0)?,
-                name: r.get(1)?,
-                contact_phone: r.get(2)?,
-                active: r.get(3)?,
-            })
-        },
-    )?;
+            [json],
+            |r| {
+                Ok(SupplierSnapshot {
+                    code: r.get(0)?,
+                    name: r.get(1)?,
+                    contact_phone: r.get(2)?,
+                    active: r.get(3)?,
+                })
+            },
+        )
+        .map_err(|error| StorageError::sqlite("查询事件 JSON", error))?;
     snapshot.validate()?;
     let values = params![
         event.aggregate_id.to_string(),
@@ -310,8 +341,8 @@ fn supplier(tx: &Transaction<'_>, event: &Event, json: &str) -> Result<(), Stora
         snapshot.active,
         event.aggregate_version
     ];
-    if tx.execute("UPDATE suppliers SET code = ?2, name = ?3, contact_phone = ?4, active = ?5, revision = ?6 WHERE id = ?1", values)? == 0 {
-        tx.execute("INSERT INTO suppliers (id, code, name, contact_phone, active, revision) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", values)?;
+    if tx.execute("UPDATE suppliers SET code = ?2, name = ?3, contact_phone = ?4, active = ?5, revision = ?6 WHERE id = ?1", values).map_err(|error| StorageError::sqlite("更新供应商", error))? == 0 {
+        tx.execute("INSERT INTO suppliers (id, code, name, contact_phone, active, revision) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", values).map_err(|error| StorageError::sqlite("插入供应商", error))?;
     }
     Ok(())
 }
@@ -324,7 +355,7 @@ fn waste_reason(tx: &Transaction<'_>, event: &Event, json: &str) -> Result<(), S
         &[],
     )?;
     let snapshot = tx.query_row("SELECT json_extract(?1, '$.code'), json_extract(?1, '$.name'), json_extract(?1, '$.active')", [json],
-        |r| Ok(WasteReasonSnapshot { code: r.get(0)?, name: r.get(1)?, active: r.get(2)? }))?;
+        |r| Ok(WasteReasonSnapshot { code: r.get(0)?, name: r.get(1)?, active: r.get(2)? })).map_err(|error| StorageError::sqlite("查询事件 JSON", error))?;
     snapshot.validate()?;
     let values = params![
         event.aggregate_id.to_string(),
@@ -336,9 +367,9 @@ fn waste_reason(tx: &Transaction<'_>, event: &Event, json: &str) -> Result<(), S
     if tx.execute(
         "UPDATE waste_reasons SET code = ?2, name = ?3, active = ?4, revision = ?5 WHERE id = ?1",
         values,
-    )? == 0
+    ).map_err(|error| StorageError::sqlite("更新报损原因", error))? == 0
     {
-        tx.execute("INSERT INTO waste_reasons (id, code, name, active, revision) VALUES (?1, ?2, ?3, ?4, ?5)", values)?;
+        tx.execute("INSERT INTO waste_reasons (id, code, name, active, revision) VALUES (?1, ?2, ?3, ?4, ?5)", values).map_err(|error| StorageError::sqlite("插入报损原因", error))?;
     }
     Ok(())
 }
@@ -354,7 +385,7 @@ mod tests {
 
     #[tokio::test]
     async fn array_rejects_non_object_elements_as_invalid_events() -> Result<(), StorageError> {
-        let dir = tempfile::tempdir()?;
+        let dir = tempfile::tempdir().map_err(|error| StorageError::io("创建测试目录", error))?;
         let storage = open(&dir.path().join("boh.db"), NonZeroUsize::MIN)?;
         storage
             .writer
@@ -380,7 +411,7 @@ mod tests {
     #[tokio::test]
     async fn recipe_updates_and_additions_do_not_rewrite_existing_versions()
     -> Result<(), StorageError> {
-        let dir = tempfile::tempdir()?;
+        let dir = tempfile::tempdir().map_err(|error| StorageError::io("创建测试目录", error))?;
         let storage = open(&dir.path().join("boh.db"), NonZeroUsize::MIN)?;
         storage
             .writer
@@ -391,7 +422,7 @@ mod tests {
                     "INSERT INTO items (id, code, name, base_unit, category, active, revision)
                      VALUES (?1, 'ITEM', 'Item', 'g', 'RAW', 1, 1)",
                     [item_id],
-                )?;
+                ).map_err(|error| StorageError::sqlite("插入物料", error))?;
                 let mut event = Event {
                     id: EventId::parse(recipe_id)?,
                     event_type: "MASTER_DATA_CHANGED".into(),
@@ -427,7 +458,7 @@ mod tests {
                             "CREATE TEMP TRIGGER preserve_{table}_{operation}
                              BEFORE {operation} ON {table} WHEN {row}.version = 1
                              BEGIN SELECT RAISE(ABORT, 'existing recipe version changed'); END;"
-                        ))?;
+                        )).map_err(|error| StorageError::sqlite("执行数据库", error))?;
                     }
                 }
 
@@ -440,16 +471,16 @@ mod tests {
                     "SELECT v.version, v.output_qty_per_batch, l.line_no, l.qty_per_batch
                      FROM recipe_versions v JOIN recipe_lines l USING (recipe_id, version)
                      WHERE v.recipe_id = ?1 ORDER BY v.version, l.line_no",
-                )?;
+                ).map_err(|error| StorageError::sqlite("准备查询配方版本", error))?;
                 let rows: Vec<(i64, i64, i64, i64)> = statement
-                    .query_map([recipe_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
-                    .collect::<Result<_, _>>()?;
+                    .query_map([recipe_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).map_err(|error| StorageError::sqlite("查询配方版本", error))?
+                    .collect::<Result<_, _>>().map_err(|error| StorageError::sqlite("读取配方版本", error))?;
                 assert_eq!(rows, [(1, 10, 0, 100), (2, 20, 0, 200)]);
                 let metadata: (String, i64) = tx.query_row(
                     "SELECT name, revision FROM recipes WHERE id = ?1",
                     [recipe_id],
                     |r| Ok((r.get(0)?, r.get(1)?)),
-                )?;
+                ).map_err(|error| StorageError::sqlite("查询配方", error))?;
                 assert_eq!(metadata, ("Renamed".into(), 3));
                 Ok(())
             })

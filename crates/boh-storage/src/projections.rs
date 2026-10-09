@@ -4,7 +4,7 @@ use boh_domain::equipment::EquipmentType;
 use boh_domain::receiving::{GoodsReceived, ReceiptInput, ReceivedLine};
 use boh_domain::temperature::TemperatureLogged;
 use boh_domain::{AggregateId, CommandId, EventId, UnixMillis};
-use rusqlite::{Transaction, params};
+use rusqlite::{Row, Transaction, params};
 
 use crate::StorageError;
 use crate::ledger::Event;
@@ -46,8 +46,9 @@ pub(crate) fn apply(tx: &Transaction<'_>, event: &Event) -> Result<(), StorageEr
 
 fn apply_equipment(tx: &Transaction<'_>, event: &Event) -> Result<(), StorageError> {
     // Decode only the event JSON, without consulting current master data or making decisions.
-    let valid: bool = tx.query_row(
-        "SELECT json_type(?1) = 'object'
+    let valid: bool = tx
+        .query_row(
+            "SELECT json_type(?1) = 'object'
           AND (SELECT count(*) FROM json_each(?1)) = 3
           AND json_extract(?1, '$.entity') = 'EQUIPMENT'
           AND json_extract(?1, '$.source') IN ('LOCAL', 'HQ_PACKAGE')
@@ -57,9 +58,10 @@ fn apply_equipment(tx: &Transaction<'_>, event: &Event) -> Result<(), StorageErr
           AND json_type(?1, '$.snapshot.name') = 'text'
           AND json_type(?1, '$.snapshot.equipment_type') = 'text'
           AND json_type(?1, '$.snapshot.active') IN ('true', 'false')",
-        [&event.payload],
-        |r| Ok(r.get::<_, Option<bool>>(0)?.unwrap_or(false)),
-    )?;
+            [&event.payload],
+            |r| Ok(r.get::<_, Option<bool>>(0)?.unwrap_or(false)),
+        )
+        .map_err(|error| StorageError::sqlite("查询事件 JSON", error))?;
     if !valid {
         return Err(StorageError::InvalidEvent(
             "invalid equipment payload".into(),
@@ -70,7 +72,7 @@ fn apply_equipment(tx: &Transaction<'_>, event: &Event) -> Result<(), StorageErr
                 json_extract(?1, '$.snapshot.equipment_type'), json_extract(?1, '$.snapshot.active')",
         [&event.payload],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-    )?;
+    ).map_err(|error| StorageError::sqlite("查询事件 JSON", error))?;
     EquipmentType::parse(&kind)?;
     // Full snapshots overwrite the projection, independent of its previous contents.
     let values = params![
@@ -81,17 +83,20 @@ fn apply_equipment(tx: &Transaction<'_>, event: &Event) -> Result<(), StorageErr
         active,
         event.aggregate_version
     ];
-    let updated = tx.execute(
-        "UPDATE equipment SET code = ?2, name = ?3, equipment_type = ?4, active = ?5,
+    let updated = tx
+        .execute(
+            "UPDATE equipment SET code = ?2, name = ?3, equipment_type = ?4, active = ?5,
                               revision = ?6 WHERE id = ?1",
-        values,
-    )?;
+            values,
+        )
+        .map_err(|error| StorageError::sqlite("更新设备", error))?;
     if updated == 0 {
         tx.execute(
             "INSERT INTO equipment (id, code, name, equipment_type, active, revision)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             values,
-        )?;
+        )
+        .map_err(|error| StorageError::sqlite("插入设备", error))?;
     }
     Ok(())
 }
@@ -102,8 +107,9 @@ fn apply_temperature(tx: &Transaction<'_>, event: &Event) -> Result<(), StorageE
             "unsupported temperature aggregate version".into(),
         ));
     }
-    let valid: bool = tx.query_row(
-        "SELECT json_type(?1) = 'object'
+    let valid: bool = tx
+        .query_row(
+            "SELECT json_type(?1) = 'object'
           AND (SELECT count(*) FROM json_each(?1)) =
               CASE WHEN json_type(?1, '$.note') IS NULL THEN 2 ELSE 3 END
           AND NOT EXISTS (SELECT 1 FROM json_each(?1)
@@ -111,20 +117,23 @@ fn apply_temperature(tx: &Transaction<'_>, event: &Event) -> Result<(), StorageE
           AND json_type(?1, '$.equipment_id') = 'text'
           AND json_type(?1, '$.celsius_x10') = 'integer'
           AND (json_type(?1, '$.note') IS NULL OR json_type(?1, '$.note') = 'text')",
-        [&event.payload],
-        |row| Ok(row.get::<_, Option<bool>>(0)?.unwrap_or(false)),
-    )?;
+            [&event.payload],
+            |row| Ok(row.get::<_, Option<bool>>(0)?.unwrap_or(false)),
+        )
+        .map_err(|error| StorageError::sqlite("查询事件 JSON", error))?;
     if !valid {
         return Err(StorageError::InvalidEvent(
             "invalid temperature payload".into(),
         ));
     }
-    let (equipment_id, celsius_x10, note): (String, i64, Option<String>) = tx.query_row(
-        "SELECT json_extract(?1, '$.equipment_id'), json_extract(?1, '$.celsius_x10'),
+    let (equipment_id, celsius_x10, note): (String, i64, Option<String>) = tx
+        .query_row(
+            "SELECT json_extract(?1, '$.equipment_id'), json_extract(?1, '$.celsius_x10'),
                 json_extract(?1, '$.note')",
-        [&event.payload],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
+            [&event.payload],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|error| StorageError::sqlite("查询事件 JSON", error))?;
     let payload = TemperatureLogged {
         equipment_id: AggregateId::parse(&equipment_id)?,
         celsius_x10,
@@ -132,23 +141,25 @@ fn apply_temperature(tx: &Transaction<'_>, event: &Event) -> Result<(), StorageE
     };
     payload.validate()?;
     // The stored event supplies seq in both the online and replay paths.
-    let inserted = tx.execute(
-        "INSERT INTO temperature_readings (id, event_seq, equipment_id, celsius_x10, note,
+    let inserted = tx
+        .execute(
+            "INSERT INTO temperature_readings (id, event_seq, equipment_id, celsius_x10, note,
              actor_id, device_id, business_date, occurred_at, recorded_at)
          SELECT ?1, seq, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9 FROM store_events WHERE id = ?10",
-        params![
-            event.aggregate_id.to_string(),
-            payload.equipment_id.to_string(),
-            payload.celsius_x10,
-            payload.note,
-            event.actor_id.to_string(),
-            event.device_id.to_string(),
-            event.business_date,
-            event.occurred_at.0,
-            event.recorded_at.0,
-            event.id.to_string()
-        ],
-    )?;
+            params![
+                event.aggregate_id.to_string(),
+                payload.equipment_id.to_string(),
+                payload.celsius_x10,
+                payload.note,
+                event.actor_id.to_string(),
+                event.device_id.to_string(),
+                event.business_date,
+                event.occurred_at.0,
+                event.recorded_at.0,
+                event.id.to_string()
+            ],
+        )
+        .map_err(|error| StorageError::sqlite("插入温度记录", error))?;
     if inserted != 1 {
         return Err(StorageError::InvalidEvent(
             "temperature event not found".into(),
@@ -165,11 +176,13 @@ fn apply_receipt(tx: &Transaction<'_>, event: &Event) -> Result<(), StorageError
     }
     let payload = receipt_payload(tx, &event.payload)?;
     // seq comes from the stored event in both the online and replay paths.
-    let seq: i64 = tx.query_row(
-        "SELECT seq FROM store_events WHERE id = ?1",
-        [event.id.to_string()],
-        |row| row.get(0),
-    )?;
+    let seq: i64 = tx
+        .query_row(
+            "SELECT seq FROM store_events WHERE id = ?1",
+            [event.id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(|error| StorageError::sqlite("查询事件账本", error))?;
     for (index, line) in payload.lines.into_iter().enumerate() {
         let index = i64::try_from(index)
             .map_err(|_| StorageError::InvalidEvent("receipt line number overflow".into()))?;
@@ -186,7 +199,8 @@ fn apply_receipt(tx: &Transaction<'_>, event: &Event) -> Result<(), StorageError
                 line.expires_at.0,
                 line.manufacturer_lot_no
             ],
-        )?;
+        )
+        .map_err(|error| StorageError::sqlite("插入库存批次", error))?;
         tx.execute(
             "INSERT INTO inventory_movements (event_seq, movement_no, item_id, lot_id,
                  kind, alloc_source, nominal_qty, qty_delta, absorbed_by_event_id,
@@ -201,7 +215,8 @@ fn apply_receipt(tx: &Transaction<'_>, event: &Event) -> Result<(), StorageError
                 event.occurred_at.0,
                 event.business_date
             ],
-        )?;
+        )
+        .map_err(|error| StorageError::sqlite("插入库存流水", error))?;
     }
     Ok(())
 }
@@ -209,8 +224,9 @@ fn apply_receipt(tx: &Transaction<'_>, event: &Event) -> Result<(), StorageError
 fn receipt_payload(tx: &Transaction<'_>, json: &str) -> Result<GoodsReceived, StorageError> {
     // Validate JSON types before extraction: SQLite otherwise coerces booleans
     // and floating-point numbers when retrieving integer columns.
-    let valid: bool = tx.query_row(
-        "SELECT json_type(?1) = 'object'
+    let valid: bool = tx
+        .query_row(
+            "SELECT json_type(?1) = 'object'
           AND (SELECT count(*) FROM json_each(?1)) = 2
           AND json_type(?1, '$.supplier_id') = 'text'
           AND json_type(?1, '$.lines') = 'array'
@@ -236,45 +252,35 @@ fn receipt_payload(tx: &Transaction<'_>, json: &str) -> Result<GoodsReceived, St
                   AND json_type(line.value, '$.expires_at') = 'integer'
                   AND json_type(line.value, '$.line_cost_cents') = 'integer'
               ELSE 0 END) IS NOT 1)",
-        [json],
-        |row| Ok(row.get::<_, Option<bool>>(0)?.unwrap_or(false)),
-    )?;
+            [json],
+            |row| Ok(row.get::<_, Option<bool>>(0)?.unwrap_or(false)),
+        )
+        .map_err(|error| StorageError::sqlite("查询事件 JSON", error))?;
     if !valid {
         return Err(StorageError::InvalidEvent("invalid receipt payload".into()));
     }
-    let invalid = |error: boh_domain::DomainError| StorageError::InvalidEvent(error.to_string());
-    let supplier_id: String =
-        tx.query_row("SELECT json_extract(?1, '$.supplier_id')", [json], |row| {
+    let invalid = |error: boh_domain::DomainError| StorageError::external("校验收货事件", error);
+    let supplier_id: String = tx
+        .query_row("SELECT json_extract(?1, '$.supplier_id')", [json], |row| {
             row.get(0)
-        })?;
-    let mut statement = tx.prepare(
-        "SELECT json_extract(value, '$.item_id'), json_extract(value, '$.qty'),
+        })
+        .map_err(|error| StorageError::sqlite("查询事件 JSON", error))?;
+    let mut statement = tx
+        .prepare(
+            "SELECT json_extract(value, '$.item_id'), json_extract(value, '$.qty'),
                 json_extract(value, '$.input.qty'), json_extract(value, '$.input.unit_code'),
                 json_extract(value, '$.input.base_qty_per_unit'), json_extract(value, '$.lot_id'),
                 json_extract(value, '$.manufacturer_lot_no'), json_extract(value, '$.produced_on'),
                 json_extract(value, '$.expires_on'), json_extract(value, '$.expires_at'),
                 json_extract(value, '$.line_cost_cents')
          FROM json_each(?1, '$.lines') ORDER BY key",
-    )?;
-    let mut rows = statement.query([json])?;
-    let mut lines = Vec::new();
-    while let Some(row) = rows.next()? {
-        lines.push(ReceivedLine {
-            item_id: AggregateId::parse(&row.get::<_, String>(0)?).map_err(invalid)?,
-            qty: row.get(1)?,
-            input: ReceiptInput {
-                qty: row.get(2)?,
-                unit_code: row.get(3)?,
-                base_qty_per_unit: row.get(4)?,
-            },
-            lot_id: AggregateId::parse(&row.get::<_, String>(5)?).map_err(invalid)?,
-            manufacturer_lot_no: row.get(6)?,
-            produced_on: row.get(7)?,
-            expires_on: row.get(8)?,
-            expires_at: UnixMillis(row.get(9)?),
-            line_cost_cents: row.get(10)?,
-        });
-    }
+        )
+        .map_err(|error| StorageError::sqlite("准备查询事件 JSON", error))?;
+    let lines = statement
+        .query_map([json], read_received_line)
+        .map_err(|error| StorageError::sqlite("查询收货事件行", error))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| StorageError::sqlite("解码收货事件行", error))?;
     let payload = GoodsReceived {
         supplier_id: AggregateId::parse(&supplier_id).map_err(invalid)?,
         lines,
@@ -283,34 +289,87 @@ fn receipt_payload(tx: &Transaction<'_>, json: &str) -> Result<GoodsReceived, St
     Ok(payload)
 }
 
+fn row_id<T>(
+    row: &Row<'_>,
+    index: usize,
+    parse: impl FnOnce(&str) -> Result<T, boh_domain::DomainError>,
+) -> rusqlite::Result<T> {
+    parse(&row.get::<_, String>(index)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
+fn read_received_line(row: &Row<'_>) -> rusqlite::Result<ReceivedLine> {
+    Ok(ReceivedLine {
+        item_id: row_id(row, 0, AggregateId::parse)?,
+        qty: row.get(1)?,
+        input: ReceiptInput {
+            qty: row.get(2)?,
+            unit_code: row.get(3)?,
+            base_qty_per_unit: row.get(4)?,
+        },
+        lot_id: row_id(row, 5, AggregateId::parse)?,
+        manufacturer_lot_no: row.get(6)?,
+        produced_on: row.get(7)?,
+        expires_on: row.get(8)?,
+        expires_at: UnixMillis(row.get(9)?),
+        line_cost_cents: row.get(10)?,
+    })
+}
+
+fn read_event(row: &Row<'_>) -> rusqlite::Result<Event> {
+    Ok(Event {
+        id: row_id(row, 0, EventId::parse)?,
+        event_type: row.get(1)?,
+        schema_version: row.get(2)?,
+        aggregate_type: row.get(3)?,
+        aggregate_id: row_id(row, 4, AggregateId::parse)?,
+        aggregate_version: row.get(5)?,
+        command_id: row_id(row, 6, CommandId::parse)?,
+        actor_id: row_id(row, 7, AggregateId::parse)?,
+        device_id: row_id(row, 8, AggregateId::parse)?,
+        business_date: row.get(9)?,
+        occurred_at: UnixMillis(row.get(10)?),
+        recorded_at: UnixMillis(row.get(11)?),
+        payload: row.get(12)?,
+    })
+}
+
 pub(crate) fn rebuild(tx: &Transaction<'_>) -> Result<u64, StorageError> {
     for table in PROJECTION_TABLES {
-        tx.execute(&format!("DELETE FROM \"{table}\""), [])?;
+        tx.execute(&format!("DELETE FROM \"{table}\""), [])
+            .map_err(|error| StorageError::sqlite("清空投影表", error))?;
     }
     let mut statement = tx.prepare(
         "SELECT id, event_type, schema_version, aggregate_type, aggregate_id, aggregate_version,
-                command_id, actor_id, device_id, business_date, occurred_at, recorded_at, payload
+                command_id, actor_id, device_id, business_date, occurred_at, recorded_at, payload, seq
          FROM store_events ORDER BY seq",
-    )?;
-    let mut rows = statement.query([])?;
+    ).map_err(|error| StorageError::sqlite("准备查询事件账本", error))?;
+    let mut rows = statement
+        .query([])
+        .map_err(|error| StorageError::sqlite("查询事件账本", error))?;
     let mut count = 0_u64;
-    while let Some(row) = rows.next()? {
-        let event = Event {
-            id: EventId::parse(&row.get::<_, String>(0)?)?,
-            event_type: row.get(1)?,
-            schema_version: row.get(2)?,
-            aggregate_type: row.get(3)?,
-            aggregate_id: AggregateId::parse(&row.get::<_, String>(4)?)?,
-            aggregate_version: row.get(5)?,
-            command_id: CommandId::parse(&row.get::<_, String>(6)?)?,
-            actor_id: AggregateId::parse(&row.get::<_, String>(7)?)?,
-            device_id: AggregateId::parse(&row.get::<_, String>(8)?)?,
-            business_date: row.get(9)?,
-            occurred_at: UnixMillis(row.get(10)?),
-            recorded_at: UnixMillis(row.get(11)?),
-            payload: row.get(12)?,
-        };
-        apply(tx, &event)?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|error| StorageError::sqlite("读取重放事件", error))?
+    {
+        let seq: i64 = row
+            .get(13)
+            .map_err(|error| StorageError::sqlite("解码重放事件序号", error))?;
+        let event_type: String = row
+            .get(1)
+            .map_err(|error| StorageError::sqlite("解码重放事件类型", error))?;
+        let schema_version: i64 = row
+            .get(2)
+            .map_err(|error| StorageError::sqlite("解码重放事件版本", error))?;
+        let result = read_event(row)
+            .map_err(|error| StorageError::sqlite("解码重放事件", error))
+            .and_then(|event| apply(tx, &event));
+        result.map_err(|error| StorageError::rebuild(seq, event_type, schema_version, error))?;
         count = count
             .checked_add(1)
             .ok_or_else(|| StorageError::InvalidEvent("replay count overflow".into()))?;
@@ -346,7 +405,7 @@ mod tests {
                     assert!(
                         matches!(
                             receipt_payload(tx, &json),
-                            Err(StorageError::InvalidEvent(_))
+                            Err(StorageError::InvalidEvent(_) | StorageError::External { .. })
                         ),
                         "{json}"
                     );
@@ -366,15 +425,19 @@ mod tests {
             .readers
             .call(|conn| -> Result<_, StorageError> {
                 // Authentication state tables must join this exclusion list when introduced.
-                let mut statement = conn.prepare(
-                    "SELECT name FROM sqlite_master
+                let mut statement = conn
+                    .prepare(
+                        "SELECT name FROM sqlite_master
                      WHERE type = 'table' AND name NOT GLOB 'sqlite_*'
                        AND name NOT IN ('store_meta', 'processed_commands', 'store_events')
                      ORDER BY name COLLATE BINARY",
-                )?;
-                Ok(statement
-                    .query_map([], |row| row.get(0))?
-                    .collect::<Result<_, _>>()?)
+                    )
+                    .map_err(|error| StorageError::sqlite("准备查询数据库表", error))?;
+                statement
+                    .query_map([], |row| row.get(0))
+                    .map_err(|error| StorageError::sqlite("查询数据库表", error))?
+                    .collect::<Result<_, _>>()
+                    .map_err(|error| StorageError::sqlite("读取数据库表", error))
             })
             .await
             .unwrap();

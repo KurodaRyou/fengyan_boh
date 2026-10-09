@@ -19,8 +19,11 @@ pub fn migrate(conn: &mut Connection) -> Result<(), StorageError> {
 }
 
 pub fn rebuild_projections(conn: &mut Connection) -> Result<u64, StorageError> {
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| StorageError::sqlite("开始写事务", error))?;
     let count = crate::projections::rebuild(&tx)?;
-    tx.commit()?;
+    tx.commit()
+        .map_err(|error| StorageError::sqlite("提交写事务", error))?;
     Ok(count)
 }
