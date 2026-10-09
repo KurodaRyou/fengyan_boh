@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub mod equipment;
+pub mod inventory;
+pub mod lot;
 pub mod master_data;
 pub mod receiving;
 pub mod temperature;

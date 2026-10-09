@@ -136,7 +136,7 @@ pub struct ItemSnapshot {
 
 impl ItemSnapshot {
     pub fn validate(&self) -> Result<(), DomainError> {
-        text(&self.code, "code")?;
+        crate::lot::validate_item_code(&self.code)?;
         item_fields(
             &self.name,
             self.default_shelf_life_ms,

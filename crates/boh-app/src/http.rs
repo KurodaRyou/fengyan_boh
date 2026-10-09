@@ -18,6 +18,8 @@ use crate::{
 };
 use boh_domain::AggregateId;
 use boh_domain::equipment::{CreateEquipment, UpdateEquipment};
+use boh_domain::inventory::{Inventory, InventoryQuery};
+use boh_domain::lot::LotId;
 use boh_domain::master_data::*;
 use boh_domain::receiving::CreateReceipt;
 use boh_domain::temperature::{LogTemperature, TemperatureQuery};
@@ -164,6 +166,8 @@ pub fn router(state: AppState) -> Router {
             get(list_temperature_readings).post(log_temperature),
         )
         .route("/api/v1/receipts", post(create_receipt))
+        .route("/api/v1/inventory", get(list_inventory))
+        .route("/api/v1/lots/{lot_id}", get(lookup_lot))
         .route("/api/v1/items", get(list_items).post(create_item))
         .route("/api/v1/items/{item_id}", put(update_item))
         .route("/api/v1/recipes", get(list_recipes).post(create_recipe))
@@ -275,6 +279,27 @@ async fn list_items(
     Ok(ok(
         serde_json::json!({ "items": master_data::list_items(state).await? }),
     ))
+}
+
+async fn list_inventory(
+    State(state): State<AppState>,
+    _actor: Actor,
+    query: Result<Query<InventoryQuery>, QueryRejection>,
+) -> Result<Json<Envelope<Inventory>>, ApiError> {
+    let Query(query) = query.map_err(|_| ApiError::validation())?;
+    Ok(ok(service::inventory::list(state, query).await?))
+}
+
+async fn lookup_lot(
+    State(state): State<AppState>,
+    _actor: Actor,
+    path: Result<Path<String>, PathRejection>,
+) -> Result<Json<Envelope<Value>>, ApiError> {
+    let Path(lot_id) = path.map_err(|_| ApiError::validation())?;
+    let lot_id = LotId::parse(&lot_id).map_err(|_| ApiError::validation())?;
+    Ok(ok(serde_json::json!({
+        "lot": service::inventory::lookup(state, lot_id).await?
+    })))
 }
 
 async fn create_item(
