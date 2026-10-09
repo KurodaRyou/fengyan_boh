@@ -127,6 +127,7 @@ impl IntoResponse for ApiError {
 }
 
 impl From<StorageError> for ApiError {
+    #[track_caller]
     fn from(err: StorageError) -> Self {
         Self::internal(err)
     }

@@ -82,6 +82,12 @@ fn assert_diagnostic(capture: &Capture, command_id: &str) {
     for field in ["command_type=", "command_id=", "actor_id=", "device_id="] {
         assert!(text.contains(field), "{text}");
     }
+    assert_eq!(
+        text.matches("deterministic equipment insert failure")
+            .count(),
+        1,
+        "{text}"
+    );
     assert!(!text.contains("BUSINESS_PAYLOAD_DO_NOT_LOG"), "{text}");
 }
 
@@ -198,6 +204,12 @@ async fn queue_failure_is_logged_once_on_the_request_side_with_identity() {
     ] {
         assert!(text.contains(fragment), "{text}");
     }
+    let location = text
+        .split_whitespace()
+        .find(|field| field.starts_with("location="))
+        .unwrap();
+    assert!(location.contains("writer.rs:"), "{text}");
+    assert!(!location.contains("http.rs"), "{text}");
 }
 
 #[test]
@@ -205,33 +217,79 @@ fn backup_health_logs_one_full_diagnostic_with_phase_and_number() {
     use boh_domain::UnixMillis;
     use boh_storage::BackupStage;
     use boh_storage::backup::BackupHealth;
+    for (stage, number) in [
+        (Some(BackupStage::DirectorySync), Some(7)),
+        (Some(BackupStage::DirectorySync), None),
+        (None, None),
+    ] {
+        let capture = Capture::default();
+        let dir = tempfile::tempdir().unwrap();
+        let cause = std::fs::File::open(dir.path().join("absent-directory")).unwrap_err();
+        let error = StorageError::io("同步备份目录", cause);
+        let error = match stage {
+            Some(stage) => StorageError::backup(stage, number, error),
+            None => error,
+        };
+        let health = BackupHealth::default();
+        tracing::subscriber::with_default(capture.subscriber(), || {
+            health.record(&Err(error), UnixMillis(123));
+        });
+        let text = capture.text();
+        assert_eq!(
+            text.lines().filter(|line| line.contains("ERROR")).count(),
+            1,
+            "{text}"
+        );
+        for fragment in ["同步备份目录", "caused by", "diagnostic_tests.rs"] {
+            assert!(text.contains(fragment), "missing {fragment}: {text}");
+        }
+        assert_eq!(
+            text.split_whitespace()
+                .find(|field| field.starts_with("backup_stage=")),
+            stage.map(|_| "backup_stage=DirectorySync"),
+            "{text}"
+        );
+        assert_eq!(
+            text.split_whitespace()
+                .find(|field| field.starts_with("backup_number=")),
+            number.map(|_| "backup_number=7"),
+            "{text}"
+        );
+        if stage.is_some() {
+            let number_description = match number {
+                Some(_) => "number 7",
+                None => "number unassigned",
+            };
+            assert!(text.contains(number_description), "{text}");
+        }
+        assert!(!text.contains("Some("), "{text}");
+        assert!(!text.contains("None"), "{text}");
+        assert_eq!(health.snapshot().last_failed_at, Some(UnixMillis(123)));
+    }
+}
+
+#[test]
+fn execute_error_conversion_preserves_the_call_site() {
+    use crate::http::ApiError;
+    use boh_storage::ledger::ExecuteError;
+
     let capture = Capture::default();
-    let dir = tempfile::tempdir().unwrap();
-    let cause = std::fs::File::open(dir.path().join("absent-directory")).unwrap_err();
-    let error = StorageError::backup(
-        BackupStage::DirectorySync,
-        Some(7),
-        StorageError::io("同步备份目录", cause),
-    );
-    let health = BackupHealth::default();
-    tracing::subscriber::with_default(capture.subscriber(), || {
-        health.record(&Err(error), UnixMillis(123));
+    let conversion_line = tracing::subscriber::with_default(capture.subscriber(), || {
+        let conversion_line = line!() + 1;
+        let _: ApiError = ExecuteError::Storage(StorageError::WriterClosed).into();
+        conversion_line
     });
     let text = capture.text();
-    assert_eq!(
-        text.lines().filter(|line| line.contains("ERROR")).count(),
-        1,
+    assert!(
+        text.contains(&format!("location={}:{}:", file!(), conversion_line)),
         "{text}"
     );
-    for fragment in [
-        "DirectorySync",
-        "backup_stage=",
-        "backup_number=7",
-        "同步备份目录",
-        "caused by",
-        "diagnostic_tests.rs",
-    ] {
-        assert!(text.contains(fragment), "missing {fragment}: {text}");
-    }
-    assert_eq!(health.snapshot().last_failed_at, Some(UnixMillis(123)));
+    assert!(
+        !text.contains("location=crates/boh-app/src/http.rs"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("location=crates/boh-app/src/service.rs"),
+        "{text}"
+    );
 }

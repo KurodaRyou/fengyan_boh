@@ -26,6 +26,7 @@ use crate::{
 };
 
 impl From<ExecuteError> for ApiError {
+    #[track_caller]
     fn from(error: ExecuteError) -> Self {
         match error {
             ExecuteError::Storage(error) => error.into(),

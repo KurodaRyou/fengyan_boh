@@ -66,7 +66,7 @@ fn check_code(tx: &Transaction<'_>, table: &str, id_key: &str, code: &str) -> Re
             |r| r.get(0),
         )
         .optional()
-        .map_err(|error| StorageError::sqlite("查询查询结果", error))?;
+        .map_err(|error| StorageError::sqlite("查询主数据编码是否已占用", error))?;
     if let Some(id) = existing {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -646,12 +646,12 @@ fn ids(conn: &Connection, table: &str) -> Result<Vec<AggregateId>, ApiError> {
         .prepare(&format!(
             "SELECT id FROM {table} ORDER BY code COLLATE BINARY"
         ))
-        .map_err(|error| StorageError::sqlite("准备查询数据库", error))?;
+        .map_err(|error| StorageError::sqlite("准备查询主数据 ID 列表", error))?;
     Ok(statement
         .query_map([], |r| row_id(r, 0))
-        .map_err(|error| StorageError::sqlite("查询数据库", error))?
+        .map_err(|error| StorageError::sqlite("查询主数据 ID 列表", error))?
         .collect::<Result<_, _>>()
-        .map_err(|error| StorageError::sqlite("读取数据库", error))?)
+        .map_err(|error| StorageError::sqlite("读取主数据 ID 列表", error))?)
 }
 
 pub async fn list_items(state: AppState) -> Result<Vec<Item>, ApiError> {

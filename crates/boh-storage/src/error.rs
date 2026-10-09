@@ -31,7 +31,7 @@ impl fmt::Display for BackupStage {
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
-    #[error("{operation}: {source}")]
+    #[error("{operation}")]
     Io {
         operation: &'static str,
         #[source]
@@ -39,7 +39,7 @@ pub enum StorageError {
         location: &'static Location<'static>,
     },
 
-    #[error("backup stage {stage} (number {number:?}): {source}")]
+    #[error("backup stage {stage} (number {})", .number.map_or_else(|| "unassigned".to_owned(), |number| number.to_string()))]
     Backup {
         stage: BackupStage,
         number: Option<u64>,
@@ -48,9 +48,7 @@ pub enum StorageError {
         location: &'static Location<'static>,
     },
 
-    #[error(
-        "rebuild event seq={seq} event_type={event_type} schema_version={schema_version}: {source}"
-    )]
+    #[error("rebuild event seq={seq} event_type={event_type} schema_version={schema_version}")]
     Rebuild {
         seq: i64,
         event_type: String,
@@ -60,7 +58,7 @@ pub enum StorageError {
         location: &'static Location<'static>,
     },
 
-    #[error("{operation}: {source}")]
+    #[error("{operation}")]
     External {
         operation: &'static str,
         #[source]
@@ -89,7 +87,7 @@ pub enum StorageError {
     #[error("database belongs to a different store")]
     StoreMismatch,
 
-    #[error("{operation}: {source}")]
+    #[error("{operation}")]
     Sqlite {
         operation: &'static str,
         #[source]
@@ -115,14 +113,14 @@ pub enum StorageError {
     #[error("reader pool invariant violated: {0}")]
     ReaderPoolInvariant(&'static str),
 
-    #[error("启动写线程: {source}")]
+    #[error("启动写线程")]
     Spawn {
         #[source]
         source: std::io::Error,
         location: &'static Location<'static>,
     },
 
-    #[error("{operation}: {source}")]
+    #[error("{operation}")]
     Join {
         operation: &'static str,
         #[source]

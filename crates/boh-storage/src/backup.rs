@@ -40,7 +40,7 @@ impl BackupHealth {
                     StorageError::Backup { stage, number, .. } => (Some(*stage), *number),
                     _ => (None, None),
                 };
-                tracing::error!(error = %Diagnostic(error), backup_stage = ?stage, backup_number = number, "backup failed");
+                tracing::error!(error = %Diagnostic(error), backup_stage = stage.map(tracing::field::debug), backup_number = number, "backup failed");
                 status.last_failed_at = Some(now);
             }
         }
@@ -225,12 +225,12 @@ fn verify(path: &Path, before: i64) -> Result<i64, StorageError> {
     .map_err(|error| StorageError::sqlite("打开备份校验连接", error))?;
     let mut stmt = conn
         .prepare("PRAGMA integrity_check")
-        .map_err(|error| StorageError::sqlite("准备查询数据库", error))?;
+        .map_err(|error| StorageError::sqlite("准备快照完整性检查", error))?;
     let results = stmt
         .query_map([], |r| r.get::<_, String>(0))
-        .map_err(|error| StorageError::sqlite("查询数据库", error))?
+        .map_err(|error| StorageError::sqlite("执行快照完整性检查", error))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| StorageError::sqlite("读取数据库", error))?;
+        .map_err(|error| StorageError::sqlite("读取快照完整性检查结果", error))?;
     if results != ["ok"] {
         return Err(StorageError::Message("snapshot integrity check failed"));
     }

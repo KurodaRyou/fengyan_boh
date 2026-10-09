@@ -36,7 +36,14 @@ async fn sqlite_operations_keep_distinct_context_and_original_cause() {
                 .downcast_ref::<boh_storage::rusqlite::Error>(),
             Some(boh_storage::rusqlite::Error::QueryReturnedNoRows)
         ));
-        assert!(Diagnostic(&error).to_string().contains("caused by"));
+        let diagnostic = Diagnostic(&error).to_string();
+        assert!(diagnostic.contains("caused by"));
+        assert!(diagnostic.contains(operation), "{diagnostic}");
+        assert_eq!(
+            diagnostic.matches("Query returned no rows").count(),
+            1,
+            "{diagnostic}"
+        );
     }
     storage.writer_handle.shutdown().await.unwrap();
 }
