@@ -197,8 +197,8 @@ occurred_at = recorded_at − lag
 |---|---|---|
 | `POST /api/v1/receipts` | `receipt.create` | 已认证员工 |
 
-- 请求体：`command_id`、`supplier_id`、`lines`、`captured_at`、`sent_at`。`lines` 每项 `{item_id, input, manufacturer_lot_no?, produced_on, expires_on, line_cost_cents}`，`input` 为 `{qty, unit_code, base_qty_per_unit}`（见「单位」）。
-- 写命令成功的 `data` 是 `{"receipt": 行}`；行为 `receipt_id`、`supplier_id`、`lines`（与 payload 的 `lines` 相同）、`business_date`、`occurred_at`、`recorded_at`、`actor_id`、`device_id`。
+- 请求体与行见 `boh_domain::receiving` 的 `CreateReceipt`、`Receipt`；`input` 见「单位」。
+- 写命令成功的 `data` 是 `{"receipt": 行}`；行的 `lines` 与 payload 的 `lines` 相同。
 - **取值**：不满足时 `400 VALIDATION_FAILED`，`details` 为 `{}`。
   - `lines` 非空。同一物料可以有多行，各行分别建批次。
   - `input.qty`、`input.base_qty_per_unit` 是正整数；`input.unit_code` 非空、首尾不能有空白字符。`input.qty × input.base_qty_per_unit` 不超出 `i64`。
@@ -210,7 +210,7 @@ occurred_at = recorded_at − lag
   - `occurred_at`、`business_date` 按「时间」的相对校准计算，规则与温度记录相同（`CAPTURE_TOO_OLD`、时间溢出的 `VALIDATION_FAILED`、`CAPTURE_TIME_ADJUSTED` 的 `details` 都是 `{}`）。
   - payload 每行：`qty = input.qty × input.base_qty_per_unit`；`expires_at` 是 `expires_on` 在门店时区（配置 `timezone`）的当日最后一毫秒，即次日当地 0 点的 UTC 毫秒减 1。
     - 理由：`projections::apply` 不读配置，换算结果必须写进 payload。
-  - payload 行的键顺序：`item_id`、`qty`、`input`、`lot_id`、`manufacturer_lot_no`、`produced_on`、`expires_on`、`expires_at`、`line_cost_cents`（被吸收的行在 `lot_id` 的位置写 `absorbed_by_event_id`）；`input` 的键顺序 `qty`、`unit_code`、`base_qty_per_unit`。
+  - 被吸收的行在 `lot_id` 的位置写 `absorbed_by_event_id`（随盘点切片加入）。
 - **业务校验**（幂等检查之后）：同时命中多个业务错误时，返回哪一个不作规定；都不写事件或 `processed_commands`。
   - 供应商、物料不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": "SUPPLIER" / "ITEM", "id"}`。停用的照常受理。
   - `unit_code` 既不是物料的 `base_unit` 也不在 `units` 中：`400 UNKNOWN_UNIT`，`details` 为 `{"line", "item_id", "unit_code"}`。
@@ -294,7 +294,7 @@ occurred_at = recorded_at − lag
 
 | event_type | aggregate_type | payload 要点 | 投影影响 |
 |---|---|---|---|
-| `GOODS_RECEIVED` | `RECEIPT` | `supplier_id`, `lines[{item_id, qty, input, lot_id \| absorbed_by_event_id, manufacturer_lot_no?, produced_on, expires_on, expires_at, line_cost_cents}]` | 每行新建一个批次；被吸收时不建 |
+| `GOODS_RECEIVED` | `RECEIPT` | `boh_domain::receiving::GoodsReceived`；样本 `crates/boh-app/tests/golden/GOODS_RECEIVED@1/`；被吸收的行以 `absorbed_by_event_id` 代替 `lot_id`（随盘点切片加入） | 每行新建一个批次；被吸收时不建 |
 | `PRODUCTION_BATCH_COMPLETED` | `PRODUCTION_BATCH` | `recipe_id`, `recipe_version`, `batch_count`, `started_at?`, `output{item_id, planned_qty, qty, lot_id \| absorbed_by_event_id, expires_at?}`, `consumed[{item_id, planned_qty, qty, alloc \| absorbed_by_event_id}]` | 原料按分配扣减（或被吸收）；成品新建批次 |
 | `WASTE_LOGGED` | `WASTE_RECORD` | `lines[{item_id, qty, input, reason_code, alloc \| absorbed_by_event_id}]` | 按分配扣减（或被吸收） |
 | `STOCK_COUNT_SUBMITTED` | `STOCK_COUNT` | `purpose`（`CLOSING` / `AUDIT`）, `lines[{item_id, lot_id?, counted_qty}]` | 无 |
