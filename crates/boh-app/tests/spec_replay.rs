@@ -964,3 +964,515 @@ async fn rebuild_refuses_goods_received_v1() {
     assert_eq!(projections(&db_path).unwrap(), online);
     assert_eq!(ledger(&db_path).unwrap(), ledger_before);
 }
+
+/// 报损请求的一行：`qty` 克，原因 EXPIRED，不指定批次；`lot_id`、`confirm` 由调用方给出。
+fn waste_line(item_id: &str, qty: i64, lot_id: Option<&str>, confirm: bool) -> Value {
+    let mut line = json!({
+        "item_id": item_id,
+        "input": { "qty": qty, "unit_code": "g", "base_qty_per_unit": 1 },
+        "reason_code": "EXPIRED",
+    });
+    if let Some(lot_id) = lot_id {
+        line["lot_id"] = json!(lot_id);
+    }
+    if confirm {
+        line["confirm_shortage"] = json!(true);
+    }
+    line
+}
+
+/// 报损：平板在 `SENT` 录入、在 `sent_at` 发送。返回完整响应。
+#[allow(clippy::unwrap_used)] // 测试夹具：响应体不是 JSON 已违反信封约定，直接终止测试。
+async fn waste(
+    router: &axum::Router,
+    command_id: &str,
+    lines: Vec<Value>,
+    sent_at: i64,
+) -> spec_support::JsonReply {
+    let body = json!({
+        "command_id": command_id, "lines": lines, "captured_at": SENT, "sent_at": sent_at,
+    });
+    let reply = spec_support::post(router, "/api/v1/waste-records", Some(&STAFF), &body)
+        .await
+        .unwrap();
+    assert_success(&reply);
+    reply
+}
+
+/// 物料（RAW，基本单位 g）与报损原因 EXPIRED；返回物料 ID。
+#[allow(clippy::unwrap_used)] // 测试夹具：写入前置状态的请求失败时，后续步骤没有意义，直接终止测试。
+async fn item_and_reason(
+    router: &axum::Router,
+    item_cmd: u16,
+    reason_cmd: u16,
+    code: &str,
+) -> String {
+    let item = write(
+        router,
+        "POST",
+        "/api/v1/items",
+        json!({
+            "command_id": cmd(item_cmd), "code": code, "name": code, "base_unit": "g",
+            "category": "RAW", "units": [], "active": true,
+        }),
+    )
+    .await["item"]["item_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    write(
+        router,
+        "POST",
+        "/api/v1/waste-reasons",
+        json!({ "command_id": cmd(reason_cmd), "code": "EXPIRED", "name": "过期", "active": true }),
+    )
+    .await;
+    item
+}
+
+#[allow(clippy::unwrap_used)] // 同上。
+async fn supplier(router: &axum::Router, n: u16) -> String {
+    write(
+        router,
+        "POST",
+        "/api/v1/suppliers",
+        json!({ "command_id": cmd(n), "code": "S1", "name": "S1", "active": true }),
+    )
+    .await["supplier"]["supplier_id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// 全部批次的 (lot_id, remaining_qty)，按批次号排列。
+fn lot_balances(db_path: &Path) -> Result<Vec<(String, i64)>, Box<dyn Error>> {
+    let reader = spec_support::reader(db_path)?;
+    let mut statement =
+        reader.prepare("SELECT lot_id, remaining_qty FROM inventory_lots ORDER BY lot_id")?;
+    let rows = statement
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
+// 报损的账本（不指定批次的 FIFO、指定批次使批次变负、账外缺口新建与累加、两个物料、一个命令多行）：在线写入后篡改库存投影
+// （删账外缺口、改批次余量、删流水），重建后全部投影与在线写入逐行一致，账本、processed_commands 和 store_meta 不变；
+// 重建可重复执行。
+// 重建不影响幂等回执：之后用原 command_id、原内容（含确认标记，sent_at 不同）重发，原样返回首次响应，不新增事件。
+// 重建后的投影能继续支撑新的写命令：面粉 A −2、B 10，净账面 8，报 8 g 不需要确认，FIFO 跳过 A，分配 B 8。
+#[tokio::test]
+async fn rebuild_restores_waste_projections() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("boh.db");
+    let clock = ManualClock::new(NOW);
+    let router = spec_support::router(&db_path, clock.clock()).unwrap();
+    let flour = item_and_reason(&router, 1, 4, "FLOUR").await;
+    let sugar = write(
+        &router,
+        "POST",
+        "/api/v1/items",
+        json!({
+            "command_id": cmd(2), "code": "SUGAR", "name": "糖", "base_unit": "g",
+            "category": "RAW", "units": [], "active": true,
+        }),
+    )
+    .await["item"]["item_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let supplier = supplier(&router, 3).await;
+    let receipt = receive(
+        &router,
+        &cmd(5),
+        &supplier,
+        vec![
+            receipt_line(&flour, 5, "g", 1, "2026-10-20"),
+            receipt_line(&flour, 10, "g", 1, "2026-10-20"),
+            receipt_line(&sugar, 4, "g", 1, "2026-10-20"),
+        ],
+        0,
+        SENT,
+    )
+    .await;
+    let lot = |i: usize| {
+        receipt.body["data"]["receipt"]["lines"][i]["lot_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let (a, b, s) = (lot(0), lot(1), lot(2));
+    waste(
+        &router,
+        &cmd(6),
+        vec![waste_line(&flour, 3, None, false)],
+        SENT,
+    )
+    .await;
+    let lines = vec![
+        waste_line(&flour, 4, Some(&a), true),
+        waste_line(&sugar, 6, None, true),
+    ];
+    let second = waste(&router, &cmd(7), lines.clone(), SENT).await;
+    waste(
+        &router,
+        &cmd(8),
+        vec![waste_line(&sugar, 1, None, true)],
+        SENT,
+    )
+    .await;
+    assert_eq!(
+        lot_balances(&db_path).unwrap(),
+        [(a.clone(), -2), (b.clone(), 10), (s.clone(), 0)]
+    );
+
+    let online = projections(&db_path).unwrap();
+    assert!(
+        online
+            .iter()
+            .any(|(name, content)| name == "inventory_unallocated" && content.len() == 1),
+        "{online:?}"
+    );
+    let ledger_before = ledger(&db_path).unwrap();
+
+    let mut writer = spec_support::writer(&db_path).unwrap();
+    writer
+        .execute_batch(&format!(
+            "DELETE FROM inventory_unallocated;
+             UPDATE inventory_lots SET remaining_qty = 99 WHERE lot_id = '{b}';
+             DELETE FROM inventory_movements WHERE event_seq = 7 AND movement_no = 1;"
+        ))
+        .unwrap();
+    assert_ne!(projections(&db_path).unwrap(), online);
+
+    for _ in 0..2 {
+        assert_eq!(spec_support::rebuild_projections(&mut writer).unwrap(), 8);
+        assert_eq!(projections(&db_path).unwrap(), online);
+        assert_eq!(ledger(&db_path).unwrap(), ledger_before);
+    }
+    drop(writer);
+
+    let router = spec_support::router(&db_path, clock.clock()).unwrap();
+    let retry = waste(&router, &cmd(7), lines, SENT + 3_600_000).await;
+    assert_eq!(retry.body, second.body);
+    assert_eq!(ledger(&db_path).unwrap(), ledger_before);
+    let reply = waste(
+        &router,
+        &cmd(9),
+        vec![waste_line(&flour, 8, None, false)],
+        SENT,
+    )
+    .await;
+    let line = &reply.body["data"]["waste_record"]["lines"][0];
+    assert_eq!(line["item_book_qty"], json!(8));
+    assert_eq!(
+        line["alloc"],
+        json!([{ "lot_id": b, "qty": 8, "source": "FIFO" }])
+    );
+    assert_eq!(reply.body["warnings"], json!([]));
+}
+
+// 验收用例「批次号重建」：同次收货 A（…-001）5 g、B（…-002）10 g，尚未扣减时清空投影、按 seq 重建，投影与重建前逐行一致；
+// 之后报损面粉 8 g（不指定批次）按重建出的批次号分配 A 5 FIFO + B 3 FIFO，余量 A 0、B 7。
+#[tokio::test]
+async fn rebuilt_lots_keep_their_fifo_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("boh.db");
+    let clock = ManualClock::new(NOW);
+    let router = spec_support::router(&db_path, clock.clock()).unwrap();
+    let flour = item_and_reason(&router, 1, 2, "FLOUR").await;
+    let supplier = supplier(&router, 3).await;
+    receive(
+        &router,
+        &cmd(4),
+        &supplier,
+        vec![
+            receipt_line(&flour, 5, "g", 1, "2026-10-20"),
+            receipt_line(&flour, 10, "g", 1, "2026-10-20"),
+        ],
+        0,
+        SENT,
+    )
+    .await;
+    drop(router);
+    let online = projections(&db_path).unwrap();
+
+    let mut writer = spec_support::writer(&db_path).unwrap();
+    writer
+        .execute_batch("DELETE FROM inventory_movements; DELETE FROM inventory_lots;")
+        .unwrap();
+    assert_eq!(spec_support::rebuild_projections(&mut writer).unwrap(), 4);
+    assert_eq!(projections(&db_path).unwrap(), online);
+    drop(writer);
+
+    let router = spec_support::router(&db_path, clock.clock()).unwrap();
+    let reply = waste(
+        &router,
+        &cmd(5),
+        vec![waste_line(&flour, 8, None, false)],
+        SENT,
+    )
+    .await;
+    assert_eq!(
+        reply.body["data"]["waste_record"]["lines"][0]["alloc"],
+        json!([
+            { "lot_id": "RAW-FLOUR-20261006-001", "qty": 5, "source": "FIFO" },
+            { "lot_id": "RAW-FLOUR-20261006-002", "qty": 3, "source": "FIFO" },
+        ])
+    );
+    assert_eq!(
+        lot_balances(&db_path).unwrap(),
+        [
+            ("RAW-FLOUR-20261006-001".to_owned(), 0),
+            ("RAW-FLOUR-20261006-002".to_owned(), 7),
+        ]
+    );
+}
+
+/// 报损 golden 样本中的物料 ID 与吸收它的事件 ID：写入账本前换成本库的实际 ID。
+const GOLDEN_WASTE_ITEM_ID: &str = "01890a5d-ac96-774b-bcce-b302099a8501";
+const GOLDEN_ABSORBER_ID: &str = "01890a5d-ac96-774b-bcce-b302099a8701";
+
+/// 建一个账本：面粉、供应商、报损原因 EXPIRED，一次收货面粉 25000 g（…-001）、3000 g（…-002），共 4 个事件。
+/// 返回 (物料 ID, 收货事件 ID)；收货事件作为被吸收行的 absorbed_by_event_id（吸收它的盘点事件本期还不能写入）。
+#[allow(clippy::unwrap_used)] // 测试夹具：写入前置状态失败时，后续步骤没有意义，直接终止测试。
+async fn waste_ledger(db_path: &Path) -> (String, String) {
+    let router = spec_support::router(db_path, ManualClock::new(NOW).clock()).unwrap();
+    let flour = item_and_reason(&router, 1, 2, "FLOUR").await;
+    let supplier = supplier(&router, 3).await;
+    receive(
+        &router,
+        &cmd(4),
+        &supplier,
+        vec![
+            receipt_line(&flour, 25000, "g", 1, "2026-10-20"),
+            receipt_line(&flour, 3000, "g", 1, "2026-10-20"),
+        ],
+        0,
+        SENT,
+    )
+    .await;
+    drop(router);
+    let reader = spec_support::reader(db_path).unwrap();
+    let receipt_id: String = reader
+        .query_row("SELECT id FROM store_events WHERE seq = 4", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    (flour, receipt_id)
+}
+
+/// 经 open_writer 直接写入一条 WASTE_LOGGED@1（本期没有写入口的结构分支）及其 processed_commands 行，不写 seq 列。
+#[allow(clippy::unwrap_used)] // 测试夹具：写入失败时，后续步骤没有意义，直接终止测试。
+fn insert_waste(writer: &mut Connection, n: u8, payload: &str) {
+    let command_id = cmd(0x90 + u16::from(n));
+    let tx = writer.transaction().unwrap();
+    tx.execute(
+        "INSERT INTO processed_commands (command_id, command_type, request, response, recorded_at)
+         VALUES (?1, 'waste.log', '{}', '{}', ?2)",
+        rusqlite::params![command_id, NOW.0],
+    )
+    .unwrap();
+    tx.execute(
+        "INSERT INTO store_events (id, event_type, schema_version, aggregate_type, aggregate_id,
+             aggregate_version, command_id, actor_id, device_id, business_date, occurred_at,
+             recorded_at, payload)
+         VALUES (?1, 'WASTE_LOGGED', 1, 'WASTE_RECORD', ?2, 1, ?3, ?4, ?5, '2026-10-06', ?6, ?6, ?7)",
+        rusqlite::params![
+            format!("01890a5d-ac96-774b-bcce-b30209a9f1{n:02x}"),
+            format!("01890a5d-ac96-774b-bcce-b30209a9f2{n:02x}"),
+            command_id,
+            STAFF.employee_id,
+            STAFF.device_id,
+            NOW.0,
+            payload
+        ],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+}
+
+/// 报损流水：(event_seq, movement_no, item_id, lot_id, alloc_source, nominal_qty, qty_delta, absorbed_by_event_id,
+/// physical_at, business_date)。
+type WasteMovement = (
+    i64,
+    i64,
+    String,
+    Option<String>,
+    String,
+    i64,
+    i64,
+    Option<String>,
+    i64,
+    String,
+);
+
+fn waste_movements(db_path: &Path) -> Result<Vec<WasteMovement>, Box<dyn Error>> {
+    let reader = spec_support::reader(db_path)?;
+    let mut statement = reader.prepare(
+        "SELECT event_seq, movement_no, item_id, lot_id, alloc_source, nominal_qty, qty_delta,
+                absorbed_by_event_id, physical_at, business_date
+         FROM inventory_movements WHERE kind = 'WASTE' ORDER BY event_seq, movement_no",
+    )?;
+    let rows = statement
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
+// domain「报损接口」投影与「盘点吸收」：被吸收的报损行（golden 样本 ABSORBED、ABSORBED_SPECIFIED_LOT；吸收判定随盘点切片实现，
+// 本期没有写入口，经 open_writer 直接写入账本）照常重建：每个被吸收的行一条流水，kind WASTE、alloc_source ABSORBED、
+// lot_id 为 NULL（指定了批次的行也一样）、nominal_qty = −qty、qty_delta = 0、absorbed_by_event_id 取自 payload，
+// 不查其他事件；不改动批次余量，不产生账外缺口。
+// 同一事件中被吸收的行和正常分配的行可以并存：流水按行序、alloc 顺序从 0 连续编号。重建可重复执行。
+#[tokio::test]
+async fn absorbed_waste_lines_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("boh.db");
+    let (flour, absorber) = waste_ledger(&db_path).await;
+    let golden = |text: &str| {
+        text.trim_end()
+            .replace(GOLDEN_WASTE_ITEM_ID, &flour)
+            .replace(GOLDEN_ABSORBER_ID, &absorber)
+    };
+    let mixed = format!(
+        r#"{{"lines":[{{"item_id":"{flour}","qty":1000,"input":{{"qty":1000,"unit_code":"g","base_qty_per_unit":1}},"reason_code":"EXPIRED","item_book_qty":28000,"absorbed_by_event_id":"{absorber}"}},{{"item_id":"{flour}","qty":500,"input":{{"qty":500,"unit_code":"g","base_qty_per_unit":1}},"reason_code":"EXPIRED","item_book_qty":28000,"alloc":[{{"lot_id":"RAW-FLOUR-20261006-001","qty":500,"source":"FIFO"}}]}}]}}"#
+    );
+    let mut writer = spec_support::writer(&db_path).unwrap();
+    insert_waste(
+        &mut writer,
+        1,
+        &golden(include_str!("golden/WASTE_LOGGED@1/ABSORBED.json")),
+    );
+    insert_waste(
+        &mut writer,
+        2,
+        &golden(include_str!(
+            "golden/WASTE_LOGGED@1/ABSORBED_SPECIFIED_LOT.json"
+        )),
+    );
+    insert_waste(&mut writer, 3, &mixed);
+    let ledger_before = ledger(&db_path).unwrap();
+
+    for _ in 0..2 {
+        assert_eq!(spec_support::rebuild_projections(&mut writer).unwrap(), 7);
+        let absorbed = |seq: i64, no: i64, qty: i64| -> WasteMovement {
+            (
+                seq,
+                no,
+                flour.clone(),
+                None,
+                "ABSORBED".into(),
+                -qty,
+                0,
+                Some(absorber.clone()),
+                NOW.0,
+                "2026-10-06".into(),
+            )
+        };
+        assert_eq!(
+            waste_movements(&db_path).unwrap(),
+            [
+                absorbed(5, 0, 2000),
+                absorbed(6, 0, 4000),
+                absorbed(7, 0, 1000),
+                (
+                    7,
+                    1,
+                    flour.clone(),
+                    Some("RAW-FLOUR-20261006-001".into()),
+                    "FIFO".into(),
+                    -500,
+                    -500,
+                    None,
+                    NOW.0,
+                    "2026-10-06".into(),
+                ),
+            ]
+        );
+        assert_eq!(
+            lot_balances(&db_path).unwrap(),
+            [
+                ("RAW-FLOUR-20261006-001".to_owned(), 24500),
+                ("RAW-FLOUR-20261006-002".to_owned(), 3000),
+            ]
+        );
+        let unallocated = spec_support::count(&writer, "inventory_unallocated").unwrap();
+        assert_eq!(unallocated, 0);
+        assert_eq!(ledger(&db_path).unwrap(), ledger_before);
+    }
+}
+
+// docs/domain.md「事件目录」WASTE_LOGGED 的行结构：alloc 与 absorbed_by_event_id 恰有一个出现；lot_book_qty 与 lot_id
+// 同时出现。每组用两个账本对照：只差这一处结构的合法报损照常重建（说明事件类型已被识别、引用都在），违反结构的报损
+// （由测试经 open_writer 直接写入）重建返回错误，全部投影保持重建前的状态，账本不变。
+#[tokio::test]
+async fn rebuild_refuses_malformed_waste_lines() {
+    let fifo = r#","alloc":[{"lot_id":"RAW-FLOUR-20261006-001","qty":1,"source":"FIFO"}]"#;
+    let specified =
+        r#","alloc":[{"lot_id":"RAW-FLOUR-20261006-001","qty":1,"source":"SPECIFIED"}]"#;
+    let absorbed = r#","absorbed_by_event_id":"ABSORBER""#;
+    let lot_id = r#","lot_id":"RAW-FLOUR-20261006-001""#;
+    let lot_book = r#","lot_book_qty":25000"#;
+    // (名称, 违反结构的 (lot 字段, lot_book_qty 字段, 结尾), 合法对照的 (lot 字段, lot_book_qty 字段, 结尾))
+    let both = format!("{fifo}{absorbed}");
+    let cases = [
+        (
+            "both alloc and absorbed",
+            ("", "", both.as_str()),
+            ("", "", fifo),
+        ),
+        (
+            "neither alloc nor absorbed",
+            ("", "", ""),
+            ("", "", absorbed),
+        ),
+        (
+            "lot_book_qty without lot_id",
+            ("", lot_book, fifo),
+            ("", "", fifo),
+        ),
+        (
+            "lot_id without lot_book_qty",
+            (lot_id, "", specified),
+            (lot_id, lot_book, specified),
+        ),
+    ];
+    for (name, malformed, valid) in cases {
+        for ((lot, book, tail), ok) in [(valid, true), (malformed, false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("boh.db");
+            let (flour, absorber) = waste_ledger(&db_path).await;
+            let payload = format!(
+                r#"{{"lines":[{{"item_id":"{flour}"{lot},"qty":1,"input":{{"qty":1,"unit_code":"g","base_qty_per_unit":1}},"reason_code":"EXPIRED","item_book_qty":28000{book}{tail}}}]}}"#
+            )
+            .replace("ABSORBER", &absorber);
+            let mut writer = spec_support::writer(&db_path).unwrap();
+            insert_waste(&mut writer, 1, &payload);
+            let online = projections(&db_path).unwrap();
+            let ledger_before = ledger(&db_path).unwrap();
+
+            let result = spec_support::rebuild_projections(&mut writer);
+
+            if ok {
+                assert_eq!(result.unwrap(), 5, "{name} (valid): {payload}");
+            } else {
+                assert!(result.is_err(), "{name}: {payload}");
+                assert_eq!(projections(&db_path).unwrap(), online, "{name}");
+            }
+            assert_eq!(ledger(&db_path).unwrap(), ledger_before, "{name}");
+        }
+    }
+}

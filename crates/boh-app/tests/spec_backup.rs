@@ -530,6 +530,12 @@ async fn failed_backup_keeps_existing_files_and_is_reported_until_a_later_succes
     create_equipment(&node.router, &cmd(1), "F1").await;
     fixture.clock.set(local(13, 0));
     fixture.wait_numbers(&[1]).await;
+    // 文件出现时结果可能还没交给 /health；先等第一次的结果，否则它会在时钟拨到 14:00 后才记录，
+    // 记成 14:00，与第二次分不开（backup.md「流程」第 4 步：成功取完成时的 now()）。
+    wait_for_health(&node.router, "first backup", |d| {
+        ms(&d["last_backup_ok_at"]) == Some(local(13, 0).0)
+    })
+    .await;
     fixture.clock.set(local(14, 0));
     fixture.wait_numbers(&[1, 2]).await;
     wait_for_health(&node.router, "second backup", |d| {

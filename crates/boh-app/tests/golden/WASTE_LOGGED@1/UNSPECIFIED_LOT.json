@@ -1,0 +1,1 @@
+{"lines":[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8501","qty":5000,"input":{"qty":5000,"unit_code":"g","base_qty_per_unit":1},"reason_code":"EXPIRED","item_book_qty":3000,"alloc":[{"lot_id":"RAW-FLOUR-20261006-002","qty":3000,"source":"FIFO"},{"qty":2000,"source":"SHORTFALL"}]}]}

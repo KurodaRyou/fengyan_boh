@@ -14,6 +14,7 @@ pub mod master_data;
 pub mod receiving;
 pub mod temperature;
 pub mod time;
+pub mod waste;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DomainError {
@@ -119,6 +120,13 @@ uuid_v7_id!(
     /// 聚合 ID（`store_events.aggregate_id`）。
     AggregateId
 );
+
+// Missing keys use default(None); a present key must contain T, never null.
+pub(crate) fn present<'de, T: Deserialize<'de>, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(deserializer).map(Some)
+}
 
 #[cfg(test)]
 mod tests {

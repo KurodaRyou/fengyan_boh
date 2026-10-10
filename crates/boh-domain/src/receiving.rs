@@ -1,14 +1,14 @@
 //! Receipt commands and the frozen GOODS_RECEIVED@2 payload.
 
 use jiff::civil::{Date, date as civil_date};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
 use crate::lot::LotId;
 use crate::{AggregateId, CommandId, DomainError, UnixMillis};
 
 const LAST_EXPIRES_ON: Date = civil_date(9998, 12, 31);
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReceiptInput {
     pub qty: i64,
@@ -41,7 +41,7 @@ pub struct ReceiptLine {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "present_lot_no"
+        deserialize_with = "crate::present"
     )]
     pub manufacturer_lot_no: Option<String>,
     pub produced_on: String,
@@ -83,8 +83,8 @@ impl CreateReceipt {
     }
 }
 
-// Field order is part of the published serialized payload. Absorption is added
-// with the stocktake slice; current receipts always create a lot.
+// Field order is part of the published serialized payload. Receipt lines create
+// new lots and are never absorbed by stocktakes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReceivedLine {
@@ -95,7 +95,7 @@ pub struct ReceivedLine {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "present_lot_no"
+        deserialize_with = "crate::present"
     )]
     pub manufacturer_lot_no: Option<String>,
     pub produced_on: String,
@@ -142,11 +142,6 @@ pub struct Receipt {
     pub recorded_at: UnixMillis,
     pub actor_id: AggregateId,
     pub device_id: AggregateId,
-}
-
-// A missing key defaults to None. A present key must contain a string, never null.
-fn present_lot_no<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
-    String::deserialize(deserializer).map(Some)
 }
 
 fn date(value: &str, field: &'static str) -> Result<Date, DomainError> {

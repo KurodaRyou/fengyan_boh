@@ -4,13 +4,12 @@ use std::collections::BTreeMap;
 
 use axum::http::StatusCode;
 use boh_domain::lot::LotId;
-use boh_domain::master_data::ItemCategory;
-use boh_domain::receiving::{CreateReceipt, GoodsReceived, Receipt, ReceiptLine, ReceivedLine};
+use boh_domain::receiving::{CreateReceipt, GoodsReceived, Receipt, ReceivedLine};
 use boh_domain::time::{CaptureTimes, business_date, calibrate, end_of_local_date, local_date};
 use boh_domain::{AggregateId, EventId, UnixMillis};
 use boh_storage::StorageError;
 use boh_storage::ledger::{self, Command, Event};
-use boh_storage::rusqlite::{OptionalExtension, Transaction, params};
+use boh_storage::rusqlite::params;
 use serde_json::{Value, json};
 
 use super::missing_reference;
@@ -24,7 +23,7 @@ pub async fn create(
     actor: Actor,
     command: CreateReceipt,
 ) -> Result<Value, ApiError> {
-    let request = super::normalized(&command, None)?;
+    let request = super::normalized(&command, None, "规范化收货命令")?;
     let writer = state.writer.clone();
     let response = writer
         .call(move |tx| {
@@ -80,7 +79,7 @@ pub async fn create(
                     let mut last_serials: BTreeMap<AggregateId, i64> = BTreeMap::new();
                     let mut lines = Vec::with_capacity(command.lines.len());
                     for (index, line) in command.lines.into_iter().enumerate() {
-                        let (code, category) = validate_item(tx, index, &line)?;
+                        let (code, category) = super::item_units::validate_item(tx, index, line.item_id, &line.input)?;
                         // Both strings are canonical YYYY-MM-DD dates, so their
                         // ordering equals calendar ordering, including year 0000.
                         let reason = if line.produced_on > calendar_date {
@@ -222,52 +221,4 @@ pub async fn create(
         })
         .await?;
     super::parse_response(&response)
-}
-
-fn validate_item(
-    tx: &Transaction<'_>,
-    index: usize,
-    line: &ReceiptLine,
-) -> Result<(String, ItemCategory), ApiError> {
-    let current: Option<(String, Option<i64>, String, String)> = tx
-        .query_row(
-            "SELECT items.base_unit, item_units.base_qty_per_unit, items.code, items.category FROM items
-             LEFT JOIN item_units ON item_units.item_id = items.id AND item_units.unit_code = ?2
-             WHERE items.id = ?1",
-            params![line.item_id.to_string(), line.input.unit_code],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .optional()
-        .map_err(|error| StorageError::sqlite("查询物料", error))?;
-    let (base_unit, factor, code, category) =
-        current.ok_or_else(|| missing_reference("ITEM", line.item_id))?;
-    let factor = if line.input.unit_code == base_unit {
-        1
-    } else {
-        factor.ok_or_else(|| {
-            ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "UNKNOWN_UNIT",
-                "unit is not configured",
-            )
-            .with_details(json!({
-                "line": index, "item_id": line.item_id, "unit_code": line.input.unit_code
-            }))
-        })?
-    };
-    if factor != line.input.base_qty_per_unit {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "UNIT_CONVERSION_CHANGED",
-            "unit conversion changed",
-        )
-        .with_details(json!({
-            "line": index, "item_id": line.item_id, "unit_code": line.input.unit_code,
-            "base_qty_per_unit": factor
-        })));
-    }
-    Ok((
-        code,
-        ItemCategory::parse(&category).map_err(StorageError::from)?,
-    ))
 }

@@ -229,17 +229,94 @@ occurred_at = recorded_at − lag
   - 账本中有 `@1` 收货时，迁移 007 报错并拒绝执行（节点不能启动）；重建投影遇到 `@1` 收货也报错。
   - 门店节点从空库 `init` 开始，不会有 `@1` 收货；只影响开发库，开发库需要重新初始化。
 
+### 报损接口
+
+| 方法与路径 | `command_type` | 权限 |
+|---|---|---|
+| `POST /api/v1/waste-records/precheck` | —（只读，不是写命令） | 已认证员工 |
+| `POST /api/v1/waste-records` | `waste.log` | 已认证员工 |
+
+报损先预检；账面不足的行由员工确认实际报损数量后，再正式提交。系统不自动确认，也不自动重提。
+
+**正式提交**：
+
+- 请求体：`command_id`、`lines`、`captured_at`、`sent_at`。`lines` 每项 `{item_id, lot_id?, input, reason_code, confirm_shortage?}`：`lot_id` 是员工指定的批次，`input` 见「单位」，`reason_code` 是 `WASTE_REASON` 的 `code`，`confirm_shortage` 见下方「不足确认」。
+- 写命令成功的 `data` 是 `{"waste_record": 行}`；行为 `waste_record_id`、`lines`（与 payload 的 `lines` 相同）、`business_date`、`occurred_at`、`recorded_at`、`actor_id`、`device_id`。
+- **取值**：不满足时 `400 VALIDATION_FAILED`，`details` 为 `{}`。
+  - `lines` 非空。同一物料、同一批次都可以出现在多行（例如不同原因）。
+  - `input` 的规则同收货：`input.qty`、`input.base_qty_per_unit` 是正整数；`input.unit_code` 非空、首尾不能有空白字符；`input.qty × input.base_qty_per_unit` 不超出 `i64`。
+  - `reason_code` 非空、首尾不能有空白字符。
+  - `lot_id` 可以省略；出现时符合批次号格式（同「批次查询」），不接受 `null`。
+  - `confirm_shortage` 可以省略；出现时是布尔值，不接受 `null`。省略与 `false` 等价，两者的规范化请求相同；`true` 保留在规范化请求中，参与幂等比对。
+  - 请求体不接受 `occurred_at`（补录入口见「时间」）。
+- **新建**：服务端生成 UUIDv7 作为报损 ID（聚合 ID），写一条 `aggregate_version = 1` 的 `WASTE_LOGGED`。
+  - `occurred_at`、`business_date` 按「时间」的相对校准计算，规则与温度记录相同（`CAPTURE_TOO_OLD`、时间溢出的 `VALIDATION_FAILED`、`CAPTURE_TIME_ADJUSTED` 的 `details` 都是 `{}`）。
+  - payload 每行：`qty = input.qty × input.base_qty_per_unit`；`lot_id` 取请求中指定的批次，未指定时省略；`item_book_qty`、`lot_book_qty` 和 `alloc` 按下方「逐行处理」得出。
+  - payload 行的键顺序：`item_id`、`lot_id`、`qty`、`input`、`reason_code`、`item_book_qty`、`lot_book_qty`、`alloc`（被吸收的行在 `alloc` 的位置写 `absorbed_by_event_id`）；`input` 的键顺序同收货；`alloc` 每项的键顺序 `lot_id`、`qty`、`source`。
+  - `confirm_shortage` 不写进 payload。
+    理由：账面值记录当时是否不足，确认标记记录员工的选择，两者含义不同；后者保存在规范化请求中。
+- **业务校验**（幂等检查之后）：同时命中多个业务错误时，返回哪一个不作规定；都不写事件或 `processed_commands`。不足确认在其余业务校验都通过之后判定。
+  - 物料不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": "ITEM", "id"}`。指定的批次不存在：`details` 为 `{"entity": "LOT", "id"}`。
+  - 报损原因不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": "WASTE_REASON", "code"}`。
+  - 停用的物料、报损原因照常受理；指定余量为 0 或为负的批次照常受理（按下方规则需要确认）。
+  - 指定的批次属于其他物料：`400 LOT_ITEM_MISMATCH`，`details` 为 `{"line", "item_id", "lot_id"}`。
+  - 物料还没有任何批次（从未收货入库）：`409 ITEM_HAS_NO_LOTS`，`details` 为 `{"line", "item_id"}`。带确认标记也拒绝：确认只处理数量不足，不授予报损资格。
+    - 依据是 `inventory_lots` 中有没有该物料的批次，不是 `inventory_on_hand` 的行（视图对每个物料都有一行）。批次由收货建立（生产产出随生产切片加入），余量为 0 后也保留，所以曾经入库、现已耗尽的物料照常按下方规则处理。
+  - 数量越界：逐行处理中的物料净账面（含最后一行扣减之后的）、批次余量或账外缺口超出 `i64`，即使各批次余量和账外缺口本身都可表示：`400 VALIDATION_FAILED`，`details` 为 `{}`。整条命令不入账，前面的正常行也不入账；不得绕回、截断或钳制后继续。
+  - `UNKNOWN_UNIT`、`UNIT_CONVERSION_CHANGED`：同收货。
+  - `line` 是行在 `lines` 中的下标。
+- **逐行处理**：按 `lines` 顺序，每行看到的账面是同一命令中前面各行处理之后的值。
+  1. **吸收**：按「盘点吸收」判定（随盘点切片实现；在此之前每行都不被吸收）。被吸收的行写 `absorbed_by_event_id`，不需要确认，带了确认标记也忽略，不改变后续各行看到的账面。
+  2. **账面**：`item_book_qty` 是该行之前的物料净账面（该物料全部批次余量之和，含负数，加账外缺口，即视图 `inventory_on_hand` 的值）。指定批次的行另记 `lot_book_qty`，即该行之前该批次的余量。被吸收的行同样记录。
+  3. **是否需要确认**（未被吸收的行）：
+
+     | 行 | 需要确认的条件 |
+     |---|---|
+     | 指定批次 | `qty > lot_book_qty`（批次余量为 0 或为负也算）或 `qty > item_book_qty` |
+     | 不指定批次 | `qty > item_book_qty` |
+
+     报损量等于账面时不需要确认。
+  4. **分配**（未被吸收的行）：
+     - 指定批次：整行扣在该批次上，`alloc` 恰好一项 `{lot_id, qty, "SPECIFIED"}`，不转去扣其他批次，该批次余量可以为负。
+     - 不指定批次：按「批次」的 FIFO 顺序，在该物料余量大于 0 的批次中逐个扣到 0 或扣完为止，每个批次一项，记 `FIFO`；仍有剩余时，剩余部分一项，不带 `lot_id`，记 `SHORTFALL`（记入账外缺口）。
+       - 净账面不小于报损量时，正余量批次之和一定足够，所以只有经过确认的行才会产生 `SHORTFALL`。
+     - `alloc` 每项 `qty` 为正，合计等于该行 `qty`。
+- **不足确认**：
+  - `confirm_shortage: true` 表示员工确认这一行的数量确实发生，允许账面不足时入账。它不绑定预检时的账面或分配：带确认的行按提交时的账面入账，不足程度比预检时更大也有效。
+  - 需要确认但没带确认的行，照确认后的结果继续试算后续各行。全部行处理完后，存在这样的行时整条命令不入账，返回 `409 WASTE_CONFIRMATION_REQUIRED`，`details` 为 `{"lines": [{line, item_id, lot_id?, qty, item_book_qty, lot_book_qty?}]}`，按 `line` 升序列出全部这样的行，一次确认完。
+  - 账面足够的行带了确认标记照常处理。
+- **重提**：
+  - 只有明确收到拒绝（如 `WASTE_CONFIRMATION_REQUIRED`）之后，才可以用同一个 `command_id` 修改内容重提：被拒绝的命令不落库。确认后重提时 `captured_at` 沿用首次填写的值，只更新 `sent_at`；超过 72 小时返回 `CAPTURE_TOO_OLD`，改走补录。
+  - 结果未知（超时、断线）时，先用原 ID、原内容重试取回结果，不能直接加确认标记。首次已成功时，原内容重试返回首次响应，即使已超过 72 小时（幂等检查先于时间校准）。
+  - 成功之后用同一个 ID 去掉或改变确认标记：`409 IDEMPOTENCY_CONFLICT`，`fields` 为 `["lines"]`。
+  - 修改某行的物料、批次或数量后，客户端清除该行的确认，重新预检。
+- **警告**：本切片只有 `CAPTURE_TIME_ADJUSTED`。盘点切片实现吸收判定后，被吸收的行另返回 `ABSORBED_BY_COUNT`（见「盘点吸收」）。
+  - 报损不返回 `STOCK_SHORTFALL`：不足已在入账前提示并确认，事件中有提交时的账面。
+- **投影**：
+  - 未被吸收的行：`alloc` 按顺序每项写一条 `inventory_movements`，`kind = 'WASTE'`，`alloc_source` 取该项的 `source`，`lot_id` 取该项的 `lot_id`（`SHORTFALL` 为 `NULL`），`nominal_qty = qty_delta = −qty`，`physical_at = occurred_at`。
+    带 `lot_id` 的项把该批次的 `remaining_qty` 减去 `qty`；`SHORTFALL` 项把该物料的账外缺口减去 `qty`，`inventory_unallocated` 没有该物料的行时新建。
+  - 被吸收的行：写一条 `kind = 'WASTE'`、`alloc_source = 'ABSORBED'`、`lot_id` 为 `NULL`、`nominal_qty = −qty`、`qty_delta = 0` 的流水，`absorbed_by_event_id` 取自 payload，不改动批次和账外缺口。
+  - `reason_code`、`item_book_qty`、`lot_book_qty` 只在事件中。
+
+**预检**：
+
+- 请求体只有 `lines`，每项 `{item_id, lot_id?, input, reason_code}`，取值规则同正式提交；不接受 `command_id`、`captured_at`、`sent_at` 和 `confirm_shortage`。
+- 在一个读事务中执行，不写事件、`processed_commands` 或任何表；没有幂等处理。
+- 校验与正式提交相同（取值、引用、`LOT_ITEM_MISMATCH`、`ITEM_HAS_NO_LOTS`、单位、数量越界），错误码与 `details` 也相同。不做时间校准，也不做吸收判定（没有发生时间）。
+- 成功的 `data` 是 `{"lines": [{line, item_id, lot_id?, qty, item_book_qty, lot_book_qty?, needs_confirmation, alloc}]}`，每行一项：按正式提交的逐行处理计算，假设全部行都不被吸收、需要确认的行都已确认。`warnings` 为空数组。
+- 结果是按当前账面的估算：正式提交在写事务内重新计算，两次请求之间账面可能变化。界面把 `alloc` 显示为「按当前账面预计扣减」。
+
 ### 库存明细查询
 
 | 方法与路径 | 查询参数 | 权限 |
 |---|---|---|
 | `GET /api/v1/inventory` | `item_id`（可选） | 已认证员工 |
 
-- `data` 是 `{"business_date", "items": [物料…]}`，全部内容读自同一个读事务。
+- 查询参数与 `data` 见 `boh_domain::inventory` 的 `InventoryQuery`、`Inventory`、`InventoryItem`，全部内容读自同一个读事务。
   - `business_date` 是门店节点按当前时间计算的营业日（盘点草稿用它核对，见「盘点」第 1 条）。
-  - `items` 每个物料一项，含停用的，按 `code` 的字节序升序；带 `item_id` 时只含该物料。每项 `{item_id, on_hand_qty, unallocated_qty, lots}`：
+  - `items` 每个物料一项，含停用的，按 `code` 的字节序升序；带 `item_id` 时只含该物料。
     `on_hand_qty` 是账面数（视图 `inventory_on_hand`），`unallocated_qty` 是账外缺口（`<= 0`，没有时为 0）。
-  - `lots` 是该物料余量不为 0 的批次（含负余量），按 FIFO 顺序（批次日期、流水号）排列。每项是一个批次行（见「批次查询」），不含 `item_id`。
+  - `lots` 是该物料余量不为 0 的批次（含负余量），按 FIFO 顺序（批次日期、流水号）排列。每项是一个批次行（`LotDetails`，见「批次查询」），不含 `item_id`。
 - 参数取值非法、未知或重复的参数：`400 VALIDATION_FAILED`。`item_id` 合法但不存在时 `items` 为空数组。
 
 ### 批次查询
@@ -249,7 +326,7 @@ occurred_at = recorded_at − lag
 | `GET /api/v1/lots/{lot_id}` | 已认证员工 |
 
 - 按标签上的批次号查一个批次，余量为 0 的也能查到（盘点补加历史批次用，见「盘点」）。
-- `data` 是 `{"lot": 批次行}`。批次行 `{lot_id, item_id, origin, remaining_qty, source_occurred_at, expires_at?, manufacturer_lot_no?}`：
+- `data` 是 `{"lot": 批次行}`，批次行见 `boh_domain::inventory::Lot`（库存明细中的批次行是其中不含 `item_id` 的 `LotDetails`）。
   `source_occurred_at` 是建批次事件的 `occurred_at`；`expires_at`、`manufacturer_lot_no` 没有时省略该键。
 - 路径中的 `lot_id` 不符合批次号格式（类型为 `RAW` / `SEMI` / `FINISHED`，编码只含 `A`–`Z`、`0`–`9`、`_`，日期为真实日期，流水号 `001`–`999`）：`400 VALIDATION_FAILED`。格式合法但不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": "LOT", "id"}`。
 
@@ -332,7 +409,7 @@ occurred_at = recorded_at − lag
 - **账面不足**：
   - 指定批次时，差额留在该批次上（余量为负）；
   - 未指定批次时，扣完该物料全部余量大于 0 的批次后，剩余部分记入账外缺口。
-  - 报损在账面不足时先提示、经员工确认后入账（规则随报损切片定）。
+  - 报损在账面不足时先提示、经员工确认后入账（见「报损接口」）；还没有任何批次的物料不能报损。
   - 下一次包含该批次或该物料的盘点会校准它们（见「盘点」）。
 - **负余量**：批次余量可以为负，表示账面少于实物。FIFO 跳过余量不大于 0 的批次。
 - 分配结果连同来源写进 payload：`alloc[{lot_id?, qty, source}]`。
@@ -353,9 +430,9 @@ occurred_at = recorded_at − lag
 
 | event_type | aggregate_type | payload 要点 | 投影影响 |
 |---|---|---|---|
-| `GOODS_RECEIVED` | `RECEIPT` | `@2`：`supplier_id`, `lines[{item_id, qty, input, lot_id, manufacturer_lot_no?, produced_on, expires_on, expires_at, line_cost_cents}]`，`lot_id` 是批次号。`@1`（`lot_id` 为 UUID）不支持，见「收货接口」 | 每行新建一个批次 |
+| `GOODS_RECEIVED` | `RECEIPT` | `@2`：`boh_domain::receiving::GoodsReceived`；样本 `crates/boh-app/tests/golden/GOODS_RECEIVED@2/`；`lot_id` 是批次号。`@1`（`lot_id` 为 UUID）不支持，见「收货接口」 | 每行新建一个批次 |
 | `PRODUCTION_BATCH_COMPLETED` | `PRODUCTION_BATCH` | `recipe_id`, `recipe_version`, `batch_count`, `started_at?`, `output{item_id, planned_qty, qty, lot_id, expires_at?}`, `consumed[{item_id, planned_qty, qty, alloc \| absorbed_by_event_id}]` | 原料按分配扣减（或被吸收）；成品新建批次 |
-| `WASTE_LOGGED` | `WASTE_RECORD` | `lines[{item_id, qty, input, reason_code, item_book_qty, lot_book_qty?, alloc \| absorbed_by_event_id}]`：`item_book_qty` 是提交时该行之前的物料净账面，指定批次的行另带该批次账面 `lot_book_qty` | 按分配扣减（或被吸收） |
+| `WASTE_LOGGED` | `WASTE_RECORD` | `lines[{item_id, lot_id?, qty, input, reason_code, item_book_qty, lot_book_qty?, alloc \| absorbed_by_event_id}]`：`lot_id` 是员工指定的批次；`item_book_qty` 是提交时该行之前的物料净账面，指定批次的行另带该批次账面 `lot_book_qty`（与 `lot_id` 同时出现）。见「报损接口」 | 按分配扣减（或被吸收） |
 | `STOCK_COUNT_SUBMITTED` | `STOCK_COUNT` | `purpose`（`CLOSING` / `AUDIT`）, `lines[{item_id, lot_id, counted_qty}]` | 无 |
 | `STOCK_ADJUSTED` | `STOCK_COUNT` | `lines[{item_id, lot_id?, book_qty, counted_qty, delta}]`：带 `lot_id` 的是批次行，不带的是每个物料一行的账外缺口清零 | 批次和账外缺口按 delta 变化；写 `inventory_counts` |
 | `PURCHASE_ORDER_SUBMITTED` | `PURCHASE_ORDER` | `supplier_id`, `lines[{item_id, qty, input}]`, `deliver_on`（门店当地日期 `'YYYY-MM-DD'`） | 无 |
@@ -584,7 +661,18 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 | 补录报损 | 100；15:00 盘点得 50（调整 −50）；16:00 补录报损 50，`occurred_at = 10:00` | 被吸收；账面 **50**；报损 **50**；未解释损耗 **0** |
 | 盘点后冲销 | 100；09:00 误报损 10，账面 90；09:20 盘点得 100（调整 +10）；10:00 冲销报损 | 被吸收；账面 **100**；报损合计 **0**；未解释损耗 **0** |
 | 闭店重盘 | 成品账面 100；先盘为 80，再盘为 90；销售 0 | 调整净和 **−10**；未解释损耗 **10** |
-| 指定批次不足 | 面粉批次 A 5、B 10；报损面粉 8 g，指定 A | 先提示 A 账面 5、报损 8、差额 3，不入账；员工确认后分配 `A 8 SPECIFIED`；A **−3**，B **10** 不动 |
+| 指定批次不足 | 面粉批次 A 5、B 10；报损面粉 8 g，指定 A | 不带确认：`409 WASTE_CONFIRMATION_REQUIRED`，列出该行（`lot_book_qty` **5**、`item_book_qty` **15**），不入账；同一 `command_id` 加确认重提后分配 `A 8 SPECIFIED`；A **−3**，B **10** 不动 |
+| 指定批次、净账面不足 | 批次 A 5，账外缺口 −10；报损 3 g，指定 A | 批次够但净账面 **−5** 不足：不带确认时 `409 WASTE_CONFIRMATION_REQUIRED`；确认后 `A 3 SPECIFIED`；A **2**，账面 **−8** |
+| 有负批次时不指定批次 | 批次 A −3、B 10（净账面 7）；报损 8 g，不指定批次 | 需要确认；确认后 `B 8 FIFO`；A **−3**、B **2**，账外缺口 **0**，账面 **−1** |
+| 不足记入账外缺口 | 只有批次 A 5；报损 8 g，不指定批次 | 需要确认；确认后 `A 5 FIFO` + `3 SHORTFALL`；A **0**，账外缺口 **−3**，账面 **−3**；不返回 `STOCK_SHORTFALL` |
+| 同一命令的后续行 | 批次 A 5、B 10（A 在前）；一次报损两行：`lines[0]` 不指定批次 8 g，`lines[1]` 指定 A 1 g | `409` 只列 `line` **1**（`lot_book_qty` **0**、`item_book_qty` **7**）；确认后 `lines[0]` 为 `A 5 FIFO` + `B 3 FIFO`，`lines[1]` 为 `A 1 SPECIFIED`；A **−1**、B **7** |
+| 从未收货的物料 | 面粉已有批次；糖已建档但从未收货；报损糖 1 g（带或不带确认），或一次报损面粉 1 g 和糖 1 g | `409 ITEM_HAS_NO_LOTS`，列出糖所在的行；整条不入账；预检同样拒绝 |
+| 收货后耗尽 | 只有批次 A 5，报损 8 g 确认后 A **0**、账外缺口 −3；再报 2 g，不指定批次 | 照常需要确认；确认后整行 `2 SHORTFALL`，账外缺口 **−5** |
+| 数量越界 | 批次 A 的余量已是 `i64::MIN + 2`；指定 A 报 3 g（确认）；或同一命令前面另有一条正常行 | `400 VALIDATION_FAILED`；整条不入账；指定 A 报 2 g（确认）照常入账，A 为 `i64::MIN`。账外缺口累加越界同样处理 |
+| 预检只读 | 批次 A 5；预检报损 8 g，指定 A | 返回该行 `needs_confirmation` **true**、`lot_book_qty` **5**、预计 `A 8 SPECIFIED`；事件、投影和 `processed_commands` 不变 |
+| 确认后不足加大 | 批次 A 5；预检指定 A 报 8 后员工确认；提交前另一台平板报损 A 2 已入账；带确认提交 | 照常入账，`lot_book_qty` **3**（提交时的值）；A **−5** |
+| 提交时新出现的不足 | 批次 A 5；预检指定 A 报 4 不需要确认；提交前另一台平板报损 A 2 已入账；不带确认提交 | `409 WASTE_CONFIRMATION_REQUIRED`（`lot_book_qty` **3**）；不入账 |
+| 确认标记与幂等 | 带确认的报损成功后，用原 `command_id`、原内容重发；再去掉确认标记重发 | 第一次原样返回首次响应，`seq` 不增加；第二次 `409 IDEMPOTENCY_CONFLICT`，`fields` 为 `["lines"]` |
 | 同次收货多个批次 | 09-10 一次收货面粉两行：`lines[0]` 建 A（`RAW-FLOUR-20260910-001`）5 g，`lines[1]` 建 B（`…-002`）10 g；报损面粉 8 g，不指定批次 | 按批次号分配 `A 5 FIFO` + `B 3 FIFO`；余量 A **0**、B **7** |
 | 同次收货重复提交 | 上例扣减后，用原 `command_id`、原内容重发收货 | 返回原批次号 A、B；`seq` 不增加；余量仍为 A **0**、B **7** |
 | 批次号重建 | 保存同次收货后尚未扣减的原库结果，清空投影，按 `seq` 重建，再报损面粉 8 g，不指定批次 | 重建后投影逐行一致，批次号仍为 `…-001`、`…-002`；后续分配 `A 5 FIFO` + `B 3 FIFO`，余量 A **0**、B **7** |

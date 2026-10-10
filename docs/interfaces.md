@@ -81,7 +81,7 @@ pub mod testing {
 - `open_reader`：只读连接，已设好全部 PRAGMA 和 `query_only = ON`。
 - `migrate`：与 `open` 内部相同的迁移。
 - `rebuild_projections`：在 `conn` 上以 `BEGIN IMMEDIATE` 执行与 `Writer::rebuild_projections` 相同的重建。`conn` 须由 `open_writer` 打开。
-- 本期没有写入口的事件（如 `source = HQ_PACKAGE` 的 `MASTER_DATA_CHANGED`），锁定测试经 `open_writer` 直接写入 `processed_commands` 和 `store_events`（不写 `seq` 列），再 `rebuild_projections` 核对投影。
+- 本期没有写入口的事件（如 `source = HQ_PACKAGE` 的 `MASTER_DATA_CHANGED`、带被吸收行的 `WASTE_LOGGED`），锁定测试经 `open_writer` 直接写入 `processed_commands` 和 `store_events`（不写 `seq` 列），再 `rebuild_projections` 核对投影。
 - 这些函数都是转发到 crate 内部函数的独立函数，不用 `pub use`。
   - clippy 按函数定义禁用；重导出会让 crate 内部对原函数的调用也被禁用。
 - 两份 `clippy.toml` 禁用这些函数，只有锁定测试及 `spec_support/` 可以 `#[allow]`。
@@ -209,6 +209,17 @@ pub fn next_closing_backup(
   - 当地不存在的时刻（夏令时跳过）按跳过之前的偏移换算，即顺延跳过的时长（跳过 02:00–03:00 时，02:30 为 03:30）。
   - 当地重复的时刻只取第一次（较早的那个）；同一天的第二次不算触发时刻。
   - 结果或换算超出可表示范围：`OutOfRange`。
+
+## boh-domain：报损 payload（`boh_domain::waste`）
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WasteLogged { /* 字段由实现决定 */ }
+```
+
+- `WASTE_LOGGED@1` 的 payload 类型；写入与 `projections::apply` 都用它序列化和解析。结构见 domain.md「事件目录」「报损接口」。
+- 锁定测试对 `golden/WASTE_LOGGED@1/` 的每份样本做 `serde_json::from_str::<WasteLogged>` 再 `serde_json::to_string`，结果必须与样本逐字节相同（含被吸收的分支：写入路径随盘点切片才产生它们）。
+- 解析拒绝 domain.md 规定以外的结构：未知字段、`alloc` 与 `absorbed_by_event_id` 同时出现或都不出现、`lot_id` 与 `lot_book_qty` 只出现一个。
 
 ## boh-app：Router 测试入口
 

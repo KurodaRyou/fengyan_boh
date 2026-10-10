@@ -363,3 +363,159 @@ async fn goods_received_with_and_without_manufacturer_lot_no() {
         ]
     );
 }
+
+// WASTE_LOGGED@1：行的结构分支各一份样本，键顺序为 item_id、lot_id、qty、input、reason_code、item_book_qty、lot_book_qty、
+// alloc / absorbed_by_event_id；省略的键不写 null。
+// - SPECIFIED_LOT：指定批次的行带 lot_id 和 lot_book_qty，alloc 恰好一项 SPECIFIED；input 的非 ASCII 单位不转义。
+//   面粉批次 …-001 25000 g、…-002 3000 g；指定 …-001 报 1 袋：批次账面 25000、物料净账面 28000，不需要确认。
+// - UNSPECIFIED_LOT：不指定批次的行没有 lot_id、lot_book_qty；alloc 中 FIFO 项带 lot_id，SHORTFALL 项不带。
+//   接着报 5000 g（确认）：净账面 3000，…-002 3000 FIFO + 2000 SHORTFALL。
+// - 被吸收的行（ABSORBED、ABSORBED_SPECIFIED_LOT）以 absorbed_by_event_id 代替 alloc；吸收判定随盘点切片实现，
+//   本切片没有写入口，样本由 spec_replay.rs 经 open_writer 写入账本并重建验证。
+// 确认标记不写进 payload。
+#[tokio::test]
+async fn waste_logged_specified_and_unspecified_lot() {
+    let cmd = |n: u16| format!("01890a5d-ac96-774b-bcce-b30209b3{n:04x}");
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("boh.db");
+    let router = spec_support::router(&db_path, ManualClock::new(NOW).clock()).unwrap();
+    let flour = post_ok(
+        &router,
+        "/api/v1/items",
+        json!({
+            "command_id": cmd(1), "code": "FLOUR", "name": "面粉", "base_unit": "g",
+            "category": "RAW", "units": [{ "unit_code": "袋", "base_qty_per_unit": 25000 }],
+            "active": true,
+        }),
+    )
+    .await["item"]["item_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let supplier = post_ok(
+        &router,
+        "/api/v1/suppliers",
+        json!({ "command_id": cmd(2), "code": "S-FLOUR", "name": "面粉供应商", "active": true }),
+    )
+    .await["supplier"]["supplier_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    post_ok(
+        &router,
+        "/api/v1/waste-reasons",
+        json!({ "command_id": cmd(3), "code": "EXPIRED", "name": "过期", "active": true }),
+    )
+    .await;
+    post_ok(
+        &router,
+        "/api/v1/receipts",
+        json!({
+            "command_id": cmd(4), "supplier_id": supplier,
+            "lines": [
+                {
+                    "item_id": flour, "input": { "qty": 1, "unit_code": "袋", "base_qty_per_unit": 25000 },
+                    "produced_on": "2026-10-01", "expires_on": "2026-10-20", "line_cost_cents": 100,
+                },
+                {
+                    "item_id": flour, "input": { "qty": 3000, "unit_code": "g", "base_qty_per_unit": 1 },
+                    "produced_on": "2026-10-01", "expires_on": "2026-10-20", "line_cost_cents": 100,
+                },
+            ],
+            "captured_at": NOW.0 - 60_000, "sent_at": NOW.0,
+        }),
+    )
+    .await;
+    for (command_id, line) in [
+        (
+            cmd(5),
+            json!({
+                "item_id": flour, "lot_id": "RAW-FLOUR-20261006-001",
+                "input": { "qty": 1, "unit_code": "袋", "base_qty_per_unit": 25000 },
+                "reason_code": "EXPIRED",
+            }),
+        ),
+        (
+            cmd(6),
+            json!({
+                "item_id": flour, "input": { "qty": 5000, "unit_code": "g", "base_qty_per_unit": 1 },
+                "reason_code": "EXPIRED", "confirm_shortage": true,
+            }),
+        ),
+    ] {
+        let reply = spec_support::post(
+            &router,
+            "/api/v1/waste-records",
+            Some(&STAFF),
+            &json!({
+                "command_id": command_id, "lines": [line],
+                "captured_at": NOW.0 - 60_000, "sent_at": NOW.0,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_success(&reply);
+    }
+
+    let payloads: Vec<String> = payloads(&db_path).unwrap()[4..]
+        .iter()
+        .map(|payload| payload.replace(&flour, GOLDEN_FLOUR_ID))
+        .collect();
+    assert_eq!(
+        payloads,
+        [
+            golden(include_str!("golden/WASTE_LOGGED@1/SPECIFIED_LOT.json")),
+            golden(include_str!("golden/WASTE_LOGGED@1/UNSPECIFIED_LOT.json")),
+        ]
+    );
+}
+
+// docs/interfaces.md「boh-domain：报损 payload」：每份 WASTE_LOGGED@1 样本经 boh_domain::waste::WasteLogged 解析再序列化，
+// 与样本逐字节相同——含被吸收的两个分支（写入路径随盘点切片才产生它们，这里锁定被测类型的序列化：键顺序、省略的键、
+// 不写 null、不丢 item_book_qty / lot_book_qty / input）。
+// 解析拒绝规定以外的结构：未知字段、alloc 与 absorbed_by_event_id 同时出现或都不出现、lot_id 与 lot_book_qty 只出现一个。
+#[test]
+fn waste_logged_payload_type_round_trips_every_sample() {
+    use boh_domain::waste::WasteLogged;
+
+    for text in [
+        golden(include_str!("golden/WASTE_LOGGED@1/SPECIFIED_LOT.json")),
+        golden(include_str!("golden/WASTE_LOGGED@1/UNSPECIFIED_LOT.json")),
+        golden(include_str!("golden/WASTE_LOGGED@1/ABSORBED.json")),
+        golden(include_str!(
+            "golden/WASTE_LOGGED@1/ABSORBED_SPECIFIED_LOT.json"
+        )),
+    ] {
+        let parsed: WasteLogged = serde_json::from_str(text).unwrap();
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), text);
+    }
+
+    let line = |extra: &str| {
+        format!(r#"{{"lines":[{{"item_id":"01890a5d-ac96-774b-bcce-b302099a8501"{extra}}}]}}"#)
+    };
+    let input = r#","qty":1,"input":{"qty":1,"unit_code":"g","base_qty_per_unit":1},"reason_code":"EXPIRED","item_book_qty":3"#;
+    let fifo = r#","alloc":[{"lot_id":"RAW-FLOUR-20261006-001","qty":1,"source":"FIFO"}]"#;
+    let absorbed = r#","absorbed_by_event_id":"01890a5d-ac96-774b-bcce-b302099a8701""#;
+    let lot = r#","lot_id":"RAW-FLOUR-20261006-001""#;
+    for (name, text) in [
+        ("both", line(&format!("{input}{fifo}{absorbed}"))),
+        ("neither", line(input)),
+        (
+            "lot_book_qty without lot_id",
+            line(&format!("{input},\"lot_book_qty\":1{fifo}")),
+        ),
+        (
+            "lot_id without lot_book_qty",
+            line(&format!("{lot}{input}{fifo}")),
+        ),
+        (
+            "unknown field",
+            line(&format!("{input},\"note\":\"x\"{fifo}")),
+        ),
+    ] {
+        assert!(
+            serde_json::from_str::<WasteLogged>(&text).is_err(),
+            "{name}: {text}"
+        );
+    }
+}

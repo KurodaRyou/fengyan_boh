@@ -1,8 +1,10 @@
 //! Command orchestration. Business checks execute after ledger idempotency.
 
 pub(crate) mod inventory;
+mod item_units;
 pub(crate) mod master_data;
 pub(crate) mod receiving;
+pub(crate) mod waste;
 
 use axum::http::StatusCode;
 use boh_domain::equipment::{
@@ -47,7 +49,7 @@ pub async fn create(
     actor: Actor,
     command: CreateEquipment,
 ) -> Result<Value, ApiError> {
-    let request = normalized(&command, None)?;
+    let request = normalized(&command, None, "规范化设备创建命令")?;
     let writer = state.writer.clone();
     let response = writer
         .call(move |tx| {
@@ -104,7 +106,7 @@ pub async fn update(
     id: AggregateId,
     command: UpdateEquipment,
 ) -> Result<Value, ApiError> {
-    let request = normalized(&command, Some(id))?;
+    let request = normalized(&command, Some(id), "规范化设备更新命令")?;
     let writer = state.writer.clone();
     let response = writer
         .call(move |tx| {
@@ -187,7 +189,7 @@ pub async fn log_temperature(
     actor: Actor,
     command: LogTemperature,
 ) -> Result<Value, ApiError> {
-    let request = normalized(&command, None)?;
+    let request = normalized(&command, None, "规范化温度记录命令")?;
     let writer = state.writer.clone();
     let response = writer
         .call(move |tx| {
@@ -374,9 +376,13 @@ fn missing_reference(entity: &str, id: AggregateId) -> ApiError {
     .with_details(json!({ "entity": entity, "id": id }))
 }
 
-fn normalized(command: &impl Serialize, id: Option<AggregateId>) -> Result<String, ApiError> {
+fn normalized(
+    command: &impl Serialize,
+    id: Option<AggregateId>,
+    operation: &'static str,
+) -> Result<String, ApiError> {
     let mut value = serde_json::to_value(command)
-        .map_err(|error| ApiError::from(StorageError::external("规范化设备命令", error)))?;
+        .map_err(|error| ApiError::from(StorageError::external(operation, error)))?;
     let object = value.as_object_mut().ok_or_else(ApiError::validation)?;
     object.remove("command_id");
     object.remove("sent_at");
@@ -384,7 +390,7 @@ fn normalized(command: &impl Serialize, id: Option<AggregateId>) -> Result<Strin
         object.insert("equipment_id".into(), json!(id));
     }
     serde_json::to_string(&value)
-        .map_err(|error| ApiError::from(StorageError::external("规范化设备命令", error)))
+        .map_err(|error| ApiError::from(StorageError::external(operation, error)))
 }
 
 fn response(row: &Equipment) -> Result<String, ApiError> {
