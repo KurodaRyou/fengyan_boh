@@ -9,12 +9,13 @@ use crate::{AggregateId, CommandId, DomainError, UnixMillis};
 const LAST_EXPIRES_ON: Date = civil_date(9998, 12, 31);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct ReceiptInput {
     pub qty: i64,
     pub unit_code: String,
     pub base_qty_per_unit: i64,
 }
+object_serde!(ReceiptInput);
 
 impl ReceiptInput {
     pub fn base_qty(&self) -> Result<i64, DomainError> {
@@ -86,7 +87,7 @@ impl CreateReceipt {
 // Field order is part of the published serialized payload. Receipt lines create
 // new lots and are never absorbed by stocktakes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct ReceivedLine {
     pub item_id: AggregateId,
     pub qty: i64,
@@ -103,13 +104,15 @@ pub struct ReceivedLine {
     pub expires_at: UnixMillis,
     pub line_cost_cents: i64,
 }
+object_serde!(ReceivedLine);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct GoodsReceived {
     pub supplier_id: AggregateId,
     pub lines: Vec<ReceivedLine>,
 }
+object_serde!(GoodsReceived);
 
 impl GoodsReceived {
     pub fn validate(&self) -> Result<(), DomainError> {

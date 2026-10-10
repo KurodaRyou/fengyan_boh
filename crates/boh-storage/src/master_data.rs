@@ -1,9 +1,7 @@
-//! Decode frozen snapshots with SQLite JSON, then project only their stored facts.
+//! Decode frozen domain snapshots, then project only their stored facts.
 
-use boh_domain::AggregateId;
 use boh_domain::master_data::{
-    BaseUnit, ItemCategory, ItemSnapshot, ItemUnit, RecipeLine, RecipeSnapshot, RecipeVersion,
-    SupplierSnapshot, WasteReasonSnapshot,
+    ItemSnapshot, MasterDataChanged, RecipeSnapshot, SupplierSnapshot, WasteReasonSnapshot,
 };
 use rusqlite::{Transaction, params};
 
@@ -13,161 +11,43 @@ fn invalid() -> StorageError {
     StorageError::InvalidEvent("invalid master data payload".into())
 }
 
-// Reject missing, unknown, duplicate and mistyped fields, including null optionals.
-fn object(
-    tx: &Transaction<'_>,
-    json: &str,
-    required: &[(&str, &str)],
-    optional: &[(&str, &str)],
-) -> Result<(), StorageError> {
-    let kind: String = tx
-        .query_row("SELECT json_type(?1)", [json], |r| r.get(0))
-        .map_err(|error| StorageError::sqlite("查询事件 JSON", error))?;
-    if kind != "object" {
-        return Err(invalid());
+fn payload(json: &str) -> Result<MasterDataChanged, StorageError> {
+    let payload: MasterDataChanged = serde_json::from_str(json)
+        .map_err(|error| StorageError::external("解析主数据事件 payload", error))?;
+    match &payload {
+        MasterDataChanged::Item { snapshot, .. } => snapshot.validate(),
+        MasterDataChanged::Recipe { snapshot, .. } => snapshot.validate(),
+        MasterDataChanged::Supplier { snapshot, .. } => snapshot.validate(),
+        MasterDataChanged::WasteReason { snapshot, .. } => snapshot.validate(),
     }
-    let mut statement = tx
-        .prepare("SELECT key, type FROM json_each(?1)")
-        .map_err(|error| StorageError::sqlite("准备查询事件 JSON", error))?;
-    let fields: Vec<(String, String)> = statement
-        .query_map([json], |r| Ok((r.get(0)?, r.get(1)?)))
-        .map_err(|error| StorageError::sqlite("查询事件 JSON", error))?
-        .collect::<Result<_, _>>()
-        .map_err(|error| StorageError::sqlite("读取事件 JSON", error))?;
-    let mut seen = Vec::new();
-    for (key, kind) in &fields {
-        let expected = required
-            .iter()
-            .chain(optional)
-            .find(|(name, _)| *name == key);
-        let Some((_, expected)) = expected else {
-            return Err(invalid());
-        };
-        if seen.contains(&key.as_str())
-            || !(kind == expected
-                || (*expected == "boolean" && matches!(kind.as_str(), "true" | "false")))
-        {
-            return Err(invalid());
-        }
-        seen.push(key.as_str());
-    }
-    if required.iter().any(|(name, _)| !seen.contains(name)) {
-        return Err(invalid());
-    }
-    Ok(())
-}
-
-fn array(tx: &Transaction<'_>, json: &str, path: &str) -> Result<Vec<String>, StorageError> {
-    let mut statement = tx
-        .prepare("SELECT value, type FROM json_each(?1, ?2) ORDER BY CAST(key AS INTEGER)")
-        .map_err(|error| StorageError::sqlite("准备查询事件 JSON", error))?;
-    let rows = statement
-        .query_map(params![json, path], |row| {
-            let kind: String = row.get(1)?;
-            if kind == "object" {
-                Ok(Some(row.get::<_, String>(0)?))
-            } else {
-                Ok(None)
-            }
-        })
-        .map_err(|error| StorageError::sqlite("查询主数据数组", error))?;
-    let mut objects = Vec::new();
-    for row in rows {
-        let object = row
-            .map_err(|error| StorageError::sqlite("解码主数据数组", error))?
-            .ok_or_else(invalid)?;
-        objects.push(object);
-    }
-    Ok(objects)
+    .map_err(|error| StorageError::external("校验主数据事件 payload", error))?;
+    Ok(payload)
 }
 
 pub(crate) fn apply(tx: &Transaction<'_>, event: &Event) -> Result<(), StorageError> {
-    object(
-        tx,
-        &event.payload,
-        &[
-            ("entity", "text"),
-            ("source", "text"),
-            ("snapshot", "object"),
-        ],
-        &[],
-    )?;
-    let (entity, source, snapshot): (String, String, String) = tx.query_row(
-        "SELECT json_extract(?1, '$.entity'), json_extract(?1, '$.source'), json_extract(?1, '$.snapshot')",
-        [&event.payload], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    ).map_err(|error| StorageError::sqlite("查询事件 JSON", error))?;
-    if entity != event.aggregate_type
-        || !matches!(source.as_str(), "LOCAL" | "HQ_PACKAGE")
-        || event.aggregate_version <= 0
-    {
+    if event.aggregate_version <= 0 {
         return Err(invalid());
     }
-    match entity.as_str() {
-        "ITEM" => item(tx, event, &snapshot),
-        "RECIPE" => recipe(tx, event, &snapshot),
-        "SUPPLIER" => supplier(tx, event, &snapshot),
-        "WASTE_REASON" => waste_reason(tx, event, &snapshot),
+    match (payload(&event.payload)?, event.aggregate_type.as_str()) {
+        (MasterDataChanged::Item { snapshot, .. }, "ITEM") => item(tx, event, &snapshot),
+        (MasterDataChanged::Recipe { snapshot, .. }, "RECIPE") => recipe(tx, event, &snapshot),
+        (MasterDataChanged::Supplier { snapshot, .. }, "SUPPLIER") => {
+            supplier(tx, event, &snapshot)
+        }
+        (MasterDataChanged::WasteReason { snapshot, .. }, "WASTE_REASON") => {
+            waste_reason(tx, event, &snapshot)
+        }
         _ => Err(invalid()),
     }
 }
 
-fn item(tx: &Transaction<'_>, event: &Event, json: &str) -> Result<(), StorageError> {
-    object(
-        tx,
-        json,
-        &[
-            ("code", "text"),
-            ("name", "text"),
-            ("base_unit", "text"),
-            ("category", "text"),
-            ("units", "array"),
-            ("active", "boolean"),
-        ],
-        &[("default_shelf_life_ms", "integer")],
-    )?;
-    let (code, name, base, category, shelf_life, active): (String, String, String, String, Option<i64>, bool) = tx.query_row(
-        "SELECT json_extract(?1, '$.code'), json_extract(?1, '$.name'), json_extract(?1, '$.base_unit'),
-         json_extract(?1, '$.category'), json_extract(?1, '$.default_shelf_life_ms'), json_extract(?1, '$.active')",
-        [json], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
-    ).map_err(|error| StorageError::sqlite("查询事件 JSON", error))?;
-    let mut units = Vec::new();
-    for unit in array(tx, json, "$.units")? {
-        object(
-            tx,
-            &unit,
-            &[("unit_code", "text"), ("base_qty_per_unit", "integer")],
-            &[],
-        )?;
-        units.push(
-            tx.query_row(
-                "SELECT json_extract(?1, '$.unit_code'), json_extract(?1, '$.base_qty_per_unit')",
-                [&unit],
-                |r| {
-                    Ok(ItemUnit {
-                        unit_code: r.get(0)?,
-                        base_qty_per_unit: r.get(1)?,
-                    })
-                },
-            )
-            .map_err(|error| StorageError::sqlite("查询事件 JSON", error))?,
-        );
-    }
-    let snapshot = ItemSnapshot {
-        code,
-        name,
-        base_unit: BaseUnit::parse(&base)?,
-        category: ItemCategory::parse(&category)?,
-        default_shelf_life_ms: shelf_life,
-        units,
-        active,
-    };
-    snapshot.validate()?;
+fn item(tx: &Transaction<'_>, event: &Event, snapshot: &ItemSnapshot) -> Result<(), StorageError> {
     let values = params![
         event.aggregate_id.to_string(),
         snapshot.code,
         snapshot.name,
-        base,
-        category,
+        snapshot.base_unit.as_str(),
+        snapshot.category.as_str(),
         snapshot.default_shelf_life_ms,
         snapshot.active,
         event.aggregate_version
@@ -189,7 +69,7 @@ fn item(tx: &Transaction<'_>, event: &Event, json: &str) -> Result<(), StorageEr
         [event.aggregate_id.to_string()],
     )
     .map_err(|error| StorageError::sqlite("删除物料单位", error))?;
-    for unit in snapshot.units {
+    for unit in &snapshot.units {
         tx.execute(
             "INSERT INTO item_units (item_id, unit_code, base_qty_per_unit) VALUES (?1, ?2, ?3)",
             params![
@@ -203,88 +83,23 @@ fn item(tx: &Transaction<'_>, event: &Event, json: &str) -> Result<(), StorageEr
     Ok(())
 }
 
-fn recipe(tx: &Transaction<'_>, event: &Event, json: &str) -> Result<(), StorageError> {
-    object(
-        tx,
-        json,
-        &[
-            ("code", "text"),
-            ("name", "text"),
-            ("output_item_id", "text"),
-            ("versions", "array"),
-            ("active", "boolean"),
-        ],
-        &[],
-    )?;
-    let (code, name, output, active): (String, String, String, bool) = tx.query_row(
-        "SELECT json_extract(?1, '$.code'), json_extract(?1, '$.name'), json_extract(?1, '$.output_item_id'),
-            json_extract(?1, '$.active')", [json], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-    ).map_err(|error| StorageError::sqlite("查询事件 JSON", error))?;
-    let mut versions = Vec::new();
-    for version in array(tx, json, "$.versions")? {
-        object(
-            tx,
-            &version,
-            &[
-                ("version", "integer"),
-                ("output_qty_per_batch", "integer"),
-                ("lines", "array"),
-            ],
-            &[],
-        )?;
-        let (number, output_qty_per_batch): (i64, i64) = tx
-            .query_row(
-                "SELECT json_extract(?1, '$.version'), json_extract(?1, '$.output_qty_per_batch')",
-                [&version],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .map_err(|error| StorageError::sqlite("查询事件 JSON", error))?;
-        let mut lines = Vec::new();
-        for line in array(tx, &version, "$.lines")? {
-            object(
-                tx,
-                &line,
-                &[("item_id", "text"), ("qty_per_batch", "integer")],
-                &[],
-            )?;
-            let (item, qty_per_batch): (String, i64) = tx
-                .query_row(
-                    "SELECT json_extract(?1, '$.item_id'), json_extract(?1, '$.qty_per_batch')",
-                    [&line],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .map_err(|error| StorageError::sqlite("查询事件 JSON", error))?;
-            lines.push(RecipeLine {
-                item_id: AggregateId::parse(&item)?,
-                qty_per_batch,
-            });
-        }
-        versions.push(RecipeVersion {
-            version: number,
-            output_qty_per_batch,
-            lines,
-        });
-    }
-    let snapshot = RecipeSnapshot {
-        code,
-        name,
-        output_item_id: AggregateId::parse(&output)?,
-        versions,
-        active,
-    };
-    snapshot.validate()?;
+fn recipe(
+    tx: &Transaction<'_>,
+    event: &Event,
+    snapshot: &RecipeSnapshot,
+) -> Result<(), StorageError> {
     let values = params![
         event.aggregate_id.to_string(),
         snapshot.code,
         snapshot.name,
-        output,
+        snapshot.output_item_id.to_string(),
         snapshot.active,
         event.aggregate_version
     ];
     if tx.execute("UPDATE recipes SET code = ?2, name = ?3, output_item_id = ?4, active = ?5, revision = ?6 WHERE id = ?1", values).map_err(|error| StorageError::sqlite("更新配方", error))? == 0 {
         tx.execute("INSERT INTO recipes (id, code, name, output_item_id, active, revision) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", values).map_err(|error| StorageError::sqlite("插入配方", error))?;
     }
-    for version in snapshot.versions {
+    for version in &snapshot.versions {
         let inserted = tx
             .execute(
                 "INSERT INTO recipe_versions (recipe_id, version, output_qty_per_batch)
@@ -301,7 +116,7 @@ fn recipe(tx: &Transaction<'_>, event: &Event, json: &str) -> Result<(), Storage
         if inserted == 0 {
             continue;
         }
-        for (index, line) in version.lines.into_iter().enumerate() {
+        for (index, line) in version.lines.iter().enumerate() {
             let line_no = i64::try_from(index).map_err(|_| invalid())?;
             tx.execute("INSERT INTO recipe_lines (recipe_id, version, line_no, item_id, qty_per_batch) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![event.aggregate_id.to_string(), version.version, line_no, line.item_id.to_string(), line.qty_per_batch]).map_err(|error| StorageError::sqlite("插入配方明细", error))?;
@@ -310,29 +125,11 @@ fn recipe(tx: &Transaction<'_>, event: &Event, json: &str) -> Result<(), Storage
     Ok(())
 }
 
-fn supplier(tx: &Transaction<'_>, event: &Event, json: &str) -> Result<(), StorageError> {
-    object(
-        tx,
-        json,
-        &[("code", "text"), ("name", "text"), ("active", "boolean")],
-        &[("contact_phone", "text")],
-    )?;
-    let snapshot = tx
-        .query_row(
-            "SELECT json_extract(?1, '$.code'), json_extract(?1, '$.name'),
-        json_extract(?1, '$.contact_phone'), json_extract(?1, '$.active')",
-            [json],
-            |r| {
-                Ok(SupplierSnapshot {
-                    code: r.get(0)?,
-                    name: r.get(1)?,
-                    contact_phone: r.get(2)?,
-                    active: r.get(3)?,
-                })
-            },
-        )
-        .map_err(|error| StorageError::sqlite("查询事件 JSON", error))?;
-    snapshot.validate()?;
+fn supplier(
+    tx: &Transaction<'_>,
+    event: &Event,
+    snapshot: &SupplierSnapshot,
+) -> Result<(), StorageError> {
     let values = params![
         event.aggregate_id.to_string(),
         snapshot.code,
@@ -347,16 +144,11 @@ fn supplier(tx: &Transaction<'_>, event: &Event, json: &str) -> Result<(), Stora
     Ok(())
 }
 
-fn waste_reason(tx: &Transaction<'_>, event: &Event, json: &str) -> Result<(), StorageError> {
-    object(
-        tx,
-        json,
-        &[("code", "text"), ("name", "text"), ("active", "boolean")],
-        &[],
-    )?;
-    let snapshot = tx.query_row("SELECT json_extract(?1, '$.code'), json_extract(?1, '$.name'), json_extract(?1, '$.active')", [json],
-        |r| Ok(WasteReasonSnapshot { code: r.get(0)?, name: r.get(1)?, active: r.get(2)? })).map_err(|error| StorageError::sqlite("查询事件 JSON", error))?;
-    snapshot.validate()?;
+fn waste_reason(
+    tx: &Transaction<'_>,
+    event: &Event,
+    snapshot: &WasteReasonSnapshot,
+) -> Result<(), StorageError> {
     let values = params![
         event.aggregate_id.to_string(),
         snapshot.code,
@@ -380,32 +172,135 @@ mod tests {
 
     use boh_domain::{AggregateId, CommandId, EventId, UnixMillis};
 
-    use super::{array, recipe};
+    use super::{apply, payload};
+    use crate::tests::assert_strict_payload;
     use crate::{StorageError, ledger::Event, open};
 
+    #[test]
+    fn item_decoder_rejects_coerced_types_nulls_duplicates_and_unknown_fields() {
+        let good = r#"{"entity":"ITEM","source":"LOCAL","snapshot":{"code":"FLOUR","name":"Flour","base_unit":"g","category":"RAW","default_shelf_life_ms":1000,"units":[{"unit_code":"bag","base_qty_per_unit":25000}],"active":true}}"#;
+        assert_strict_payload(
+            payload,
+            good,
+            &["default_shelf_life_ms"],
+            "解析主数据事件 payload",
+        );
+        for json in [
+            good.replace("\"ITEM\"", r#"{"ITEM":null}"#),
+            good.replace("\"LOCAL\"", r#"{"LOCAL":null}"#),
+            good.replace("\"g\"", r#"{"g":null}"#),
+            good.replace("\"RAW\"", r#"{"RAW":null}"#),
+            good.replace("\"RAW\"", "\"UNKNOWN\""),
+            good.replace(r#"{"unit_code":"bag","base_qty_per_unit":25000}"#, r#"["bag",25000]"#),
+            good.replace(r#"{"code":"FLOUR","name":"Flour","base_unit":"g","category":"RAW","default_shelf_life_ms":1000,"units":[{"unit_code":"bag","base_qty_per_unit":25000}],"active":true}"#, r#"["FLOUR","Flour","g","RAW",1000,[{"unit_code":"bag","base_qty_per_unit":25000}],true]"#),
+            good.replace(r#""units":["#, r#""units":[null,"#),
+            good.replace("25000", "0"),
+            good.replace("1000", "0"),
+        ] {
+            assert!(payload(&json).is_err(), "{json}");
+        }
+        assert!(payload(&good.replace("LOCAL", "HQ_PACKAGE")).is_ok());
+    }
+
+    #[test]
+    fn recipe_decoder_rejects_coerced_types_nulls_duplicates_and_unknown_fields() {
+        let good = r#"{"entity":"RECIPE","source":"LOCAL","snapshot":{"code":"BREAD","name":"Bread","output_item_id":"01890a5d-ac96-774b-bcce-b302099a8301","versions":[{"version":1,"output_qty_per_batch":10,"lines":[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8302","qty_per_batch":100}]}],"active":true}}"#;
+        assert_strict_payload(payload, good, &[], "解析主数据事件 payload");
+        for json in [
+            good.replace("\"LOCAL\"", r#"{"LOCAL":null}"#),
+            good.replace(r#"{"item_id":"01890a5d-ac96-774b-bcce-b302099a8302","qty_per_batch":100}"#, r#"["01890a5d-ac96-774b-bcce-b302099a8302",100]"#),
+            good.replace(r#"{"version":1,"output_qty_per_batch":10,"lines":[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8302","qty_per_batch":100}]}"#, r#"[1,10,[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8302","qty_per_batch":100}]]"#),
+            good.replace(r#"{"code":"BREAD","name":"Bread","output_item_id":"01890a5d-ac96-774b-bcce-b302099a8301","versions":[{"version":1,"output_qty_per_batch":10,"lines":[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8302","qty_per_batch":100}]}],"active":true}"#, r#"["BREAD","Bread","01890a5d-ac96-774b-bcce-b302099a8301",[{"version":1,"output_qty_per_batch":10,"lines":[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8302","qty_per_batch":100}]}],true]"#),
+            good.replace(r#""versions":["#, r#""versions":[true,"#),
+            good.replace(r#""lines":["#, r#""lines":[null,"#),
+            good.replace(r#""version":1"#, r#""version":2"#),
+            good.replace(r#""qty_per_batch":100"#, r#""qty_per_batch":0"#),
+        ] {
+            assert!(payload(&json).is_err(), "{json}");
+        }
+        assert!(payload(&good.replace("LOCAL", "HQ_PACKAGE")).is_ok());
+    }
+
+    #[test]
+    fn supplier_decoder_rejects_coerced_types_nulls_duplicates_and_unknown_fields() {
+        let good = r#"{"entity":"SUPPLIER","source":"LOCAL","snapshot":{"code":"S1","name":"Supplier","contact_phone":"021-5555","active":true}}"#;
+        assert_strict_payload(payload, good, &["contact_phone"], "解析主数据事件 payload");
+        for json in [
+            good.replace("\"LOCAL\"", r#"{"LOCAL":null}"#),
+            good.replace(
+                r#"{"code":"S1","name":"Supplier","contact_phone":"021-5555","active":true}"#,
+                r#"["S1","Supplier","021-5555",true]"#,
+            ),
+            good.replace("021-5555", ""),
+            good.replace("021-5555", " 021-5555"),
+        ] {
+            assert!(payload(&json).is_err(), "{json}");
+        }
+        assert!(payload(&good.replace("LOCAL", "HQ_PACKAGE")).is_ok());
+    }
+
+    #[test]
+    fn waste_reason_decoder_rejects_coerced_types_nulls_duplicates_and_unknown_fields() {
+        let good = r#"{"entity":"WASTE_REASON","source":"LOCAL","snapshot":{"code":"EXPIRED","name":"Expired","active":true}}"#;
+        assert_strict_payload(payload, good, &[], "解析主数据事件 payload");
+        for json in [
+            good.replace("\"LOCAL\"", r#"{"LOCAL":null}"#),
+            good.replace(
+                r#"{"code":"EXPIRED","name":"Expired","active":true}"#,
+                r#"["EXPIRED","Expired",true]"#,
+            ),
+            good.replace("Expired", ""),
+            good.replace("Expired", " Expired"),
+        ] {
+            assert!(payload(&json).is_err(), "{json}");
+        }
+        assert!(payload(&good.replace("LOCAL", "HQ_PACKAGE")).is_ok());
+    }
+
     #[tokio::test]
-    async fn array_rejects_non_object_elements_as_invalid_events() -> Result<(), StorageError> {
-        let dir = tempfile::tempdir().map_err(|error| StorageError::io("创建测试目录", error))?;
-        let storage = open(&dir.path().join("boh.db"), NonZeroUsize::MIN)?;
-        storage
-            .writer
-            .call(|tx| -> Result<(), StorageError> {
-                for value in ["null", "true", "false", "1", "1.5", "\"text\"", "[]"] {
-                    let json = format!(r#"{{"values":[{{}},{value}]}}"#);
-                    assert!(matches!(
-                        array(tx, &json, "$.values"),
-                        Err(StorageError::InvalidEvent(_))
-                    ));
+    async fn master_data_rejects_mismatched_entities_and_nonpositive_revisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = open(&dir.path().join("boh.db"), NonZeroUsize::MIN).unwrap();
+        storage.writer.call(|tx| -> Result<(), StorageError> {
+            let id = "01890a5d-ac96-774b-bcce-b302099a8301";
+            let mut event = Event {
+                id: EventId::parse(id)?,
+                event_type: "MASTER_DATA_CHANGED".into(),
+                schema_version: 1,
+                aggregate_type: String::new(),
+                aggregate_id: AggregateId::parse(id)?,
+                aggregate_version: 1,
+                command_id: CommandId::parse(id)?,
+                actor_id: AggregateId::parse(id)?,
+                device_id: AggregateId::parse(id)?,
+                business_date: "2026-10-07".into(),
+                occurred_at: UnixMillis(0),
+                recorded_at: UnixMillis(0),
+                payload: String::new(),
+            };
+            for (entity, snapshot) in [
+                ("ITEM", r#"{"code":"FLOUR","name":"Flour","base_unit":"g","category":"RAW","units":[],"active":true}"#),
+                ("RECIPE", r#"{"code":"BREAD","name":"Bread","output_item_id":"01890a5d-ac96-774b-bcce-b302099a8301","versions":[{"version":1,"output_qty_per_batch":1,"lines":[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8301","qty_per_batch":1}]}],"active":true}"#),
+                ("SUPPLIER", r#"{"code":"S1","name":"Supplier","active":true}"#),
+                ("WASTE_REASON", r#"{"code":"EXPIRED","name":"Expired","active":true}"#),
+            ] {
+                event.payload = format!(r#"{{"entity":"{entity}","source":"LOCAL","snapshot":{snapshot}}}"#);
+                assert!(payload(&event.payload).is_ok());
+                for aggregate_type in ["ITEM", "RECIPE", "SUPPLIER", "WASTE_REASON"] {
+                    event.aggregate_type = aggregate_type.into();
+                    event.aggregate_version = 1;
+                    if aggregate_type != entity {
+                        assert!(matches!(apply(tx, &event), Err(StorageError::InvalidEvent(_))));
+                    }
+                    for revision in [0, -1] {
+                        event.aggregate_version = revision;
+                        assert!(matches!(apply(tx, &event), Err(StorageError::InvalidEvent(_))));
+                    }
                 }
-                assert_eq!(
-                    array(tx, r#"{"values":[{"n":2},{"n":1}]}"#, "$.values")?,
-                    [r#"{"n":2}"#, r#"{"n":1}"#]
-                );
-                assert!(array(tx, r#"{"values":[]}"#, "$.values")?.is_empty());
-                Ok(())
-            })
-            .await?;
-        storage.writer_handle.shutdown().await
+            }
+            Ok(())
+        }).await.unwrap();
+        storage.writer_handle.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -446,10 +341,11 @@ mod tests {
                 );
                 let snapshot = |name: &str, versions: &str| {
                     format!(
-                        r#"{{"code":"RECIPE","name":"{name}","output_item_id":"{item_id}","versions":[{versions}],"active":true}}"#
+                        r#"{{"entity":"RECIPE","source":"LOCAL","snapshot":{{"code":"RECIPE","name":"{name}","output_item_id":"{item_id}","versions":[{versions}],"active":true}}}}"#
                     )
                 };
-                recipe(tx, &event, &snapshot("Original", &v1))?;
+                event.payload = snapshot("Original", &v1);
+                apply(tx, &event)?;
 
                 // Catch delete/reinsert cycles even when the final rows would be identical.
                 for table in ["recipe_versions", "recipe_lines"] {
@@ -463,9 +359,11 @@ mod tests {
                 }
 
                 event.aggregate_version = 2;
-                recipe(tx, &event, &snapshot("Renamed", &v1))?;
+                event.payload = snapshot("Renamed", &v1);
+                apply(tx, &event)?;
                 event.aggregate_version = 3;
-                recipe(tx, &event, &snapshot("Renamed", &format!("{v1},{v2}")))?;
+                event.payload = snapshot("Renamed", &format!("{v1},{v2}"));
+                apply(tx, &event)?;
 
                 let mut statement = tx.prepare(
                     "SELECT v.version, v.output_qty_per_batch, l.line_no, l.qty_per_batch

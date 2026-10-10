@@ -7,6 +7,43 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+// Serde's derived struct decoder also accepts positional arrays. These JSON
+// contracts require objects at every struct boundary. Remote derives provide
+// the field decoders; this wrapper only admits maps before calling them.
+macro_rules! object_serde {
+    ($name:ident) => {
+        impl serde::Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                $name::serialize(self, serializer)
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                struct ObjectVisitor;
+                impl<'de> serde::de::Visitor<'de> for ObjectVisitor {
+                    type Value = $name;
+
+                    fn expecting(
+                        &self,
+                        formatter: &mut std::fmt::Formatter<'_>,
+                    ) -> std::fmt::Result {
+                        formatter.write_str("a JSON object")
+                    }
+
+                    fn visit_map<A: serde::de::MapAccess<'de>>(
+                        self,
+                        map: A,
+                    ) -> Result<Self::Value, A::Error> {
+                        $name::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    }
+                }
+                deserializer.deserialize_map(ObjectVisitor)
+            }
+        }
+    };
+}
+
 pub mod equipment;
 pub mod inventory;
 pub mod lot;
@@ -120,6 +157,15 @@ uuid_v7_id!(
     /// 聚合 ID（`store_events.aggregate_id`）。
     AggregateId
 );
+
+// Unit enums normally also accept externally tagged objects. Payload enum
+// fields are strings, so constrain their input before the derived decoder.
+pub(crate) fn string_enum<'de, T: Deserialize<'de>, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<T, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    T::deserialize(serde::de::value::StringDeserializer::<D::Error>::new(value))
+}
 
 // Missing keys use default(None); a present key must contain T, never null.
 pub(crate) fn present<'de, T: Deserialize<'de>, D: serde::Deserializer<'de>>(

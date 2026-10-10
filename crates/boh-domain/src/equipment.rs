@@ -17,6 +17,18 @@ pub enum EquipmentType {
 }
 
 impl EquipmentType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fridge => "FRIDGE",
+            Self::Freezer => "FREEZER",
+            Self::BlastFreezer => "BLAST_FREEZER",
+            Self::Oven => "OVEN",
+            Self::Proofer => "PROOFER",
+            Self::Mixer => "MIXER",
+            Self::Other => "OTHER",
+        }
+    }
+
     pub fn parse(value: &str) -> Result<Self, DomainError> {
         match value {
             "FRIDGE" => Ok(Self::Fridge),
@@ -32,13 +44,15 @@ impl EquipmentType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct EquipmentSnapshot {
     pub code: String,
     pub name: String,
+    #[serde(deserialize_with = "crate::string_enum")]
     pub equipment_type: EquipmentType,
     pub active: bool,
 }
+object_serde!(EquipmentSnapshot);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -130,12 +144,15 @@ pub enum MasterDataSource {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct EquipmentChanged {
+    #[serde(deserialize_with = "crate::string_enum")]
     pub entity: EquipmentEntity,
+    #[serde(deserialize_with = "crate::string_enum")]
     pub source: MasterDataSource,
     pub snapshot: EquipmentSnapshot,
 }
+object_serde!(EquipmentChanged);
 
 fn text(value: &str, field: &'static str) -> Result<(), DomainError> {
     if value.is_empty() || value.trim() != value {

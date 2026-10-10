@@ -78,11 +78,12 @@ impl ItemCategory {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct ItemUnit {
     pub unit_code: String,
     pub base_qty_per_unit: i64,
 }
+object_serde!(ItemUnit);
 
 fn item_fields(
     name: &str,
@@ -109,11 +110,13 @@ fn item_fields(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct ItemSnapshot {
     pub code: String,
     pub name: String,
+    #[serde(deserialize_with = "crate::string_enum")]
     pub base_unit: BaseUnit,
+    #[serde(deserialize_with = "crate::string_enum")]
     pub category: ItemCategory,
     #[serde(
         default,
@@ -124,6 +127,7 @@ pub struct ItemSnapshot {
     pub units: Vec<ItemUnit>,
     pub active: bool,
 }
+object_serde!(ItemSnapshot);
 
 impl ItemSnapshot {
     pub fn validate(&self) -> Result<(), DomainError> {
@@ -209,11 +213,12 @@ impl UpdateItem {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct RecipeLine {
     pub item_id: AggregateId,
     pub qty_per_batch: i64,
 }
+object_serde!(RecipeLine);
 
 fn recipe_lines(output: i64, lines: &[RecipeLine]) -> Result<(), DomainError> {
     positive(output, "output_qty_per_batch")?;
@@ -231,15 +236,16 @@ fn recipe_lines(output: i64, lines: &[RecipeLine]) -> Result<(), DomainError> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct RecipeVersion {
     pub version: i64,
     pub output_qty_per_batch: i64,
     pub lines: Vec<RecipeLine>,
 }
+object_serde!(RecipeVersion);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct RecipeSnapshot {
     pub code: String,
     pub name: String,
@@ -247,6 +253,7 @@ pub struct RecipeSnapshot {
     pub versions: Vec<RecipeVersion>,
     pub active: bool,
 }
+object_serde!(RecipeSnapshot);
 
 impl RecipeSnapshot {
     pub fn validate(&self) -> Result<(), DomainError> {
@@ -335,7 +342,7 @@ impl AddRecipeVersion {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct SupplierSnapshot {
     pub code: String,
     pub name: String,
@@ -347,6 +354,7 @@ pub struct SupplierSnapshot {
     pub contact_phone: Option<String>,
     pub active: bool,
 }
+object_serde!(SupplierSnapshot);
 
 impl SupplierSnapshot {
     pub fn validate(&self) -> Result<(), DomainError> {
@@ -423,12 +431,13 @@ impl UpdateSupplier {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct WasteReasonSnapshot {
     pub code: String,
     pub name: String,
     pub active: bool,
 }
+object_serde!(WasteReasonSnapshot);
 
 impl WasteReasonSnapshot {
     pub fn validate(&self) -> Result<(), DomainError> {
@@ -484,28 +493,34 @@ impl UpdateWasteReason {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(
+    remote = "Self",
     tag = "entity",
     rename_all = "SCREAMING_SNAKE_CASE",
     deny_unknown_fields
 )]
 pub enum MasterDataChanged {
     Item {
+        #[serde(deserialize_with = "crate::string_enum")]
         source: MasterDataSource,
         snapshot: ItemSnapshot,
     },
     Recipe {
+        #[serde(deserialize_with = "crate::string_enum")]
         source: MasterDataSource,
         snapshot: RecipeSnapshot,
     },
     Supplier {
+        #[serde(deserialize_with = "crate::string_enum")]
         source: MasterDataSource,
         snapshot: SupplierSnapshot,
     },
     WasteReason {
+        #[serde(deserialize_with = "crate::string_enum")]
         source: MasterDataSource,
         snapshot: WasteReasonSnapshot,
     },
 }
+object_serde!(MasterDataChanged);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Item {
