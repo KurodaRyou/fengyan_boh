@@ -1,45 +1,10 @@
 //! Waste requests and the frozen WASTE_LOGGED@1 payload.
 
-use serde::de::{MapAccess, Visitor, value::MapAccessDeserializer};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 
 use crate::lot::LotId;
 use crate::receiving::ReceiptInput;
 use crate::{AggregateId, CommandId, DomainError, EventId, UnixMillis};
-
-// Serde's derived struct decoder also accepts positional arrays. These JSON
-// contracts require objects at every struct boundary. Remote derives provide
-// the field decoders; this wrapper only admits maps before calling them.
-macro_rules! object_serde {
-    ($name:ident) => {
-        impl Serialize for $name {
-            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-                $name::serialize(self, serializer)
-            }
-        }
-
-        impl<'de> Deserialize<'de> for $name {
-            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-                struct ObjectVisitor;
-                impl<'de> Visitor<'de> for ObjectVisitor {
-                    type Value = $name;
-
-                    fn expecting(
-                        &self,
-                        formatter: &mut std::fmt::Formatter<'_>,
-                    ) -> std::fmt::Result {
-                        formatter.write_str("a JSON object")
-                    }
-
-                    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
-                        $name::deserialize(MapAccessDeserializer::new(map))
-                    }
-                }
-                deserializer.deserialize_map(ObjectVisitor)
-            }
-        }
-    };
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(remote = "Self", deny_unknown_fields)]
@@ -51,7 +16,6 @@ pub struct WasteRequestLine {
         deserialize_with = "crate::present"
     )]
     pub lot_id: Option<LotId>,
-    #[serde(deserialize_with = "input_object")]
     pub input: ReceiptInput,
     pub reason_code: String,
 }
@@ -73,7 +37,6 @@ pub struct WasteCommandLine {
         deserialize_with = "crate::present"
     )]
     pub lot_id: Option<LotId>,
-    #[serde(deserialize_with = "input_object")]
     pub input: ReceiptInput,
     pub reason_code: String,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -134,12 +97,13 @@ impl PrecheckWaste {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[serde(remote = "Self", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AllocationSource {
     Specified,
     Fifo,
     Shortfall,
 }
+string_enum_serde!(AllocationSource);
 
 impl AllocationSource {
     pub fn as_str(self) -> &'static str {
@@ -240,7 +204,6 @@ struct WireWasteLine {
     )]
     lot_id: Option<LotId>,
     qty: i64,
-    #[serde(deserialize_with = "input_object")]
     input: ReceiptInput,
     reason_code: String,
     item_book_qty: i64,
@@ -356,22 +319,6 @@ pub struct WasteRecord {
 
 fn is_false(value: &bool) -> bool {
     !value
-}
-
-fn input_object<'de, D: Deserializer<'de>>(deserializer: D) -> Result<ReceiptInput, D::Error> {
-    struct InputVisitor;
-    impl<'de> Visitor<'de> for InputVisitor {
-        type Value = ReceiptInput;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("an input object")
-        }
-
-        fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
-            ReceiptInput::deserialize(MapAccessDeserializer::new(map))
-        }
-    }
-    deserializer.deserialize_map(InputVisitor)
 }
 
 fn validate_input(input: &ReceiptInput, reason_code: &str) -> Result<(), DomainError> {
