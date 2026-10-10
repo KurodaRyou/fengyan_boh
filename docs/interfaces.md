@@ -210,6 +210,17 @@ pub fn next_closing_backup(
   - 当地重复的时刻只取第一次（较早的那个）；同一天的第二次不算触发时刻。
   - 结果或换算超出可表示范围：`OutOfRange`。
 
+## boh-domain：报损 payload（`boh_domain::waste`）
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WasteLogged { /* 字段由实现决定 */ }
+```
+
+- `WASTE_LOGGED@1` 的 payload 类型；写入与 `projections::apply` 都用它序列化和解析。结构见 domain.md「事件目录」「报损接口」。
+- 锁定测试对 `golden/WASTE_LOGGED@1/` 的每份样本做 `serde_json::from_str::<WasteLogged>` 再 `serde_json::to_string`，结果必须与样本逐字节相同（含被吸收的分支：写入路径随盘点切片才产生它们）。
+- 解析拒绝 domain.md 规定以外的结构：未知字段、`alloc` 与 `absorbed_by_event_id` 同时出现或都不出现、`lot_id` 与 `lot_book_qty` 只出现一个。
+
 ## boh-app：Router 测试入口
 
 ```rust

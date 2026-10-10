@@ -262,7 +262,7 @@ occurred_at = recorded_at − lag
   - 指定的批次属于其他物料：`400 LOT_ITEM_MISMATCH`，`details` 为 `{"line", "item_id", "lot_id"}`。
   - 物料还没有任何批次（从未收货入库）：`409 ITEM_HAS_NO_LOTS`，`details` 为 `{"line", "item_id"}`。带确认标记也拒绝：确认只处理数量不足，不授予报损资格。
     - 依据是 `inventory_lots` 中有没有该物料的批次，不是 `inventory_on_hand` 的行（视图对每个物料都有一行）。批次由收货建立（生产产出随生产切片加入），余量为 0 后也保留，所以曾经入库、现已耗尽的物料照常按下方规则处理。
-  - 数量越界：逐行处理中的账面、扣减后的批次余量或账外缺口超出 `i64`：`400 VALIDATION_FAILED`，`details` 为 `{}`。整条命令不入账，前面的正常行也不入账；不得绕回、截断或钳制后继续。
+  - 数量越界：逐行处理中的物料净账面（含最后一行扣减之后的）、批次余量或账外缺口超出 `i64`，即使各批次余量和账外缺口本身都可表示：`400 VALIDATION_FAILED`，`details` 为 `{}`。整条命令不入账，前面的正常行也不入账；不得绕回、截断或钳制后继续。
   - `UNKNOWN_UNIT`、`UNIT_CONVERSION_CHANGED`：同收货。
   - `line` 是行在 `lines` 中的下标。
 - **逐行处理**：按 `lines` 顺序，每行看到的账面是同一命令中前面各行处理之后的值。
