@@ -81,7 +81,7 @@ pub mod testing {
 - `open_reader`：只读连接，已设好全部 PRAGMA 和 `query_only = ON`。
 - `migrate`：与 `open` 内部相同的迁移。
 - `rebuild_projections`：在 `conn` 上以 `BEGIN IMMEDIATE` 执行与 `Writer::rebuild_projections` 相同的重建。`conn` 须由 `open_writer` 打开。
-- 本期没有写入口的事件（如 `source = HQ_PACKAGE` 的 `MASTER_DATA_CHANGED`），锁定测试经 `open_writer` 直接写入 `processed_commands` 和 `store_events`（不写 `seq` 列），再 `rebuild_projections` 核对投影。
+- 本期没有写入口的事件（如 `source = HQ_PACKAGE` 的 `MASTER_DATA_CHANGED`、带被吸收行的 `WASTE_LOGGED`），锁定测试经 `open_writer` 直接写入 `processed_commands` 和 `store_events`（不写 `seq` 列），再 `rebuild_projections` 核对投影。
 - 这些函数都是转发到 crate 内部函数的独立函数，不用 `pub use`。
   - clippy 按函数定义禁用；重导出会让 crate 内部对原函数的调用也被禁用。
 - 两份 `clippy.toml` 禁用这些函数，只有锁定测试及 `spec_support/` 可以 `#[allow]`。

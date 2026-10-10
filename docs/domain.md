@@ -260,6 +260,9 @@ occurred_at = recorded_at − lag
   - 报损原因不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": "WASTE_REASON", "code"}`。
   - 停用的物料、报损原因照常受理；指定余量为 0 或为负的批次照常受理（按下方规则需要确认）。
   - 指定的批次属于其他物料：`400 LOT_ITEM_MISMATCH`，`details` 为 `{"line", "item_id", "lot_id"}`。
+  - 物料还没有任何批次（从未收货入库）：`409 ITEM_HAS_NO_LOTS`，`details` 为 `{"line", "item_id"}`。带确认标记也拒绝：确认只处理数量不足，不授予报损资格。
+    - 依据是 `inventory_lots` 中有没有该物料的批次，不是 `inventory_on_hand` 的行（视图对每个物料都有一行）。批次由收货建立（生产产出随生产切片加入），余量为 0 后也保留，所以曾经入库、现已耗尽的物料照常按下方规则处理。
+  - 数量越界：逐行处理中的账面、扣减后的批次余量或账外缺口超出 `i64`：`400 VALIDATION_FAILED`，`details` 为 `{}`。整条命令不入账，前面的正常行也不入账；不得绕回、截断或钳制后继续。
   - `UNKNOWN_UNIT`、`UNIT_CONVERSION_CHANGED`：同收货。
   - `line` 是行在 `lines` 中的下标。
 - **逐行处理**：按 `lines` 顺序，每行看到的账面是同一命令中前面各行处理之后的值。
@@ -299,7 +302,7 @@ occurred_at = recorded_at − lag
 
 - 请求体只有 `lines`，每项 `{item_id, lot_id?, input, reason_code}`，取值规则同正式提交；不接受 `command_id`、`captured_at`、`sent_at` 和 `confirm_shortage`。
 - 在一个读事务中执行，不写事件、`processed_commands` 或任何表；没有幂等处理。
-- 校验与正式提交相同（取值、引用、`LOT_ITEM_MISMATCH`、单位），错误码与 `details` 也相同。不做时间校准，也不做吸收判定（没有发生时间）。
+- 校验与正式提交相同（取值、引用、`LOT_ITEM_MISMATCH`、`ITEM_HAS_NO_LOTS`、单位、数量越界），错误码与 `details` 也相同。不做时间校准，也不做吸收判定（没有发生时间）。
 - 成功的 `data` 是 `{"lines": [{line, item_id, lot_id?, qty, item_book_qty, lot_book_qty?, needs_confirmation, alloc}]}`，每行一项：按正式提交的逐行处理计算，假设全部行都不被吸收、需要确认的行都已确认。`warnings` 为空数组。
 - 结果是按当前账面的估算：正式提交在写事务内重新计算，两次请求之间账面可能变化。界面把 `alloc` 显示为「按当前账面预计扣减」。
 
@@ -406,7 +409,7 @@ occurred_at = recorded_at − lag
 - **账面不足**：
   - 指定批次时，差额留在该批次上（余量为负）；
   - 未指定批次时，扣完该物料全部余量大于 0 的批次后，剩余部分记入账外缺口。
-  - 报损在账面不足时先提示、经员工确认后入账（见「报损接口」）。
+  - 报损在账面不足时先提示、经员工确认后入账（见「报损接口」）；还没有任何批次的物料不能报损。
   - 下一次包含该批次或该物料的盘点会校准它们（见「盘点」）。
 - **负余量**：批次余量可以为负，表示账面少于实物。FIFO 跳过余量不大于 0 的批次。
 - 分配结果连同来源写进 payload：`alloc[{lot_id?, qty, source}]`。
@@ -663,6 +666,9 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 | 有负批次时不指定批次 | 批次 A −3、B 10（净账面 7）；报损 8 g，不指定批次 | 需要确认；确认后 `B 8 FIFO`；A **−3**、B **2**，账外缺口 **0**，账面 **−1** |
 | 不足记入账外缺口 | 只有批次 A 5；报损 8 g，不指定批次 | 需要确认；确认后 `A 5 FIFO` + `3 SHORTFALL`；A **0**，账外缺口 **−3**，账面 **−3**；不返回 `STOCK_SHORTFALL` |
 | 同一命令的后续行 | 批次 A 5、B 10（A 在前）；一次报损两行：`lines[0]` 不指定批次 8 g，`lines[1]` 指定 A 1 g | `409` 只列 `line` **1**（`lot_book_qty` **0**、`item_book_qty` **7**）；确认后 `lines[0]` 为 `A 5 FIFO` + `B 3 FIFO`，`lines[1]` 为 `A 1 SPECIFIED`；A **−1**、B **7** |
+| 从未收货的物料 | 面粉已有批次；糖已建档但从未收货；报损糖 1 g（带或不带确认），或一次报损面粉 1 g 和糖 1 g | `409 ITEM_HAS_NO_LOTS`，列出糖所在的行；整条不入账；预检同样拒绝 |
+| 收货后耗尽 | 只有批次 A 5，报损 8 g 确认后 A **0**、账外缺口 −3；再报 2 g，不指定批次 | 照常需要确认；确认后整行 `2 SHORTFALL`，账外缺口 **−5** |
+| 数量越界 | 批次 A 的余量已是 `i64::MIN + 2`；指定 A 报 3 g（确认）；或同一命令前面另有一条正常行 | `400 VALIDATION_FAILED`；整条不入账；指定 A 报 2 g（确认）照常入账，A 为 `i64::MIN`。账外缺口累加越界同样处理 |
 | 预检只读 | 批次 A 5；预检报损 8 g，指定 A | 返回该行 `needs_confirmation` **true**、`lot_book_qty` **5**、预计 `A 8 SPECIFIED`；事件、投影和 `processed_commands` 不变 |
 | 确认后不足加大 | 批次 A 5；预检指定 A 报 8 后员工确认；提交前另一台平板报损 A 2 已入账；带确认提交 | 照常入账，`lot_book_qty` **3**（提交时的值）；A **−5** |
 | 提交时新出现的不足 | 批次 A 5；预检指定 A 报 4 不需要确认；提交前另一台平板报损 A 2 已入账；不带确认提交 | `409 WASTE_CONFIRMATION_REQUIRED`（`lot_book_qty` **3**）；不入账 |
