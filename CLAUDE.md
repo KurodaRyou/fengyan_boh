@@ -16,7 +16,7 @@ Review 时以 AGENTS.md 的「不可违反的规则」为检查清单，逐条�
 开发顺序第 4.3 步的 review prompt（AGENTS.md「开发顺序」第 6 步）：
 - 写明切片分支、比对基准、本切片范围，以及实现 prompt 要求顺带落实的改动和小改动（逐条列出，review 时核对是否落实）；切片需要进程级黑盒验收时写明（AGENTS.md「测试分工」）。
 - 不写设计讨论过程和对实现方式的设想；核对清单由 AGENTS.md 和本文件规定，不在 prompt 中改写。
-- 末尾留位置给人粘贴实现 agent 的交付说明。
+- 末尾留位置给人粘贴实现 agent 的交付说明。交付说明只是实现方的陈述：改动范围以 git 为准，说明中的结论不代替核对。
 - 在 review 会话以外收到交付说明时，不开始 review，给出 review prompt。
 
 ## Engineering 插件
