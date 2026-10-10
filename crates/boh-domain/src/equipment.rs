@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{AggregateId, CommandId, DomainError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[serde(remote = "Self", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum EquipmentType {
     Fridge,
     Freezer,
@@ -15,6 +15,7 @@ pub enum EquipmentType {
     Mixer,
     Other,
 }
+string_enum_serde!(EquipmentType);
 
 impl EquipmentType {
     pub fn as_str(self) -> &'static str {
@@ -48,7 +49,6 @@ impl EquipmentType {
 pub struct EquipmentSnapshot {
     pub code: String,
     pub name: String,
-    #[serde(deserialize_with = "crate::string_enum")]
     pub equipment_type: EquipmentType,
     pub active: bool,
 }
@@ -130,25 +130,27 @@ impl Equipment {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub enum EquipmentEntity {
     #[serde(rename = "EQUIPMENT")]
     Equipment,
 }
+string_enum_serde!(EquipmentEntity);
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub enum MasterDataSource {
     #[serde(rename = "LOCAL")]
     Local,
     #[serde(rename = "HQ_PACKAGE")]
     HqPackage,
 }
+string_enum_serde!(MasterDataSource);
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(remote = "Self", deny_unknown_fields)]
 pub struct EquipmentChanged {
-    #[serde(deserialize_with = "crate::string_enum")]
     pub entity: EquipmentEntity,
-    #[serde(deserialize_with = "crate::string_enum")]
     pub source: MasterDataSource,
     pub snapshot: EquipmentSnapshot,
 }

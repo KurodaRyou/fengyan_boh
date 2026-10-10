@@ -97,12 +97,13 @@ impl PrecheckWaste {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[serde(remote = "Self", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AllocationSource {
     Specified,
     Fifo,
     Shortfall,
 }
+string_enum_serde!(AllocationSource);
 
 impl AllocationSource {
     pub fn as_str(self) -> &'static str {

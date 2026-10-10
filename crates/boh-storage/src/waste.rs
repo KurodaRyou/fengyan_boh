@@ -153,37 +153,43 @@ fn payload(json: &str) -> Result<WasteLogged, StorageError> {
 #[cfg(test)]
 mod tests {
     use super::payload;
+    use crate::tests::assert_strict_payload;
 
     #[test]
     fn decoder_rejects_coerced_types_nulls_duplicates_and_unknown_fields() {
         let good = r#"{"lines":[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8501","qty":1,"input":{"qty":1,"unit_code":"g","base_qty_per_unit":1},"reason_code":"EXPIRED","item_book_qty":3,"alloc":[{"lot_id":"RAW-FLOUR-20261006-001","qty":1,"source":"FIFO"}]}]}"#;
-        assert_eq!(payload(good).unwrap().lines.len(), 1);
+        assert_strict_payload(payload, good, &[], "解析报损事件 payload");
+        let shortfall = good
+            .replace("\"lot_id\":\"RAW-FLOUR-20261006-001\",", "")
+            .replace("\"FIFO\"", "\"SHORTFALL\"");
+        let specified = good
+            .replace(
+                "\"qty\":1,\"input\"",
+                "\"lot_id\":\"RAW-FLOUR-20261006-001\",\"lot_book_qty\":3,\"qty\":1,\"input\"",
+            )
+            .replace("\"FIFO\"", "\"SPECIFIED\"");
+        let absorbed = good.replace(
+            "\"alloc\":[{\"lot_id\":\"RAW-FLOUR-20261006-001\",\"qty\":1,\"source\":\"FIFO\"}]",
+            "\"absorbed_by_event_id\":\"01890a5d-ac96-774b-bcce-b302099a8502\"",
+        );
+        for json in [&shortfall, &specified, &absorbed] {
+            assert_strict_payload(payload, json, &[], "解析报损事件 payload");
+        }
         for json in [
-            good.replace("\"qty\":1", "\"qty\":true"),
-            good.replace("\"qty\":1", "\"qty\":1.0"),
-            good.replace("\"qty\":1", "\"qty\":null"),
             good.replace("\"qty\":1", "\"qty\":-1"),
-            good.replace("\"item_book_qty\":3", "\"item_book_qty\":null"),
-            good.replace(
-                "\"item_book_qty\":3",
-                "\"item_book_qty\":3,\"item_book_qty\":3",
-            ),
             good.replace("\"input\":", "\"lot_id\":null,\"input\":"),
             good.replace("\"input\":", "\"lot_book_qty\":null,\"input\":"),
             good.replace("\"alloc\":[", "\"absorbed_by_event_id\":null,\"alloc\":["),
-            good.replace("\"alloc\":[", "\"alloc\":[null,"),
-            good.replace("\"alloc\":[", "\"unknown\":true,\"alloc\":["),
-            good.replace("\"lot_id\":\"RAW-FLOUR-20261006-001\"", "\"lot_id\":null"),
-            good.replace("\"source\":\"FIFO\"", "\"source\":\"SHORTFALL\""),
-            good.replace("\"source\":\"FIFO\"", "\"source\":\"FIFO\",\"unknown\":1"),
             good.replace(
-                "\"source\":\"FIFO\"",
-                "\"source\":\"FIFO\",\"source\":\"FIFO\"",
+                "\"alloc\":[",
+                "\"absorbed_by_event_id\":\"01890a5d-ac96-774b-bcce-b302099a8502\",\"alloc\":[",
             ),
+            good.replace("\"alloc\":[", "\"alloc\":[null,"),
+            good.replace("\"source\":\"FIFO\"", "\"source\":\"SHORTFALL\""),
             good.replace("\"qty\":1,\"source\"", "\"qty\":2,\"source\""),
             good.replace("\"base_qty_per_unit\":1", "\"base_qty_per_unit\":2"),
-            good.replace("\"lines\":[", "\"unknown\":1,\"lines\":["),
             good.replace("\"lines\":[", "\"lines\":[false,"),
+            "{\"lines\":[]}".into(),
         ] {
             assert!(payload(&json).is_err(), "{json}");
         }

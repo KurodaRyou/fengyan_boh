@@ -111,7 +111,12 @@ pub(crate) mod tests {
                             wrong_types.push(serde_json::from_str(&format!("{number}.0")).unwrap());
                         }
                         Value::Bool(_) => wrong_types.extend([json!(1), json!("true")]),
-                        Value::String(_) => wrong_types.extend([json!(1), json!(true)]),
+                        Value::String(text) => wrong_types.extend([
+                            json!(1),
+                            json!(true),
+                            json!({ text: null }),
+                            json!([text]),
+                        ]),
                         Value::Array(_) => wrong_types.extend([json!({}), json!("array")]),
                         Value::Object(_) => wrong_types.extend([json!([]), json!("object")]),
                         Value::Null => panic!("valid payloads cannot contain null"),

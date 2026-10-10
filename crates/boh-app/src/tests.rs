@@ -21,6 +21,9 @@ mod receiving;
 #[path = "diagnostic_tests.rs"]
 mod diagnostics;
 
+#[path = "strict_json_tests.rs"]
+mod strict_json;
+
 struct Node {
     _dir: tempfile::TempDir,
     storage: Storage,

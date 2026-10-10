@@ -44,6 +44,25 @@ macro_rules! object_serde {
     };
 }
 
+// Remote derives preserve the enum's wire names. Enforce string input on the
+// type itself so every payload and command field shares the same contract.
+macro_rules! string_enum_serde {
+    ($name:ident) => {
+        impl serde::Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                $name::serialize(self, serializer)
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+                $name::deserialize(serde::de::value::StringDeserializer::<D::Error>::new(value))
+            }
+        }
+    };
+}
+
 pub mod equipment;
 pub mod inventory;
 pub mod lot;
@@ -158,15 +177,6 @@ uuid_v7_id!(
     AggregateId
 );
 
-// Unit enums normally also accept externally tagged objects. Payload enum
-// fields are strings, so constrain their input before the derived decoder.
-pub(crate) fn string_enum<'de, T: Deserialize<'de>, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<T, D::Error> {
-    let value = String::deserialize(deserializer)?;
-    T::deserialize(serde::de::value::StringDeserializer::<D::Error>::new(value))
-}
-
 // Missing keys use default(None); a present key must contain T, never null.
 pub(crate) fn present<'de, T: Deserialize<'de>, D: serde::Deserializer<'de>>(
     deserializer: D,
@@ -180,6 +190,40 @@ mod tests {
 
     const V7: &str = "01890a5d-ac96-774b-bcce-b302099a8057";
     const V4: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn assert_string_enum<T: serde::de::DeserializeOwned + Serialize>(variants: &[&str]) {
+        use serde_json::json;
+
+        for variant in variants {
+            let good = json!(variant);
+            let value: T = serde_json::from_value(good.clone()).unwrap();
+            assert_eq!(serde_json::to_value(value).unwrap(), good);
+            for bad in [json!({ *variant: null }), json!([variant])] {
+                assert!(serde_json::from_value::<T>(bad.clone()).is_err(), "{bad}");
+            }
+        }
+        for bad in [json!(null), json!(true), json!(1), json!("UNKNOWN")] {
+            assert!(serde_json::from_value::<T>(bad.clone()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn every_wire_enum_accepts_only_strings_and_preserves_all_variant_names() {
+        assert_string_enum::<equipment::EquipmentType>(&[
+            "FRIDGE",
+            "FREEZER",
+            "BLAST_FREEZER",
+            "OVEN",
+            "PROOFER",
+            "MIXER",
+            "OTHER",
+        ]);
+        assert_string_enum::<equipment::EquipmentEntity>(&["EQUIPMENT"]);
+        assert_string_enum::<equipment::MasterDataSource>(&["LOCAL", "HQ_PACKAGE"]);
+        assert_string_enum::<master_data::BaseUnit>(&["g", "ml", "pcs"]);
+        assert_string_enum::<master_data::ItemCategory>(&["RAW", "SEMI", "FINISHED"]);
+        assert_string_enum::<waste::AllocationSource>(&["SPECIFIED", "FIFO", "SHORTFALL"]);
+    }
 
     #[test]
     fn accepts_v7() {

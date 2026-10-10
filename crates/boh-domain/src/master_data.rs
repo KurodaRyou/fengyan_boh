@@ -22,6 +22,7 @@ fn positive(value: i64, field: &'static str) -> Result<(), DomainError> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub enum BaseUnit {
     #[serde(rename = "g")]
     G,
@@ -30,6 +31,7 @@ pub enum BaseUnit {
     #[serde(rename = "pcs")]
     Pcs,
 }
+string_enum_serde!(BaseUnit);
 
 impl BaseUnit {
     pub fn as_str(self) -> &'static str {
@@ -51,12 +53,13 @@ impl BaseUnit {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[serde(remote = "Self", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ItemCategory {
     Raw,
     Semi,
     Finished,
 }
+string_enum_serde!(ItemCategory);
 
 impl ItemCategory {
     pub fn as_str(self) -> &'static str {
@@ -114,9 +117,7 @@ fn item_fields(
 pub struct ItemSnapshot {
     pub code: String,
     pub name: String,
-    #[serde(deserialize_with = "crate::string_enum")]
     pub base_unit: BaseUnit,
-    #[serde(deserialize_with = "crate::string_enum")]
     pub category: ItemCategory,
     #[serde(
         default,
@@ -500,22 +501,18 @@ impl UpdateWasteReason {
 )]
 pub enum MasterDataChanged {
     Item {
-        #[serde(deserialize_with = "crate::string_enum")]
         source: MasterDataSource,
         snapshot: ItemSnapshot,
     },
     Recipe {
-        #[serde(deserialize_with = "crate::string_enum")]
         source: MasterDataSource,
         snapshot: RecipeSnapshot,
     },
     Supplier {
-        #[serde(deserialize_with = "crate::string_enum")]
         source: MasterDataSource,
         snapshot: SupplierSnapshot,
     },
     WasteReason {
-        #[serde(deserialize_with = "crate::string_enum")]
         source: MasterDataSource,
         snapshot: WasteReasonSnapshot,
     },
