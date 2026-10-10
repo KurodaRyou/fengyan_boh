@@ -238,6 +238,8 @@ scripts/        CI 扫描脚本。
 - 当前状态（库存余量等）放在**投影表**中，在产生事件的**同一事务内**同步更新。投影必须能从事件流按 `seq` 完整重建。
   - `projections::apply` 只读事件本身（`store_events` 的列和 payload），不查主数据，不重新做决策（分配、吸收）。在线写入和 `rebuild-projections` 共用同一个 `apply`。
   - 业务决策在 `append` 之前完成，结果写进 payload。
+  - `projections::apply` 用 `boh-domain` 的 payload 类型经 `serde_json` 解析 payload，不手写 JSON 结构校验。
+    - golden 锁定的类型同时约束写入端和重放端；upcast 在类型上进行。
 - 主数据也走事件流（`MASTER_DATA_CHANGED`），主数据表是投影。
   例外：员工凭据、设备注册、会话等认证状态表不进事件流、不同步、不参与重建。
 - 事件 payload 结构一旦发布不得修改：改结构只能升 `schema_version`，再写 upcast。
