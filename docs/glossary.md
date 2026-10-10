@@ -44,6 +44,8 @@
 | Manufacturer lot number | 生产商批号 | 包装上由生产商印的批号（`manufacturer_lot_no`），可选，不作批次主键；不是供应商的批号 | domain「批次」 |
 | Allocation | 分配 | 把一笔扣减落到具体批次（或账外缺口）的结果，写进 payload 的 `alloc`，重放时不重新计算 | domain「批次」 |
 | Off-book shortfall | 账外缺口 | 未指定批次的扣减超过全部正余量批次时，未落到批次的不足部分；下一次盘点该物料时清零 | domain「批次」 |
+| Precheck | 预检 | 正式提交报损前的只读试算：返回每行的账面、是否需要确认和按当前账面预计的分配，不写任何内容 | domain「报损接口」 |
+| Shortage confirmation | 不足确认 | 员工确认报损行的数量确实发生，允许账面不足时入账；不绑定预检时的账面或分配 | domain「报损接口」 |
 | Count absorption | 盘点吸收 | 实物发生在某次盘点观察时点之前、却在盘点之后才入账的扣减（及对盘点时已存在批次的纠错），已被盘点数计入，因此不再改动库存，只更正报表 | domain「盘点吸收」 |
 | Reversal | 冲销 | 追加一条 `EVENT_REVERSED`，整条抵消原事件 | domain「纠错」 |
 | Quantity correction | 数量更正 | 追加一条 `QUANTITY_CORRECTED`，只改数量并保持原批次 | domain「纠错」 |
