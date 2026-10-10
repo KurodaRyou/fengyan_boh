@@ -138,6 +138,7 @@ dependencies = [
  "boh-domain",
  "jiff",
  "rusqlite",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
