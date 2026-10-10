@@ -1,6 +1,6 @@
 //! Temperature commands, query parameters and the frozen TEMPERATURE_LOGGED@1 payload.
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
 use crate::{AggregateId, CommandId, DomainError, UnixMillis};
 
@@ -13,7 +13,7 @@ pub struct LogTemperature {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "present_note"
+        deserialize_with = "crate::present"
     )]
     pub note: Option<String>,
     pub captured_at: UnixMillis,
@@ -81,11 +81,6 @@ pub struct TemperatureReading {
     pub recorded_at: UnixMillis,
     pub actor_id: AggregateId,
     pub device_id: AggregateId,
-}
-
-// Missing notes use the field default; a present note must be a string, never null.
-fn present_note<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
-    String::deserialize(deserializer).map(Some)
 }
 
 fn validate_reading(celsius_x10: i64, note: Option<&str>) -> Result<(), DomainError> {

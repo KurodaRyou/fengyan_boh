@@ -1,6 +1,6 @@
 //! Remaining master data commands and frozen full snapshots.
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
 use crate::equipment::MasterDataSource;
 use crate::{AggregateId, CommandId, DomainError};
@@ -19,15 +19,6 @@ fn positive(value: i64, field: &'static str) -> Result<(), DomainError> {
     } else {
         Ok(())
     }
-}
-
-// Missing keys use default(None); a present key must contain T, never null.
-fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    T::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,7 +117,7 @@ pub struct ItemSnapshot {
     pub category: ItemCategory,
     #[serde(
         default,
-        deserialize_with = "present",
+        deserialize_with = "crate::present",
         skip_serializing_if = "Option::is_none"
     )]
     pub default_shelf_life_ms: Option<i64>,
@@ -156,7 +147,7 @@ pub struct CreateItem {
     pub category: ItemCategory,
     #[serde(
         default,
-        deserialize_with = "present",
+        deserialize_with = "crate::present",
         skip_serializing_if = "Option::is_none"
     )]
     pub default_shelf_life_ms: Option<i64>,
@@ -190,7 +181,7 @@ pub struct UpdateItem {
     pub category: ItemCategory,
     #[serde(
         default,
-        deserialize_with = "present",
+        deserialize_with = "crate::present",
         skip_serializing_if = "Option::is_none"
     )]
     pub default_shelf_life_ms: Option<i64>,
@@ -350,7 +341,7 @@ pub struct SupplierSnapshot {
     pub name: String,
     #[serde(
         default,
-        deserialize_with = "present",
+        deserialize_with = "crate::present",
         skip_serializing_if = "Option::is_none"
     )]
     pub contact_phone: Option<String>,
@@ -376,7 +367,7 @@ pub struct CreateSupplier {
     pub name: String,
     #[serde(
         default,
-        deserialize_with = "present",
+        deserialize_with = "crate::present",
         skip_serializing_if = "Option::is_none"
     )]
     pub contact_phone: Option<String>,
@@ -405,7 +396,7 @@ pub struct UpdateSupplier {
     pub name: String,
     #[serde(
         default,
-        deserialize_with = "present",
+        deserialize_with = "crate::present",
         skip_serializing_if = "Option::is_none"
     )]
     pub contact_phone: Option<String>,

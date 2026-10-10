@@ -8,6 +8,7 @@ mod migrate;
 mod projections;
 mod readers;
 pub mod store;
+mod waste;
 mod writer;
 
 pub mod backup;

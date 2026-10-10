@@ -24,6 +24,7 @@ use boh_domain::master_data::*;
 use boh_domain::receiving::CreateReceipt;
 use boh_domain::temperature::{LogTemperature, TemperatureQuery};
 use boh_domain::time::TimeError;
+use boh_domain::waste::{LogWaste, PrecheckWaste};
 
 /// 所有接口的统一响应格式：`{ "success", "data", "warnings", "error" }`。
 #[derive(Debug, Serialize)]
@@ -166,6 +167,8 @@ pub fn router(state: AppState) -> Router {
             get(list_temperature_readings).post(log_temperature),
         )
         .route("/api/v1/receipts", post(create_receipt))
+        .route("/api/v1/waste-records", post(log_waste))
+        .route("/api/v1/waste-records/precheck", post(precheck_waste))
         .route("/api/v1/inventory", get(list_inventory))
         .route("/api/v1/lots/{lot_id}", get(lookup_lot))
         .route("/api/v1/items", get(list_items).post(create_item))
@@ -270,6 +273,26 @@ async fn create_receipt(
     Ok(Json(
         service::receiving::create(state, actor, command).await?,
     ))
+}
+
+async fn log_waste(
+    State(state): State<AppState>,
+    actor: Actor,
+    body: Result<Json<LogWaste>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Json(command) = body.map_err(|_| ApiError::validation())?;
+    command.validate().map_err(|_| ApiError::validation())?;
+    Ok(Json(service::waste::log(state, actor, command).await?))
+}
+
+async fn precheck_waste(
+    State(state): State<AppState>,
+    actor: Actor,
+    body: Result<Json<PrecheckWaste>, JsonRejection>,
+) -> Result<Json<Envelope<Value>>, ApiError> {
+    let Json(request) = body.map_err(|_| ApiError::validation())?;
+    request.validate().map_err(|_| ApiError::validation())?;
+    Ok(ok(service::waste::precheck(state, actor, request).await?))
 }
 
 async fn list_items(

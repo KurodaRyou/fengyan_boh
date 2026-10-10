@@ -39,6 +39,7 @@ pub(crate) fn apply(tx: &Transaction<'_>, event: &Event) -> Result<(), StorageEr
         }
         ("TEMPERATURE_LOGGED", 1, "TEMPERATURE_READING") => apply_temperature(tx, event),
         ("GOODS_RECEIVED", 2, "RECEIPT") => apply_receipt(tx, event),
+        ("WASTE_LOGGED", 1, "WASTE_RECORD") => crate::waste::apply(tx, event),
         _ => Err(StorageError::InvalidEvent(
             "unsupported event type or version".into(),
         )),
