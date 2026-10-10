@@ -1,6 +1,6 @@
 //! 锁定测试：库存明细查询与批次查询。规则见 docs/domain.md「库存明细查询」「批次查询」「批次」「盘点」「投影表」「时间」，
 //! AGENTS.md「HTTP 约定」「ID 与时间」，接口见 docs/interfaces.md。
-//! 余量为 0 或为负的批次、账外缺口要由报损产生，随报损切片锁定。
+//! 余量为 0 或为负的批次、账外缺口由报损产生（docs/domain.md「报损接口」）。
 
 mod spec_support;
 
@@ -428,6 +428,89 @@ async fn detail_requires_identity_and_does_not_write() {
     }
 
     assert_eq!(node.state(), before);
+}
+
+// 库存明细与批次查询中余量为 0、为负的批次和账外缺口（由报损产生）：当天一次收货面粉三行，A（…-001）5 g、B（…-002）10 g、
+// C（…-003）3 g。指定 A 报 5（A 0）；指定 B 报 12（确认，B −2）；不指定批次报 4（确认：净账面 1，FIFO 跳过 A、B，扣 C 3，
+// 剩余 1 记入账外缺口）。之后再收货建 D（…-004）6 g。
+// - 库存明细：lots 只列余量不为 0 的批次，含负余量，按 FIFO 顺序——B（−2）在 D（6）之前：B 的流水号更小，
+//   负余量批次不排到最后；余量为 0 的 A、C 不列。unallocated_qty 为 −1，on_hand_qty 为批次余量之和加账外缺口：3。
+// - 批次查询：余量为 0 的 A、C 和负余量的 B 都能查到（盘点补加历史批次用）。
+#[tokio::test]
+async fn zero_and_negative_lots_and_unallocated_qty_are_reported() {
+    let node = node();
+    let flour = node.item(1, "FLOUR").await;
+    let supplier = node.supplier(2).await;
+    node.write(
+        &MANAGER,
+        Method::POST,
+        "/api/v1/waste-reasons",
+        json!({ "command_id": cmd(3), "code": "EXPIRED", "name": "过期", "active": true }),
+    )
+    .await;
+    let lots = node
+        .receive(
+            4,
+            &supplier,
+            vec![
+                rline(&flour, 5, "2026-10-20"),
+                rline(&flour, 10, "2026-10-20"),
+                rline(&flour, 3, "2026-10-20"),
+            ],
+            0,
+        )
+        .await;
+    let waste = |n: u16, line: Value| json!({ "command_id": cmd(n), "lines": [line], "captured_at": SENT, "sent_at": SENT });
+    let wline = |qty: i64| {
+        json!({
+            "item_id": flour, "input": { "qty": qty, "unit_code": "g", "base_qty_per_unit": 1 },
+            "reason_code": "EXPIRED",
+        })
+    };
+    let mut a = wline(5);
+    a["lot_id"] = json!(lots[0]);
+    let mut b = wline(12);
+    b["lot_id"] = json!(lots[1]);
+    b["confirm_shortage"] = json!(true);
+    let mut rest = wline(4);
+    rest["confirm_shortage"] = json!(true);
+    for (n, line) in [(5, a), (6, b), (7, rest)] {
+        node.write(
+            &STAFF,
+            Method::POST,
+            "/api/v1/waste-records",
+            waste(n, line),
+        )
+        .await;
+    }
+    let d = node
+        .receive(8, &supplier, vec![rline(&flour, 6, "2026-10-25")], 0)
+        .await
+        .remove(0);
+    assert_eq!(d, "RAW-FLOUR-20261006-004");
+
+    let item = json!({
+        "item_id": flour, "on_hand_qty": 3, "unallocated_qty": -1,
+        "lots": [
+            lot_row(&lots[1], -2, NOW, END_OF_10_20),
+            lot_row(&d, 6, NOW, END_OF_10_25),
+        ],
+    });
+    for query in [String::new(), format!("item_id={flour}")] {
+        assert_eq!(
+            node.detail(&query).await,
+            json!({ "business_date": "2026-10-06", "items": [item] }),
+            "{query}"
+        );
+    }
+    for (lot_id, remaining_qty) in [(&lots[0], 0), (&lots[1], -2), (&lots[2], 0)] {
+        let reply = node.lot(Some(&STAFF), lot_id).await;
+        assert_eq!(
+            assert_success(&reply),
+            &json!({ "lot": with_item(lot_row(lot_id, remaining_qty, NOW, END_OF_10_20), &flour) }),
+            "{lot_id}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

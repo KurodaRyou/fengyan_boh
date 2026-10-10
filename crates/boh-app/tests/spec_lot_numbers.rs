@@ -621,3 +621,58 @@ async fn expiry_warning_compares_lots_earlier_in_fifo_order() {
         ]
     );
 }
+
+// domain「批次」到期提醒：「另一个批次」只算 remaining_qty > 0 的批次。当天收货 A（…-001）5 g、到期 10-15，
+// B（…-002）5 g、到期 10-14；指定 A 报 5（A 0），指定 B 报 6（确认，B −1）。
+// - 再收货 C（…-003）到期 10-12：A、B 都排在前面、到期更晚，但余量不大于 0，不警告。
+// - 再收货 D（…-004）到期 10-11：早于余量为正的 C，警告。
+#[tokio::test]
+async fn expiry_warning_ignores_lots_without_positive_remaining() {
+    let node = node();
+    let flour = node.item(1, "FLOUR", "RAW").await;
+    let supplier = node.supplier(2).await;
+    node.master(
+        "/api/v1/waste-reasons",
+        json!({ "command_id": cmd(3), "code": "EXPIRED", "name": "过期", "active": true }),
+    )
+    .await;
+    let reply = node
+        .receive(
+            4,
+            &supplier,
+            vec![line(&flour, 5, "2026-10-15"), line(&flour, 5, "2026-10-14")],
+            NOW,
+            0,
+        )
+        .await;
+    let lots = lot_ids(&reply);
+    for (n, lot_id, qty) in [(5, &lots[0], 5), (6, &lots[1], 6)] {
+        let reply = spec_support::post(
+            &node.router,
+            "/api/v1/waste-records",
+            Some(&STAFF),
+            &json!({
+                "command_id": cmd(n), "captured_at": NOW + SKEW, "sent_at": NOW + SKEW,
+                "lines": [{
+                    "item_id": flour, "lot_id": lot_id,
+                    "input": { "qty": qty, "unit_code": "g", "base_qty_per_unit": 1 },
+                    "reason_code": "EXPIRED", "confirm_shortage": true,
+                }],
+            }),
+        )
+        .await
+        .unwrap();
+        assert_success(&reply);
+    }
+
+    let c = node
+        .receive(7, &supplier, vec![line(&flour, 1, "2026-10-12")], NOW, 0)
+        .await;
+    assert_eq!(lot_ids(&c), ["RAW-FLOUR-20261006-003"]);
+    assert_expiry_warnings(&c, &flour, &[]);
+    let d = node
+        .receive(8, &supplier, vec![line(&flour, 1, "2026-10-11")], NOW, 0)
+        .await;
+    assert_eq!(lot_ids(&d), ["RAW-FLOUR-20261006-004"]);
+    assert_expiry_warnings(&d, &flour, &[0]);
+}
