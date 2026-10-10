@@ -81,12 +81,16 @@
    1. **Claude** 写锁定测试（golden payload、HTTP 契约、验收用例、重放一致性）和接口说明。
    2. **测试 agent** 做独立测试审查（见「测试分工」）；Claude 逐条核对，把采纳项写进锁定测试、接口说明或 `docs/`。引出的规范修改作为 `docs:` 提交，放在 `spec:` 提交之前。
    3. **人逐条确认预期值**后，Claude 作为 `spec:` 提交，并给出实现 agent 的 prompt：本切片范围、比对基准、需要顺带落实的已生效改动（已写回 `docs/` 或锁定测试，如上一切片遗留的修复）、不涉及规范的小改动（如去掉多余的检查）。小改动来自 `workdocs/` 时，Claude 先确认它仍然适用、不涉及规范，再把内容直接写进 prompt；不让实现 agent 读取或引用 `workdocs/`。
+      同时给出第 6 步 review 的 prompt。
 5. **实现 agent**：在 `spec:` 提交之上实现本切片，交付前全部锁定测试通过：
    - `boh-domain`：命令 / 事件结构体 + 校验。
    - `boh-app::service`：经 `ledger::execute` 组装一个事务；`projections::apply` 增加该事件的投影。
    - `boh-app::http`：handler + 路由。
    - 补自己的单元测试，提交交付说明。
-6. **Claude** 在本地 review 切片分支：按「不可违反的规则」逐条核对，逐个提交核对锁定路径，`git diff <比对基准> HEAD -- <锁定路径>` 为空。
+6. **Claude** 在新会话中用第 4.3 步给出的 review prompt 本地 review 切片分支：按「不可违反的规则」逐条核对，逐个提交核对锁定路径，`git diff <比对基准> HEAD -- <锁定路径>` 为空。
+   - 不在写设计、锁定测试或实现 prompt 的会话中 review：那里的上下文会让 review 按设计意图理解实现，看不出偏差。
+   - 重新 review 和第 7 步的复审在同一个 review 会话中继续。
+
    有问题退回实现 agent 修改后重新 review；通过后 Claude 给出可以提 PR 的结论，写明 review 时的 HEAD 和比对基准。
 7. **提 PR**，GitHub 上自动运行 **Codex** review（只在 PR 打开后运行，本地不跑）。Codex 的发现由 Claude 判断是否采纳，需要修改的退回实现 agent；
    PR 打开后又有新提交时，合入前评论 `@codex review` 重新触发，Claude 复审新增的提交并给出新的 HEAD。不采纳的 Codex 发现在 PR 评论中写明理由。
@@ -96,7 +100,7 @@
 - 在切片分支开头的 `docs:` / `spec:` 提交之后追加新的提交：规范改动由 Claude 作为 `docs:` 提交；锁定测试改动由人逐条确认预期值后，Claude 作为 `spec:` 提交。再把实现提交 rebase 到它们之后，比对基准随之后移。
   - 切片分支允许强推，`main` 不允许：锁定路径的改动必须始终位于分支开头，不能合入后再补救。
 - 锁定测试改动按影响重做第 4 步：新增事件、payload 分支、错误码或警告码时，先查覆盖缺口并做第 4.2 步独立测试审查，再由人确认预期值；只修正已有用例的预期值或措辞时，人确认后即可提交。
-- 之后实现 agent 在 rebase 后的分支上修改，从第 6 步重新 review。
+- 之后实现 agent 在 rebase 后的分支上修改，从第 6 步重新 review：提交设计改动的 Claude 给出新的 review prompt，写明新的比对基准，在新会话中 review。
 
 ### 路线图
 
