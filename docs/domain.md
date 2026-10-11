@@ -240,8 +240,8 @@ occurred_at = recorded_at − lag
 
 **正式提交**：
 
-- 请求体：`command_id`、`lines`、`captured_at`、`sent_at`。`lines` 每项 `{item_id, lot_id?, input, reason_code, confirm_shortage?}`：`lot_id` 是员工指定的批次，`input` 见「单位」，`reason_code` 是 `WASTE_REASON` 的 `code`，`confirm_shortage` 见下方「不足确认」。
-- 写命令成功的 `data` 是 `{"waste_record": 行}`；行为 `waste_record_id`、`lines`（与 payload 的 `lines` 相同）、`business_date`、`occurred_at`、`recorded_at`、`actor_id`、`device_id`。
+- 请求体与行见 `boh_domain::waste` 的 `LogWaste`、`WasteRecord`；`input` 见「单位」。`lot_id` 是员工指定的批次，`reason_code` 是 `WASTE_REASON` 的 `code`，`confirm_shortage` 见下方「不足确认」。
+- 写命令成功的 `data` 是 `{"waste_record": 行}`；行的 `lines` 与 payload 的 `lines` 相同。
 - **取值**：不满足时 `400 VALIDATION_FAILED`，`details` 为 `{}`。
   - `lines` 非空。同一物料、同一批次都可以出现在多行（例如不同原因）。
   - `input` 的规则同收货：`input.qty`、`input.base_qty_per_unit` 是正整数；`input.unit_code` 非空、首尾不能有空白字符；`input.qty × input.base_qty_per_unit` 不超出 `i64`。
@@ -252,7 +252,7 @@ occurred_at = recorded_at − lag
 - **新建**：服务端生成 UUIDv7 作为报损 ID（聚合 ID），写一条 `aggregate_version = 1` 的 `WASTE_LOGGED`。
   - `occurred_at`、`business_date` 按「时间」的相对校准计算，规则与温度记录相同（`CAPTURE_TOO_OLD`、时间溢出的 `VALIDATION_FAILED`、`CAPTURE_TIME_ADJUSTED` 的 `details` 都是 `{}`）。
   - payload 每行：`qty = input.qty × input.base_qty_per_unit`；`lot_id` 取请求中指定的批次，未指定时省略；`item_book_qty`、`lot_book_qty` 和 `alloc` 按下方「逐行处理」得出。
-  - payload 行的键顺序：`item_id`、`lot_id`、`qty`、`input`、`reason_code`、`item_book_qty`、`lot_book_qty`、`alloc`（被吸收的行在 `alloc` 的位置写 `absorbed_by_event_id`）；`input` 的键顺序同收货；`alloc` 每项的键顺序 `lot_id`、`qty`、`source`。
+  - payload 结构与键顺序见 `boh_domain::waste::WasteLogged`；样本 `crates/boh-app/tests/golden/WASTE_LOGGED@1/`。
   - `confirm_shortage` 不写进 payload。
     理由：账面值记录当时是否不足，确认标记记录员工的选择，两者含义不同；后者保存在规范化请求中。
 - **业务校验**（幂等检查之后）：同时命中多个业务错误时，返回哪一个不作规定；都不写事件或 `processed_commands`。不足确认在其余业务校验都通过之后判定。
@@ -300,7 +300,7 @@ occurred_at = recorded_at − lag
 
 **预检**：
 
-- 请求体只有 `lines`，每项 `{item_id, lot_id?, input, reason_code}`，取值规则同正式提交；不接受 `command_id`、`captured_at`、`sent_at` 和 `confirm_shortage`。
+- 请求体见 `boh_domain::waste::PrecheckWaste`，只有 `lines`，取值规则同正式提交；不接受 `command_id`、`captured_at`、`sent_at` 和 `confirm_shortage`。
 - 在一个读事务中执行，不写事件、`processed_commands` 或任何表；没有幂等处理。
 - 校验与正式提交相同（取值、引用、`LOT_ITEM_MISMATCH`、`ITEM_HAS_NO_LOTS`、单位、数量越界），错误码与 `details` 也相同。不做时间校准，也不做吸收判定（没有发生时间）。
 - 成功的 `data` 是 `{"lines": [{line, item_id, lot_id?, qty, item_book_qty, lot_book_qty?, needs_confirmation, alloc}]}`，每行一项：按正式提交的逐行处理计算，假设全部行都不被吸收、需要确认的行都已确认。`warnings` 为空数组。
@@ -432,7 +432,7 @@ occurred_at = recorded_at − lag
 |---|---|---|---|
 | `GOODS_RECEIVED` | `RECEIPT` | `@2`：`boh_domain::receiving::GoodsReceived`；样本 `crates/boh-app/tests/golden/GOODS_RECEIVED@2/`；`lot_id` 是批次号。`@1`（`lot_id` 为 UUID）不支持，见「收货接口」 | 每行新建一个批次 |
 | `PRODUCTION_BATCH_COMPLETED` | `PRODUCTION_BATCH` | `recipe_id`, `recipe_version`, `batch_count`, `started_at?`, `output{item_id, planned_qty, qty, lot_id, expires_at?}`, `consumed[{item_id, planned_qty, qty, alloc \| absorbed_by_event_id}]` | 原料按分配扣减（或被吸收）；成品新建批次 |
-| `WASTE_LOGGED` | `WASTE_RECORD` | `lines[{item_id, lot_id?, qty, input, reason_code, item_book_qty, lot_book_qty?, alloc \| absorbed_by_event_id}]`：`lot_id` 是员工指定的批次；`item_book_qty` 是提交时该行之前的物料净账面，指定批次的行另带该批次账面 `lot_book_qty`（与 `lot_id` 同时出现）。见「报损接口」 | 按分配扣减（或被吸收） |
+| `WASTE_LOGGED` | `WASTE_RECORD` | `boh_domain::waste::WasteLogged`；样本 `crates/boh-app/tests/golden/WASTE_LOGGED@1/`。`lot_id` 是员工指定的批次；`item_book_qty` 是提交时该行之前的物料净账面，指定批次的行另带该批次账面 `lot_book_qty`（与 `lot_id` 同时出现）。见「报损接口」 | 按分配扣减（或被吸收） |
 | `STOCK_COUNT_SUBMITTED` | `STOCK_COUNT` | `purpose`（`CLOSING` / `AUDIT`）, `lines[{item_id, lot_id, counted_qty}]` | 无 |
 | `STOCK_ADJUSTED` | `STOCK_COUNT` | `lines[{item_id, lot_id?, book_qty, counted_qty, delta}]`：带 `lot_id` 的是批次行，不带的是每个物料一行的账外缺口清零 | 批次和账外缺口按 delta 变化；写 `inventory_counts` |
 | `PURCHASE_ORDER_SUBMITTED` | `PURCHASE_ORDER` | `supplier_id`, `lines[{item_id, qty, input}]`, `deliver_on`（门店当地日期 `'YYYY-MM-DD'`） | 无 |
