@@ -2,6 +2,9 @@
 
 use std::collections::VecDeque;
 
+use crate::invariant_check::{
+    CheckHandle, InvariantCheckHealth, InvariantCheckHold, InvariantChecks,
+};
 use boh_domain::UnixMillis;
 use boh_domain::time::{ClosingBackupTime, StoreTimeZone, next_closing_backup};
 use boh_storage::StorageError;
@@ -13,15 +16,17 @@ use tokio::task::JoinHandle;
 pub struct BackupTasks {
     stop: BackupStop,
     task: JoinHandle<()>,
+    checks: InvariantChecks,
 }
 
 #[derive(Clone)]
-pub struct BackupStop(watch::Sender<bool>);
+pub struct BackupStop(watch::Sender<bool>, CheckHandle);
 
 impl BackupStop {
     /// Stop accepting triggers immediately; the task still drains accepted backups.
     pub fn stop(&self) {
         self.0.send_replace(true);
+        self.1.stop();
     }
 }
 
@@ -129,22 +134,30 @@ impl BackupTasks {
         health: BackupHealth,
         timezone: StoreTimeZone,
         closing_time: ClosingBackupTime,
+        readers: boh_storage::Readers,
+        invariant_health: InvariantCheckHealth,
     ) -> Result<Self, StorageError> {
         let changes = clock.changes();
         let schedule = Schedule::new(clock.now(), timezone, closing_time)?;
         let (stop, stopping) = watch::channel(false);
+        let checks = InvariantChecks::start(readers, clock.clone(), invariant_health);
+        let check_handle = checks.handle();
         let task = tokio::spawn(run(
-            backup,
-            clock,
-            health,
+            BackupWorker {
+                backup,
+                clock,
+                health,
+                checks: check_handle.clone(),
+            },
             schedule,
             changes,
             stopping,
             VecDeque::new(),
         ));
         Ok(Self {
-            stop: BackupStop(stop),
+            stop: BackupStop(stop, check_handle),
             task,
+            checks,
         })
     }
 
@@ -154,21 +167,44 @@ impl BackupTasks {
 
     pub async fn shutdown(self) -> Result<(), StorageError> {
         self.stop.stop();
-        self.task
+        let backups = self
+            .task
             .await
-            .map_err(|error| StorageError::join("等待备份任务", error))
+            .map_err(|error| StorageError::join("等待备份任务", error));
+        let checks = self.checks.shutdown().await;
+        backups?;
+        checks
+    }
+
+    pub(crate) async fn run_invariant_check(&self) {
+        self.checks.handle().run().await;
+    }
+
+    pub(crate) fn hold_invariant_checks(&self) -> InvariantCheckHold {
+        self.checks.handle().hold()
     }
 }
 
-async fn run(
+struct BackupWorker {
     backup: Backup,
     clock: Clock,
     health: BackupHealth,
+    checks: CheckHandle,
+}
+
+async fn run(
+    worker: BackupWorker,
     mut schedule: Schedule,
     mut changes: boh_storage::clock::ClockChanges,
     mut stop: watch::Receiver<bool>,
     mut queue: VecDeque<Trigger>,
 ) {
+    let BackupWorker {
+        backup,
+        clock,
+        health,
+        checks,
+    } = worker;
     let mut active: Option<JoinHandle<()>> = None;
     let mut stopping = false;
     let mut schedule_failed = false;
@@ -198,13 +234,28 @@ async fn run(
                 }
             }
         };
-        if active.is_none() && queue.pop_front().is_some() {
+        if active.is_none()
+            && let Some(trigger) = queue.pop_front()
+        {
             let backup = backup.clone();
             let clock = clock.clone();
             let health = health.clone();
-            active = Some(tokio::task::spawn_blocking(move || {
-                let result = backup.run(&clock);
+            let checks = checks.clone();
+            active = Some(tokio::spawn(async move {
+                let backup_clock = clock.clone();
+                let result = tokio::task::spawn_blocking(move || backup.run(&backup_clock))
+                    .await
+                    .unwrap_or_else(|error| {
+                        Err(StorageError::backup(
+                            boh_storage::BackupStage::Worker,
+                            None,
+                            StorageError::join("等待备份任务", error),
+                        ))
+                    });
                 health.record(&result, clock.now());
+                if trigger == Trigger::Closing {
+                    checks.closing().await;
+                }
             }));
         }
         if stopping && active.is_none() && queue.is_empty() {
@@ -295,12 +346,20 @@ mod tests {
         )
         .unwrap();
         let (stop, stopping) = watch::channel(false);
+        let checks = InvariantChecks::start(
+            storage.readers.clone(),
+            clock.clock(),
+            InvariantCheckHealth::default(),
+        );
         let counter = ErrorCounter::default();
         let mut task = Box::pin(
             run(
-                backup,
-                clock.clock(),
-                BackupHealth::default(),
+                BackupWorker {
+                    backup,
+                    clock: clock.clock(),
+                    health: BackupHealth::default(),
+                    checks: checks.handle(),
+                },
                 schedule,
                 clock.clock().changes(),
                 stopping,
@@ -323,6 +382,7 @@ mod tests {
         assert_eq!(counter.0.load(Ordering::Relaxed), 2);
         stop.send_replace(true);
         task.await;
+        checks.shutdown().await.unwrap();
         storage.writer_handle.shutdown().await.unwrap();
     }
 
@@ -351,10 +411,18 @@ mod tests {
         let hold = backup.hold();
         let health = BackupHealth::default();
         let (stop, stopping) = watch::channel(false);
-        let task = tokio::spawn(run(
-            backup,
+        let checks = InvariantChecks::start(
+            storage.readers.clone(),
             clock.clock(),
-            health.clone(),
+            InvariantCheckHealth::default(),
+        );
+        let task = tokio::spawn(run(
+            BackupWorker {
+                backup,
+                clock: clock.clock(),
+                health: health.clone(),
+                checks: checks.handle(),
+            },
             schedule,
             clock.clock().changes(),
             stopping,
@@ -386,6 +454,7 @@ mod tests {
         }
         stop.send_replace(true);
         task.await.unwrap();
+        checks.shutdown().await.unwrap();
         storage.writer_handle.shutdown().await.unwrap();
     }
 
@@ -411,6 +480,8 @@ mod tests {
             BackupHealth::default(),
             parse_timezone("Asia/Shanghai").unwrap(),
             parse_closing_backup_time("23:30").unwrap(),
+            storage.readers.clone(),
+            InvariantCheckHealth::default(),
         )
         .unwrap();
         clock.advance(Duration::from_secs(30 * 60));

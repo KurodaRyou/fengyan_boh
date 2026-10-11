@@ -222,6 +222,7 @@ async fn receipt_dates_use_configured_timezone_and_replay_preserves_the_saved_ex
         dev_actor_stub: true,
         db_path: node._dir.path().join("boh.db"),
         backup_health: Default::default(),
+        invariant_health: Default::default(),
     });
     let mut body = request(3, &supplier, &item, &["2026-10-05"]);
     body["lines"][0]["produced_on"] = json!("2026-10-05");

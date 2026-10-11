@@ -143,6 +143,7 @@ async fn enqueued_failure_still_logs_once_after_the_caller_drops_its_future() {
         dev_actor_stub: true,
         db_path: node._dir.path().join("boh.db"),
         backup_health: Default::default(),
+        invariant_health: Default::default(),
     };
     let actor = Actor {
         employee_id: AggregateId::parse("01890a5d-ac96-774b-bcce-b302099a8101").unwrap(),
