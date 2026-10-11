@@ -104,12 +104,18 @@
 
 ### 路线图
 
-1. **Write path 与基础设施**：时钟模块、相对校准、营业日纯函数；`Readers::call` 包读事务、写线程任务计时；信封加 `warnings`；`boh_storage::open()` 收口。
-2. **Walking skeleton 与首批切片**：
-   设备主数据（walking skeleton：`ledger::execute` / `Ledger::append` / `projections::apply` 骨架与 `rebuild-projections`、`Actor` 开发桩、`boh-server init`、`EQUIPMENT` 写接口、迁移 002：`equipment`；打通 write path、幂等、重放、golden payload）
-   → 温度记录（迁移 003：`temperature_readings`）→ 备份模块与恢复演练测试、`/health` 字段（迁移 004：`store_events(recorded_at)` 索引）→ 005：其余主数据与库存投影表 → 收货（迁移 006：批号列改名为 `manufacturer_lot_no`）→ 批次号与库存明细查询（迁移 007：重建 `inventory_lots`、`inventory_movements`，批次号为主键、余量可为负；`GOODS_RECEIVED@2`）→ 报损（指定批次与确认、FIFO、账外缺口）→ 不变量自检 → 盘点（含盘点吸收：已有的报损一并实现吸收判定）→ 局域网 HTTPS → 员工认证。
-   - 设备主数据切片的 `init` 只写 `store_meta`；预置报损原因随 005 加入；`EMPLOYEE`（`employees` 投影、写接口、golden 样本）与第一个店长随认证切片加入。
-3. **扩展**：生产 → 纠错（冲销、数量更正）→ 补录入口 → 销售导入。每一步配对应的验收用例。
+已完成：write path 与基础设施；设备主数据（walking skeleton）；温度记录；备份与 `/health`；其余主数据（物料、配方、供应商、报损原因）与库存投影；收货与批次号；库存明细与批次查询；报损；不变量自检。迁移到 007。
+
+当前实现边界：
+- `init` 写入 `store_meta` 和预置报损原因；第一个店长随认证切片加入。
+- 业务接口经 `Actor` 开发桩取得身份（[docs/auth.md](docs/auth.md)「开发桩」）。
+- 报损不判定吸收，每行都不被吸收。
+- 当前没有显式补录入口；温度记录、收货、报损的发生时间通过相对校准确定。
+- `MASTER_DATA_CHANGED` 只有 `source = LOCAL` 的写入口。
+
+待做，按顺序：
+1. 盘点（含盘点吸收：已有的报损一并实现吸收判定）→ 局域网 HTTPS → 员工认证（`EMPLOYEE` 投影、写接口、golden 样本与第一个店长）。
+2. 扩展：生产 → 纠错（冲销、数量更正）→ 补录入口 → 销售导入。每一步配对应的验收用例。
 
 ---
 
@@ -206,7 +212,7 @@ scripts/        CI 扫描脚本。
 细则（文件名、流程、保留策略、触发、关闭、测试要求）见 [docs/backup.md](docs/backup.md)。
 - 在 `spawn_blocking` 上执行，不占写线程；连接只用「SQLite」中的备份连接。
 - 新备份经完整性与 `seq` 校验、文件 fsync、原子重命名和目录 fsync 之后才算成功；失败只记日志并反映在 `/health`，不重试、不退出进程、不影响写入。
-- 禁止并发备份。收到停止信号后不再接受新的触发，先执行完正在进行和已排队的备份，再关写线程。
+- 禁止并发备份。收到停止信号后不再接受新的触发，先执行完正在进行和已排队的备份及闭店流程中的自检，再关写线程。
 - **恢复演练写成测试**：从备份恢复、清空投影并重建，结果必须和原库一致。只验证备份文件生成了不算数。
 
 ### 不变量自检
@@ -382,7 +388,7 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 scripts/ci-scan.sh
-cargo run -p boh-server -- init deploy/config.dev.toml   # 新数据库先初始化，只写 store_meta；已初始化时拒绝
+cargo run -p boh-server -- init deploy/config.dev.toml   # 新数据库先初始化：写 store_meta 和预置报损原因；已初始化时拒绝
 cargo run -p boh-server -- deploy/config.dev.toml
 cargo run -p boh-server -- rebuild-projections deploy/config.dev.toml   # 只在服务停止时运行
 ```

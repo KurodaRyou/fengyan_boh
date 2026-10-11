@@ -47,7 +47,7 @@ occurred_at = recorded_at − lag
 - 生产命令可带 `started_captured_at`，用同一个 `sent_at`、`recorded_at` 按上述规则换算出 `started_at` 写进 payload。
 - 带开始时间时，先校验 `started_captured_at <= captured_at`，再计算两段 lag；开始时间也适用 72 小时上限。开始晚于完成时返回 `400 INVALID_PRODUCTION_TIME`，不得用 lag 的负值归零掩盖错误顺序。
 
-**补录**（显式入口，Q6 确认后实现）：
+**补录**（显式入口；实现状态：尚未实现，随补录入口实现，前置 Q6）：
 
 - 收货、生产、报损、订货、温度记录的命令可以显式提交 `occurred_at`（生产同时提交 `started_at`），不走相对校准。
 - `occurred_at` 晚于 `recorded_at`：`400 INVALID_OCCURRED_AT`。超出锁账范围：`409 BOOKS_LOCKED`（见 Q6）。
@@ -101,7 +101,7 @@ occurred_at = recorded_at − lag
 - **系统操作人**：初始化和主数据包导入在没有登录员工时，`actor_id` 使用保留 ID `00000000-0000-7000-8000-000000000000`。
 - **系统设备**：初始化和没有登录平板的主数据包导入，`device_id` 使用保留 ID `00000000-0000-7000-8000-000000000001`，表示产生事件的本门店节点。该身份不需要设备注册、设备令牌、解锁码或员工会话，不写入设备注册表；事件的 `device_id` 仍为非空 UUIDv7。
 - 两个保留 ID 不得分配给真实员工或注册平板。系统身份只由节点内部的初始化和主数据包导入入口填写，表示事件来源，不授予 HTTP 访问权限。
-- **初始化**：`boh-server init` 在一个写事务中写入 `store_meta`、预置主数据和第一个店长账号（在终端输入两次 PIN），任一步失败则全部回滚，可以重新执行。第一个店长随认证切片加入（见 AGENTS.md「路线图」）。
+- **初始化**：`boh-server init` 在一个写事务中写入 `store_meta`、预置主数据和第一个店长账号（在终端输入两次 PIN），任一步失败则全部回滚，可以重新执行。第一个店长随认证切片加入；当前写入 `store_meta` 和预置报损原因。
   - 初始化是一个命令：`command_type` 为 `store.init`，`command_id` 由服务端按 AGENTS.md「ID 与时间」生成；`processed_commands` 中的规范化请求为 `{"store_id": <配置的 store_id>}`，响应为 `{}`。
   - `store_meta.created_at`、`processed_commands.recorded_at` 和每条事件的 `recorded_at` 都是同一个 `now()`；事件的 `occurred_at = recorded_at`，`business_date` 由它计算。
   - 产生的每条 `MASTER_DATA_CHANGED` 都使用上述系统 `actor_id` 和系统 `device_id`，`source = LOCAL`，`aggregate_version = 1`。
@@ -121,9 +121,11 @@ occurred_at = recorded_at − lag
 
 - 每个物料只有一个基本单位。账本、投影中的数量都是基本单位的 `i64`。换算系数必须是**正整数**基本单位（`> 0`）。
   - 主数据写入时校验（本地编辑和总部包导入都一样），系数不合格的变更整条拒绝，不进入事件流。
-- 命令用 `input {qty, unit_code, base_qty_per_unit}` 提交，其中系数是客户端录入时看到的值。写入线程用当前换算核对：
-  - `unit_code` 未配置：`400 UNKNOWN_UNIT`；
-  - 系数和当前值不一致：`409 UNIT_CONVERSION_CHANGED`，不入账，由人工确认后重新提交。
+- 命令用 `input {qty, unit_code, base_qty_per_unit}` 提交，其中系数是客户端录入时看到的值。
+  - 取值：`input.qty`、`input.base_qty_per_unit` 是正整数；`input.unit_code` 非空、首尾不能有空白字符；`input.qty × input.base_qty_per_unit` 不超出 `i64`。不满足时 `400 VALIDATION_FAILED`。
+- 写入线程用当前换算核对（业务校验）：
+  - `unit_code` 既不是物料的 `base_unit` 也不在 `units` 中：`400 UNKNOWN_UNIT`，`details` 为 `{"line", "item_id", "unit_code"}`；
+  - 系数和当前值不一致：`409 UNIT_CONVERSION_CHANGED`，`details` 为 `{"line", "item_id", "unit_code", "base_qty_per_unit": 当前值}`（`unit_code` 等于 `base_unit` 时当前值为 1），不入账，由人工确认后重新提交。
 - payload 同时写入换算后的 `qty` 和 `input` 快照。
 - 盘点的 `counted_qty` 只用基本单位，不带 `input`，这是 `input` 规则的例外。
 
@@ -152,7 +154,7 @@ occurred_at = recorded_at − lag
 - **到期时间** `expires_at`（UTC 毫秒，可空）只用于过期提醒，不参与分配。收货批次必有到期时间，由收货行的 `expires_on` 换算（见「收货接口」）；生产产出的到期时间随生产切片定。
 - **FIFO 分配**：未指定批次的扣减，只在该行物料余量大于 0 的批次中，按批次日期升序、同一日期内按流水号升序逐个扣减。
   - 不按 `seq`、UUID、到期日或实物发生钟点。
-  - 补录的旧日期批次排在较新日期的批次之前。
+  - 批次日期较早的批次（例如补录或迟到入账形成的）排在较新日期的批次之前，即使入账在后。
 - **来源**：批次投影保存建批次的 `source_event_seq` 和 `source_line_no`（收货取原 `lines[i]` 的 `i`，生产 `output` 取 0），只用于追溯，不参与分配。
 - **指定批次**：客户端可以指定 `lot_id`。指定批次的扣减只作用于该批次，不转去扣其他批次；超出该批次账面时，按报损的确认规则入账，该批次余量可以为负。
 - **账面不足**：
@@ -177,19 +179,19 @@ occurred_at = recorded_at − lag
 `input` 见「单位」，`alloc` 和批次号 `lot_id` 见「批次」。新建批次的行带新批次号，不会被吸收；扣减库存的行（盘点行除外）要么带 `alloc`，要么带 `absorbed_by_event_id`（被吸收，见「盘点吸收」），二者取一。
 带 `?` 的字段可选：缺省时省略该键，payload 中不出现 `null`。字段之间的 `a | b` 表示二者恰有一个出现；枚举值写作（`A` / `B`）。
 
-| event_type | aggregate_type | payload 要点 | 投影影响 |
-|---|---|---|---|
-| `GOODS_RECEIVED` | `RECEIPT` | `@2`：`boh_domain::receiving::GoodsReceived`；样本 `crates/boh-app/tests/golden/GOODS_RECEIVED@2/`；`lot_id` 是批次号。`@1`（`lot_id` 为 UUID）不支持，见「收货接口」 | 每行新建一个批次 |
-| `PRODUCTION_BATCH_COMPLETED` | `PRODUCTION_BATCH` | `recipe_id`, `recipe_version`, `batch_count`, `started_at?`, `output{item_id, planned_qty, qty, lot_id, expires_at?}`, `consumed[{item_id, planned_qty, qty, alloc \| absorbed_by_event_id}]` | 原料按分配扣减（或被吸收）；成品新建批次 |
-| `WASTE_LOGGED` | `WASTE_RECORD` | `boh_domain::waste::WasteLogged`；样本 `crates/boh-app/tests/golden/WASTE_LOGGED@1/`。`lot_id` 是员工指定的批次；`item_book_qty` 是提交时该行之前的物料净账面，指定批次的行另带该批次账面 `lot_book_qty`（与 `lot_id` 同时出现）。见「报损接口」 | 按分配扣减（或被吸收） |
-| `STOCK_COUNT_SUBMITTED` | `STOCK_COUNT` | `purpose`（`CLOSING` / `AUDIT`）, `lines[{item_id, lot_id, counted_qty}]` | 无 |
-| `STOCK_ADJUSTED` | `STOCK_COUNT` | `lines[{item_id, lot_id?, book_qty, counted_qty, delta}]`：带 `lot_id` 的是批次行，不带的是每个物料一行的账外缺口清零 | 批次和账外缺口按 delta 变化；写 `inventory_counts` |
-| `PURCHASE_ORDER_SUBMITTED` | `PURCHASE_ORDER` | `supplier_id`, `lines[{item_id, qty, input}]`, `deliver_on`（门店当地日期 `'YYYY-MM-DD'`） | 无 |
-| `TEMPERATURE_LOGGED` | `TEMPERATURE_READING` | `boh_domain::temperature::TemperatureLogged`；样本 `crates/boh-app/tests/golden/TEMPERATURE_LOGGED@1/` | 写 `temperature_readings` |
-| `QUANTITY_CORRECTED` | 与原事件相同 | `corrected_event_id`, `reason`, `lines[{line_ref, item_id, physical_at, old_qty, new_qty, delta, input?, line_cost_cents?, alloc \| absorbed_by_event_id}]` | 按差额调整（或被吸收），见「纠错」 |
-| `EVENT_REVERSED` | 与原事件相同 | `reversed_event_id`, `reason`, `lines[{line_ref, item_id, physical_at, qty, alloc \| absorbed_by_event_id}]` | 精确取反（或被吸收），见「纠错」 |
-| `SALES_IMPORTED` | `SALES_DAY` | `source`（`CSV` / `XLSX`）, `file_name`, `lines[{item_id, qty, amount_cents}]`, `ignored_rows`（整数） | 覆盖 `daily_sales` 中该营业日；**不写库存流水** |
-| `MASTER_DATA_CHANGED` | 实体名 | `entity`, `source`, `snapshot` | 覆盖对应的主数据表 |
+| event_type | aggregate_type | payload 要点 | 投影影响 | 实现状态 |
+|---|---|---|---|---|
+| `GOODS_RECEIVED` | `RECEIPT` | `@2`：`boh_domain::receiving::GoodsReceived`；样本 `crates/boh-app/tests/golden/GOODS_RECEIVED@2/`；`lot_id` 是批次号。`@1`（`lot_id` 为 UUID）不支持，见「收货接口」 | 每行新建一个批次 | 已实现（`@2`） |
+| `PRODUCTION_BATCH_COMPLETED` | `PRODUCTION_BATCH` | `recipe_id`, `recipe_version`, `batch_count`, `started_at?`, `output{item_id, planned_qty, qty, lot_id, expires_at?}`, `consumed[{item_id, planned_qty, qty, alloc \| absorbed_by_event_id}]` | 原料按分配扣减（或被吸收）；成品新建批次 | 尚未实现，随生产切片实现 |
+| `WASTE_LOGGED` | `WASTE_RECORD` | `boh_domain::waste::WasteLogged`；样本 `crates/boh-app/tests/golden/WASTE_LOGGED@1/`。`lot_id` 是员工指定的批次；`item_book_qty` 是提交时该行之前的物料净账面，指定批次的行另带该批次账面 `lot_book_qty`（与 `lot_id` 同时出现）。见「报损接口」 | 按分配扣减（或被吸收） | 部分实现：写入路径的吸收判定随盘点切片实现 |
+| `STOCK_COUNT_SUBMITTED` | `STOCK_COUNT` | `purpose`（`CLOSING` / `AUDIT`）, `lines[{item_id, lot_id, counted_qty}]` | 无 | 尚未实现，随盘点切片实现 |
+| `STOCK_ADJUSTED` | `STOCK_COUNT` | `lines[{item_id, lot_id?, book_qty, counted_qty, delta}]`：带 `lot_id` 的是批次行，不带的是每个物料一行的账外缺口清零 | 批次和账外缺口按 delta 变化；写 `inventory_counts` | 尚未实现，随盘点切片实现 |
+| `PURCHASE_ORDER_SUBMITTED` | `PURCHASE_ORDER` | `supplier_id`, `lines[{item_id, qty, input}]`, `deliver_on`（门店当地日期 `'YYYY-MM-DD'`） | 无 | 尚未实现，未排期 |
+| `TEMPERATURE_LOGGED` | `TEMPERATURE_READING` | `boh_domain::temperature::TemperatureLogged`；样本 `crates/boh-app/tests/golden/TEMPERATURE_LOGGED@1/` | 写 `temperature_readings` | 已实现 |
+| `QUANTITY_CORRECTED` | 与原事件相同 | `corrected_event_id`, `reason`, `lines[{line_ref, item_id, physical_at, old_qty, new_qty, delta, input?, line_cost_cents?, alloc \| absorbed_by_event_id}]` | 按差额调整（或被吸收），见「纠错」 | 尚未实现，随纠错切片实现 |
+| `EVENT_REVERSED` | 与原事件相同 | `reversed_event_id`, `reason`, `lines[{line_ref, item_id, physical_at, qty, alloc \| absorbed_by_event_id}]` | 精确取反（或被吸收），见「纠错」 | 尚未实现，随纠错切片实现 |
+| `SALES_IMPORTED` | `SALES_DAY` | `source`（`CSV` / `XLSX`）, `file_name`, `lines[{item_id, qty, amount_cents}]`, `ignored_rows`（整数） | 覆盖 `daily_sales` 中该营业日；**不写库存流水** | 尚未实现，随销售导入切片实现 |
+| `MASTER_DATA_CHANGED` | 实体名 | `entity`, `source`, `snapshot` | 覆盖对应的主数据表 | 部分实现：`EQUIPMENT`、`ITEM`、`RECIPE`、`SUPPLIER`、`WASTE_REASON` 的 `source = LOCAL` 写入已实现；`EMPLOYEE` 随认证切片实现，`HQ_PACKAGE` 随下行同步实现 |
 
 - `reason_code` 的值对应 `WASTE_REASON` 的 `code`。
 - 温度记录每条读数一个新的 `TEMPERATURE_READING` 聚合。
@@ -198,6 +200,8 @@ occurred_at = recorded_at − lag
 
 ### 生产规则
 
+实现状态：尚未实现，随生产切片实现。
+
 - 计划用量 = 配方版本中每批用量 × `batch_count`；计划产出 = 每批产出 × `batch_count`。只有整数乘法，没有除法和舍入。
 - 命令携带 `recipe_version`，按该版本计算。版本存在即可，不要求是当前版本。
 - 员工可以修改每行实际 `qty`、增加配方外的物料（`planned_qty = 0`）、把某行改为 0，也可以修改实际产出（烤坏的直接少计产出，不另记报损）。
@@ -205,6 +209,8 @@ occurred_at = recorded_at − lag
 - 生产界面在员工点「开始生产」时记录 `started_captured_at`（只存在客户端，提交时一起带上）。用料的实物时点取开始时间，见「盘点吸收」。
 
 ## 盘点
+
+实现状态：尚未实现，随盘点切片实现。
 
 1. **盘点表与草稿**：客户端按库存明细生成盘点表，不调用专门的盘点接口，不产生事件。库存明细查询返回物料余量不为 0 的批次、账外缺口及门店节点当前的 `business_date`（见「库存明细查询」）。
    - 每个批次行显示批次号、收货或生产时间、到期日、生产商批号。盘点表不预填清点数量，有空格时客户端不允许提交。
@@ -230,6 +236,8 @@ occurred_at = recorded_at − lag
    系统不检测盘点期间的变动，违反规范时差异会算错，由店长重盘。
 
 ## 盘点吸收
+
+实现状态：部分实现。报损被吸收行的 payload 类型和投影重放已支持；写入路径的吸收判定随盘点切片实现。
 
 **原则**：一次盘点把账面校准到观察时点的实物数量。某个库存影响如果在这次盘点**入账之后**才入账，但实物影响发生在观察时点**之前**，盘点已经把它算进去了，它不应再改动账面。
 盘点只能看到盘点时已在账上的批次，所以只吸收扣减类影响（报损、生产用料）以及对盘点时已存在批次的纠错；新建批次的收货行、生产产出不吸收（见「边界」）。
@@ -273,6 +281,8 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 - 冲销或更正新建批次的行时，只有在建批次事件入账之后提交的盘点（`c.event_seq` 大于该批次的 `source_event_seq`）才能吸收它；更早入账的盘点看不到这个批次。
 
 ## 纠错
+
+实现状态：尚未实现，随纠错切片实现。
 
 不提供编辑接口。所有纠错都是追加事件：
 
@@ -320,7 +330,7 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 
 ## 销售导入
 
-开发顺序排在库存切片之后。
+实现状态：尚未实现，随销售导入切片实现。
 
 **规则：销售只进报表，不扣库存。** 成品库存只由收货、生产产出、报损、生产用料和盘点决定。
 导入与闭店盘点的先后无法保证；销售如果扣库存，先盘点再导入时同一批销售会被扣两次。原料在生产完成时已经扣减。
@@ -354,7 +364,7 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 
 ## 投影表
 
-库存投影由迁移 005 定义，迁移 007 重建 `inventory_lots` 和 `inventory_movements`（批次号为主键、拆出批次日期与流水号、余量可为负），字段与约束以迁移为准：
+库存投影的字段与约束以迁移为准（`inventory_lots`、`inventory_movements` 见迁移 007，其余见迁移 005）：
 
 | 表 / 视图 | 内容 |
 |---|---|
@@ -386,6 +396,23 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 
 ## 接口
 
+### 写命令通用规则
+
+适用于本节的写命令：主数据、温度记录、收货、报损。报损预检是 `POST`，但不是写命令：没有 `command_id`，没有幂等处理（见「报损接口」预检）。
+处理顺序见 AGENTS.md「HTTP 约定」：身份与权限 → 请求结构与取值 → 幂等检查 → 业务校验。各接口只写自己的取值、业务校验和例外。
+
+- **取值**：不满足时 `400 VALIDATION_FAILED`，`details` 为 `{}`。
+- **新建**：服务端生成 UUIDv7 作为聚合 ID，写一条 `aggregate_version = 1` 的事件。
+- **发生时间**：
+  - 温度记录、收货、报损带 `captured_at`、`sent_at`，`occurred_at`、`business_date` 按「时间」的相对校准计算。请求体不接受 `occurred_at`（补录入口见「时间」）。
+    - 相对校准和营业日计算属于业务校验，在幂等检查之后执行。
+      理由：`recorded_at` 在写事务内才确定，`sent_at` 不在规范化请求中。重试即使带着会超限或溢出的新 `sent_at`，也返回首次响应，不重新校准。
+    - `CAPTURE_TOO_OLD`、时间溢出的 `VALIDATION_FAILED` 以及警告 `CAPTURE_TIME_ADJUSTED` 的 `details` 都是 `{}`。
+  - 主数据命令不带 `captured_at` / `sent_at`：`occurred_at = recorded_at`，`business_date` 由它计算。
+- **业务校验**（幂等检查之后）：被拒绝时不写事件或 `processed_commands`。同时命中多个业务错误时，返回哪一个不作规定；接口规定了判定先后的除外（报损的不足确认在其余业务校验都通过之后判定）。
+- **引用**：引用的实体不存在时 `404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": <被引用的实体>, "id"}`，接口另有规定的除外。停用的照常受理。
+- **行下标**：带 `lines` 的命令，错误和警告 `details` 中的 `line` 是行在 `lines` 中的下标。
+
 ### 主数据接口
 
 | 实体 | 路径 | `command_type` 前缀 | 行的 ID 字段 | 单行键 / 列表键 |
@@ -399,13 +426,11 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 - 每个实体有三个接口：`POST <路径>` 新建（`<前缀>.create`）、`PUT <路径>/{<ID 字段>}` 修改（`<前缀>.update`）、`GET <路径>` 查询。配方另有追加版本的接口。写接口只允许 `MANAGER`，查询允许已认证员工。
 - 新建请求体：`command_id` 加快照的全部字段（配方例外，见下文）。修改请求体：`command_id`、`base_revision` 加快照中可修改的字段；不可修改的字段不在请求体中，取当前值。各实体的字段见下文。
 - 写命令成功的 `data` 是 `{<单行键>: 行}`，行为该命令执行后的实体：`<ID 字段>`、快照的全部字段、`revision`，可选字段缺省时省略该键。查询的 `data` 是 `{<列表键>: [行…]}`，含停用的，按 `code` 的字节序升序。
-- 取值：`code`、`name` 非空，首尾不能有空白字符；`base_revision` 是正整数；其余字段见下文。不满足时 `400 VALIDATION_FAILED`。
-- 不带 `captured_at` / `sent_at`：`occurred_at = recorded_at`，`business_date` 由它计算。
-- **新建**：服务端生成 UUIDv7 作为 ID，写一条 `aggregate_version = 1` 的 `MASTER_DATA_CHANGED`。`code` 已被同一实体的其他行使用（含停用的）：`409 CODE_ALREADY_EXISTS`，`details` 为 `{"code", <ID 字段>}`（已占用该 `code` 的行）。
+- 取值：`code`、`name` 非空，首尾不能有空白字符；`base_revision` 是正整数；其余字段见下文。
+- **新建**：`code` 已被同一实体的其他行使用（含停用的）：`409 CODE_ALREADY_EXISTS`，`details` 为 `{"code", <ID 字段>}`（已占用该 `code` 的行）。
 - **修改**：行不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": <实体>, "id"}`。`base_revision` 规则见「主数据」。
   - 新快照与当前快照相同时不写事件，命令照常成功并写入 `processed_commands`，响应为当前行。
-- **引用**：引用其他主数据的字段必须指向已有的行（含停用的），否则 `404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": <被引用的实体>, "id"}`。
-- 同时命中多个业务错误时，返回哪一个不作规定。
+- **引用**：引用其他主数据的字段必须指向已有的行（含停用的），规则见「写命令通用规则」。
 
 **设备**：请求体与行见 `boh_domain::equipment` 的 `CreateEquipment`、`UpdateEquipment`、`Equipment`。
 
@@ -446,16 +471,11 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 | `GET /api/v1/temperature-readings` | — | `TemperatureQuery` | 已认证员工 |
 
 - 写命令成功的 `data` 是 `{"temperature_reading": 行}`，查询的 `data` 是 `{"temperature_readings": [行…]}`；行为 `boh_domain::temperature::TemperatureReading`。
-- **取值**：不满足时 `400 VALIDATION_FAILED`。
+- **取值**：
   - `celsius_x10` 是 0.1 °C 的整数，`-500`～`5000`（-50.0～500.0 °C），两端可取。它只拦截单位或数量级录错，不是食安阈值，不产生警告。
   - `note` 可以省略；出现时非空、首尾不能有空白字符、最多 200 个字符（按 Unicode 字符计），不接受 `null`。首尾以外的空白和换行原样保存。
-  - 请求体不接受 `occurred_at`（补录入口见「时间」）。
-- **新建**：服务端生成 UUIDv7 作为读数 ID（聚合 ID），写一条 `aggregate_version = 1` 的 `TEMPERATURE_LOGGED`。
-  - `occurred_at`、`business_date` 按「时间」的相对校准计算。相对校准和营业日计算属于业务校验，在幂等检查之后执行。
-    - 理由：`recorded_at` 在写事务内才确定，`sent_at` 不在规范化请求中。重试即使带着会超限或溢出的新 `sent_at`，也返回首次响应，不重新校准。
-  - `CAPTURE_TOO_OLD`、时间溢出的 `VALIDATION_FAILED` 以及警告 `CAPTURE_TIME_ADJUSTED` 的 `details` 都是 `{}`。
-  - 设备不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": "EQUIPMENT", "id"}`。停用的设备照常受理；不限制 `equipment_type`。
-  - 同时命中多个业务错误时，返回哪一个不作规定。
+- **新建**：读数 ID 是聚合 ID，写 `TEMPERATURE_LOGGED`。
+  - 设备不存在：`404 REFERENCE_NOT_FOUND`，`entity` 为 `EQUIPMENT`。停用的设备照常受理；不限制 `equipment_type`。
 - **查询**：`business_date`（`'YYYY-MM-DD'`，真实日期）必填，`equipment_id` 可选；不分页。按 `occurred_at` 升序，相同时按 `seq` 升序；含停用设备的读数。
   - 参数缺失、取值非法、未知或重复的参数：`400 VALIDATION_FAILED`。`equipment_id` 合法但不存在时返回空数组。
 - 投影 `temperature_readings` 每条读数一行，字段以迁移 003 为准。冲销在投影和查询中的体现随纠错切片设计。
@@ -468,26 +488,22 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 
 - 请求体与行见 `boh_domain::receiving` 的 `CreateReceipt`、`Receipt`；`input` 见「单位」。
 - 写命令成功的 `data` 是 `{"receipt": 行}`；行的 `lines` 与 payload 的 `lines` 相同。
-- **取值**：不满足时 `400 VALIDATION_FAILED`，`details` 为 `{}`。
+- **取值**：
   - `lines` 非空。同一物料可以有多行，各行分别建批次。
-  - `input.qty`、`input.base_qty_per_unit` 是正整数；`input.unit_code` 非空、首尾不能有空白字符。`input.qty × input.base_qty_per_unit` 不超出 `i64`。
+  - `input` 见「单位」。
   - `line_cost_cents` 是该行总金额（分），`>= 0`。
   - `manufacturer_lot_no` 可以省略；出现时非空、首尾不能有空白字符、最多 64 个字符（按 Unicode 字符计），不接受 `null`。
   - `produced_on`（生产日期）、`expires_on`（到期日）必填，是包装标签上的门店当地日期，格式 `'YYYY-MM-DD'`（真实日期），`produced_on <= expires_on`，`expires_on` 不晚于 `9998-12-31`（`expires_at` 由次日当地 0 点换算，须在时间戳范围内）。标签只印保质期时长时，由客户端按日历推算 `expires_on`。
-  - 请求体不接受 `occurred_at`（补录入口见「时间」）。
-- **新建**：服务端生成 UUIDv7 作为收货 ID（聚合 ID），每行按「批次」生成一个批次号 `lot_id`，写一条 `aggregate_version = 1` 的 `GOODS_RECEIVED@2`。
-  - `occurred_at`、`business_date` 按「时间」的相对校准计算，规则与温度记录相同（`CAPTURE_TOO_OLD`、时间溢出的 `VALIDATION_FAILED`、`CAPTURE_TIME_ADJUSTED` 的 `details` 都是 `{}`）。
+- **新建**：收货 ID 是聚合 ID，每行按「批次」生成一个批次号 `lot_id`，写 `GOODS_RECEIVED@2`。
   - payload 每行：`qty = input.qty × input.base_qty_per_unit`；`expires_at` 是 `expires_on` 在门店时区（配置 `timezone`）的当日最后一毫秒，即次日当地 0 点的 UTC 毫秒减 1。
     - 理由：`projections::apply` 不读配置，换算结果必须写进 payload。
   - 批次日期是 `occurred_at` 的门店当地日历日期，与下面 `INVALID_LOT_DATES` 的 D 相同。
-- **业务校验**（幂等检查之后）：同时命中多个业务错误时，返回哪一个不作规定；都不写事件或 `processed_commands`。
-  - 供应商、物料不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": "SUPPLIER" / "ITEM", "id"}`。停用的照常受理。
-  - `unit_code` 既不是物料的 `base_unit` 也不在 `units` 中：`400 UNKNOWN_UNIT`，`details` 为 `{"line", "item_id", "unit_code"}`。
-  - 系数与当前值不同：`409 UNIT_CONVERSION_CHANGED`，`details` 为 `{"line", "item_id", "unit_code", "base_qty_per_unit": 当前值}`。`unit_code` 等于 `base_unit` 时当前值为 1。
+- **业务校验**：
+  - 供应商、物料不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": "SUPPLIER" / "ITEM", "id"}`。
+  - `UNKNOWN_UNIT`、`UNIT_CONVERSION_CHANGED`：见「单位」。
   - 日期与收货时间矛盾：`400 INVALID_LOT_DATES`，`details` 为 `{"line", "item_id", "reason"}`。以 `occurred_at` 在门店时区的日历日期 D 判定（不是营业日）：`produced_on > D` 时 `reason = "PRODUCED_IN_FUTURE"`；`expires_on < D` 时 `reason = "EXPIRED_ON_RECEIPT"`。等于 D 都允许。
     - 用日历日期而不是营业日：日切前（如凌晨 2 点）收到当天生产的货是正常的。
   - 流水号用尽：`409 LOT_SERIAL_EXHAUSTED`（见「批次」）。
-  - `line` 是行在 `lines` 中的下标。
 - **警告**：`CAPTURE_TIME_ADJUSTED` 在前，之后按 `line` 升序的 `EXPIRES_BEFORE_OLDER_STOCK`（见「批次」）。
 - **吸收**：收货行新建批次，不被盘点吸收（见「盘点吸收」）。
 - **投影**：每行在 `inventory_lots` 建一个 `origin = 'RECEIPT'` 的批次（`lot_id` 及由它拆出的批次日期和流水号，`source_line_no` 是行下标，`remaining_qty = qty`），在 `inventory_movements` 写一条 `kind = 'RECEIPT'`、`alloc_source = 'NEW_LOT'` 的流水，`physical_at = occurred_at`。`line_cost_cents`、`produced_on` 只在事件中。
@@ -508,29 +524,26 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 
 - 请求体与行见 `boh_domain::waste` 的 `LogWaste`、`WasteRecord`；`input` 见「单位」。`lot_id` 是员工指定的批次，`reason_code` 是 `WASTE_REASON` 的 `code`，`confirm_shortage` 见下方「不足确认」。
 - 写命令成功的 `data` 是 `{"waste_record": 行}`；行的 `lines` 与 payload 的 `lines` 相同。
-- **取值**：不满足时 `400 VALIDATION_FAILED`，`details` 为 `{}`。
+- **取值**：
   - `lines` 非空。同一物料、同一批次都可以出现在多行（例如不同原因）。
-  - `input` 的规则同收货：`input.qty`、`input.base_qty_per_unit` 是正整数；`input.unit_code` 非空、首尾不能有空白字符；`input.qty × input.base_qty_per_unit` 不超出 `i64`。
+  - `input` 见「单位」。
   - `reason_code` 非空、首尾不能有空白字符。
   - `lot_id` 可以省略；出现时符合批次号格式（同「批次查询」），不接受 `null`。
   - `confirm_shortage` 可以省略；出现时是布尔值，不接受 `null`。省略与 `false` 等价，两者的规范化请求相同；`true` 保留在规范化请求中，参与幂等比对。
-  - 请求体不接受 `occurred_at`（补录入口见「时间」）。
-- **新建**：服务端生成 UUIDv7 作为报损 ID（聚合 ID），写一条 `aggregate_version = 1` 的 `WASTE_LOGGED`。
-  - `occurred_at`、`business_date` 按「时间」的相对校准计算，规则与温度记录相同（`CAPTURE_TOO_OLD`、时间溢出的 `VALIDATION_FAILED`、`CAPTURE_TIME_ADJUSTED` 的 `details` 都是 `{}`）。
+- **新建**：报损 ID 是聚合 ID，写 `WASTE_LOGGED`。
   - payload 每行：`qty = input.qty × input.base_qty_per_unit`；`lot_id` 取请求中指定的批次，未指定时省略；`item_book_qty`、`lot_book_qty` 和 `alloc` 按下方「逐行处理」得出。
   - payload 结构与键顺序见 `boh_domain::waste::WasteLogged`；样本 `crates/boh-app/tests/golden/WASTE_LOGGED@1/`。
   - `confirm_shortage` 不写进 payload。
     理由：账面值记录当时是否不足，确认标记记录员工的选择，两者含义不同；后者保存在规范化请求中。
-- **业务校验**（幂等检查之后）：同时命中多个业务错误时，返回哪一个不作规定；都不写事件或 `processed_commands`。不足确认在其余业务校验都通过之后判定。
+- **业务校验**：不足确认在其余业务校验都通过之后判定。
   - 物料不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": "ITEM", "id"}`。指定的批次不存在：`details` 为 `{"entity": "LOT", "id"}`。
   - 报损原因不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": "WASTE_REASON", "code"}`。
-  - 停用的物料、报损原因照常受理；指定余量为 0 或为负的批次照常受理（按下方规则需要确认）。
+  - 指定余量为 0 或为负的批次照常受理（按下方规则需要确认）。
   - 指定的批次属于其他物料：`400 LOT_ITEM_MISMATCH`，`details` 为 `{"line", "item_id", "lot_id"}`。
   - 物料还没有任何批次（从未收货入库）：`409 ITEM_HAS_NO_LOTS`，`details` 为 `{"line", "item_id"}`。带确认标记也拒绝：确认只处理数量不足，不授予报损资格。
     - 依据是 `inventory_lots` 中有没有该物料的批次，不是 `inventory_on_hand` 的行（视图对每个物料都有一行）。批次由收货建立（生产产出随生产切片加入），余量为 0 后也保留，所以曾经入库、现已耗尽的物料照常按下方规则处理。
   - 数量越界：逐行处理中的物料净账面（含最后一行扣减之后的）、批次余量或账外缺口超出 `i64`，即使各批次余量和账外缺口本身都可表示：`400 VALIDATION_FAILED`，`details` 为 `{}`。整条命令不入账，前面的正常行也不入账；不得绕回、截断或钳制后继续。
-  - `UNKNOWN_UNIT`、`UNIT_CONVERSION_CHANGED`：同收货。
-  - `line` 是行在 `lines` 中的下标。
+  - `UNKNOWN_UNIT`、`UNIT_CONVERSION_CHANGED`：见「单位」。
 - **逐行处理**：按 `lines` 顺序，每行看到的账面是同一命令中前面各行处理之后的值。
   1. **吸收**：按「盘点吸收」判定（随盘点切片实现；在此之前每行都不被吸收）。被吸收的行写 `absorbed_by_event_id`，不需要确认，带了确认标记也忽略，不改变后续各行看到的账面。
   2. **账面**：`item_book_qty` 是该行之前的物料净账面（该物料全部批次余量之和，含负数，加账外缺口，即视图 `inventory_on_hand` 的值）。指定批次的行另记 `lot_book_qty`，即该行之前该批次的余量。被吸收的行同样记录。
@@ -556,7 +569,7 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
   - 结果未知（超时、断线）时，先用原 ID、原内容重试取回结果，不能直接加确认标记。首次已成功时，原内容重试返回首次响应，即使已超过 72 小时（幂等检查先于时间校准）。
   - 成功之后用同一个 ID 去掉或改变确认标记：`409 IDEMPOTENCY_CONFLICT`，`fields` 为 `["lines"]`。
   - 修改某行的物料、批次或数量后，客户端清除该行的确认，重新预检。
-- **警告**：本切片只有 `CAPTURE_TIME_ADJUSTED`。盘点切片实现吸收判定后，被吸收的行另返回 `ABSORBED_BY_COUNT`（见「盘点吸收」）。
+- **警告**：`CAPTURE_TIME_ADJUSTED`；被吸收的行另返回 `ABSORBED_BY_COUNT`（见「盘点吸收」；吸收判定随盘点切片实现，现在不产生）。
   - 报损不返回 `STOCK_SHORTFALL`：不足已在入账前提示并确认，事件中有提交时的账面。
 - **投影**：
   - 未被吸收的行：`alloc` 按顺序每项写一条 `inventory_movements`，`kind = 'WASTE'`，`alloc_source` 取该项的 `source`，`lot_id` 取该项的 `lot_id`（`SHORTFALL` 为 `NULL`），`nominal_qty = qty_delta = −qty`，`physical_at = occurred_at`。
@@ -610,6 +623,20 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 ## 验收用例
 
 写成锁定测试之前，预期数值由人工逐条确认（见 AGENTS.md「测试分工」）。初始状态：账面 = 实物。
+已锁定的主题，完整算例在锁定测试中，这里只留一个代表例子；尚未实现的切片的用例在「待实现」表中。
+
+### 已锁定
+
+| 主题 | 代表例子 | 预期 | 锁定测试（`crates/boh-app/tests/`） |
+|---|---|---|---|
+| 报损不足确认与分配 | 只有批次 A 5；报损 8 g，不指定批次 | 不带确认时 `409 WASTE_CONFIRMATION_REQUIRED`；确认后 `A 5 FIFO` + `3 SHORTFALL`；A **0**，账外缺口 **−3**，账面 **−3**；不返回 `STOCK_SHORTFALL` | `spec_waste.rs` |
+| 批次号与 FIFO | 面粉：09-10 08:00 收货一行；09-10 14:00 收货两行；09-11 收货一行；09-12 经相对校准（lag 72 小时）入账一张 09-09 的收货 | 批次号依次为 `RAW-FLOUR-20260910-001`、`…-002`、`…-003`、`…-20260911-001`、`…-20260909-001`；FIFO 先扣 `…-20260909-001` | `spec_lot_numbers.rs`、`spec_waste.rs` |
+| 批次号重建 | 同次收货 A、B 后清空投影、按 `seq` 重建，再报损 8 g，不指定批次 | 批次号不变；分配 `A 5 FIFO` + `B 3 FIFO` | `spec_replay.rs` |
+| 收货日期 | 10-08 02:00 收货（营业日 10-07），`produced_on` 10-08 | 照常受理；`produced_on` 10-09 时 `400 INVALID_LOT_DATES`，`reason` `PRODUCED_IN_FUTURE` | `spec_receiving.rs` |
+| 单位换算 | 离线录入「2 袋，每袋 25000 g」；提交前换算改为 20000 | `409 UNIT_CONVERSION_CHANGED`，不入账 | `spec_receiving.rs`、`spec_waste.rs` |
+| 幂等 | 同一命令发送 2 次，`sent_at` 不同 | 第二次原样返回首次响应（含 warnings），`seq` 不增加 | 各接口的 `spec_*.rs` |
+
+### 待实现
 
 | 用例 | 过程 | 预期 |
 |---|---|---|
@@ -621,26 +648,9 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 | 迟到报损 | 100；09:00 报损 10 留在平板队列；09:20 盘点得 90（调整 −10）；09:40 报损送达 | 被吸收；账面 **90**；未解释损耗 **0** |
 | 补录报损 | 100；15:00 盘点得 50（调整 −50）；16:00 补录报损 50，`occurred_at = 10:00` | 被吸收；账面 **50**；报损 **50**；未解释损耗 **0** |
 | 盘点后冲销 | 100；09:00 误报损 10，账面 90；09:20 盘点得 100（调整 +10）；10:00 冲销报损 | 被吸收；账面 **100**；报损合计 **0**；未解释损耗 **0** |
-| 闭店重盘 | 成品账面 100；先盘为 80，再盘为 90；销售 0 | 调整净和 **−10**；未解释损耗 **10** |
-| 指定批次不足 | 面粉批次 A 5、B 10；报损面粉 8 g，指定 A | 不带确认：`409 WASTE_CONFIRMATION_REQUIRED`，列出该行（`lot_book_qty` **5**、`item_book_qty` **15**），不入账；同一 `command_id` 加确认重提后分配 `A 8 SPECIFIED`；A **−3**，B **10** 不动 |
-| 指定批次、净账面不足 | 批次 A 5，账外缺口 −10；报损 3 g，指定 A | 批次够但净账面 **−5** 不足：不带确认时 `409 WASTE_CONFIRMATION_REQUIRED`；确认后 `A 3 SPECIFIED`；A **2**，账面 **−8** |
-| 有负批次时不指定批次 | 批次 A −3、B 10（净账面 7）；报损 8 g，不指定批次 | 需要确认；确认后 `B 8 FIFO`；A **−3**、B **2**，账外缺口 **0**，账面 **−1** |
-| 不足记入账外缺口 | 只有批次 A 5；报损 8 g，不指定批次 | 需要确认；确认后 `A 5 FIFO` + `3 SHORTFALL`；A **0**，账外缺口 **−3**，账面 **−3**；不返回 `STOCK_SHORTFALL` |
-| 同一命令的后续行 | 批次 A 5、B 10（A 在前）；一次报损两行：`lines[0]` 不指定批次 8 g，`lines[1]` 指定 A 1 g | `409` 只列 `line` **1**（`lot_book_qty` **0**、`item_book_qty` **7**）；确认后 `lines[0]` 为 `A 5 FIFO` + `B 3 FIFO`，`lines[1]` 为 `A 1 SPECIFIED`；A **−1**、B **7** |
-| 从未收货的物料 | 面粉已有批次；糖已建档但从未收货；报损糖 1 g（带或不带确认），或一次报损面粉 1 g 和糖 1 g | `409 ITEM_HAS_NO_LOTS`，列出糖所在的行；整条不入账；预检同样拒绝 |
-| 收货后耗尽 | 只有批次 A 5，报损 8 g 确认后 A **0**、账外缺口 −3；再报 2 g，不指定批次 | 照常需要确认；确认后整行 `2 SHORTFALL`，账外缺口 **−5** |
-| 数量越界 | 批次 A 的余量已是 `i64::MIN + 2`；指定 A 报 3 g（确认）；或同一命令前面另有一条正常行 | `400 VALIDATION_FAILED`；整条不入账；指定 A 报 2 g（确认）照常入账，A 为 `i64::MIN`。账外缺口累加越界同样处理 |
-| 预检只读 | 批次 A 5；预检报损 8 g，指定 A | 返回该行 `needs_confirmation` **true**、`lot_book_qty` **5**、预计 `A 8 SPECIFIED`；事件、投影和 `processed_commands` 不变 |
-| 确认后不足加大 | 批次 A 5；预检指定 A 报 8 后员工确认；提交前另一台平板报损 A 2 已入账；带确认提交 | 照常入账，`lot_book_qty` **3**（提交时的值）；A **−5** |
-| 提交时新出现的不足 | 批次 A 5；预检指定 A 报 4 不需要确认；提交前另一台平板报损 A 2 已入账；不带确认提交 | `409 WASTE_CONFIRMATION_REQUIRED`（`lot_book_qty` **3**）；不入账 |
-| 确认标记与幂等 | 带确认的报损成功后，用原 `command_id`、原内容重发；再去掉确认标记重发 | 第一次原样返回首次响应，`seq` 不增加；第二次 `409 IDEMPOTENCY_CONFLICT`，`fields` 为 `["lines"]` |
-| 同次收货多个批次 | 09-10 一次收货面粉两行：`lines[0]` 建 A（`RAW-FLOUR-20260910-001`）5 g，`lines[1]` 建 B（`…-002`）10 g；报损面粉 8 g，不指定批次 | 按批次号分配 `A 5 FIFO` + `B 3 FIFO`；余量 A **0**、B **7** |
-| 同次收货重复提交 | 上例扣减后，用原 `command_id`、原内容重发收货 | 返回原批次号 A、B；`seq` 不增加；余量仍为 A **0**、B **7** |
-| 批次号重建 | 保存同次收货后尚未扣减的原库结果，清空投影，按 `seq` 重建，再报损面粉 8 g，不指定批次 | 重建后投影逐行一致，批次号仍为 `…-001`、`…-002`；后续分配 `A 5 FIFO` + `B 3 FIFO`，余量 A **0**、B **7** |
-| 批次日期与流水号 | 面粉：09-10 08:00 收货一行；09-10 14:00 收货两行；09-11 收货一行；09-12 补录一张 09-09 的收货 | 批次号依次为 `RAW-FLOUR-20260910-001`、`…-20260910-002`、`…-20260910-003`、`…-20260911-001`、`…-20260909-001`；FIFO 先扣 `…-20260909-001` |
-| 午夜前后的批次日期 | 服务器时间 10-09 00:10 收货，lag 20 分钟；另一次 lag 5 分钟 | 前者 `occurred_at` 为 10-08 23:50，批次日期 **20261008**；后者为 10-09 00:05，批次日期 **20261009** |
-| 流水号用尽 | 同一物料同一天已有 `…-999` 批次，再收一行 | `409 LOT_SERIAL_EXHAUSTED`；不入账 |
-| 修改物料分类 | 面粉（`RAW`）已有批次 `RAW-FLOUR-20260910-001`；把分类改为 `SEMI` 后当天再收货 | 原批次号不变；新批次为 `SEMI-FLOUR-20260910-002`（流水号按物料与日期连续） |
+| 盘点后的正常业务 | 09:20 盘点；10:30 报损并提交 | 不被吸收，正常扣减 |
+| 盘点后补录收货 | 09:00 到货一袋面粉未登记，09:20 盘点面粉时未清点它；09:40 补录收货，`occurred_at = 09:00` | 不被吸收，照常建批次；账面 = 盘点数 + 这袋面粉 |
+| 冲销盘点后补录的收货 | 上例补录的收货录错，10:00 冲销 | 不被 09:20 的盘点吸收（盘点时该批次不存在）；从该批次扣回 |
 | 按批次盘点 | 批次 A 5、B 10，账外缺口 −2；清点 A 4、B 10 | A 调整 −1；账外缺口 +2 归零；账面 **14** |
 | 盘点负余量批次 | 批次 A −3；清点 A 2 | A 调整 **+5**；A **2** |
 | 盘点补加零余量批次 | 批次 A 0（已登记），实物找到 3；按批次号补加 A，清点 3 | A 调整 **+3**；A **3** |
@@ -651,20 +661,13 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 | 余量以提交时为准 | 打开盘点表时 A 5；提交前另一台平板报损 A 2 已入账；提交 A 4 | `book_qty` **3**，`delta` **+1**；账面 **4**；响应返回这些值 |
 | 盘点重复提交 | 盘点成功后又报损该物料；同一 `command_id` 重发盘点 | 原样返回首次的响应；`seq` 不增加 |
 | 分次闭店盘点 | 面粉账面 100、黄油账面 50；21:00 `CLOSING` 只盘面粉得 90；21:30 `CLOSING` 只盘黄油得 48 | 面粉调整 −10、黄油调整 −2；各写一行 `inventory_counts` |
-| 换算变化 | 离线录入「2 袋，每袋 25000 g」；提交前换算改为 20000 | `409 UNIT_CONVERSION_CHANGED`，不入账 |
-| 到期早于先扣的批次 | 面粉已有批次 A 余量 5、到期 10-20；一次收货 `lines[0]` 到期 10-15，`lines[1]` 到期 10-25，`lines[2]` 到期 10-22 | 两条 `EXPIRES_BEFORE_OLDER_STOCK`：`line` **0**（早于 A）、`line` **2**（早于同次的 `lines[1]`）；`lines[1]` 不警告；三行都入账 |
-| 到货即过期 | 10-08 收货，`expires_on` 10-07 | `400 INVALID_LOT_DATES`，`reason` `EXPIRED_ON_RECEIPT`；不入账。`expires_on` 10-08 照常受理 |
-| 凌晨收当天生产的货 | 10-08 02:00 收货（营业日 10-07），`produced_on` 10-08 | 照常受理；`produced_on` 10-09 时 `400 INVALID_LOT_DATES`，`reason` `PRODUCED_IN_FUTURE` |
-| 销售示例 | 生产 100、报损 8、闭店实数 5（调整 −87）、销售 84 | 未解释损耗 **3** |
-| 幂等 | 同一命令发送 2 次，`sent_at` 不同 | 第二次原样返回首次响应（含 warnings），`seq` 不增加 |
-| 盘点后的正常业务 | 09:20 盘点；10:30 报损并提交 | 不被吸收，正常扣减 |
-| 盘点后补录收货 | 09:00 到货一袋面粉未登记，09:20 盘点面粉时未清点它；09:40 补录收货，`occurred_at = 09:00` | 不被吸收，照常建批次；账面 = 盘点数 + 这袋面粉 |
-| 冲销盘点后补录的收货 | 上例补录的收货录错，10:00 冲销 | 不被 09:20 的盘点吸收（盘点时该批次不存在）；从该批次扣回 |
 | 冲销时批次已消耗 | 收货批次 L 10，已用掉 3，之后没有盘点；冲销这次收货 | L 扣到 **0**；账外缺口 **−3**；返回 `STOCK_SHORTFALL` |
 | 数量更正 | 收货录成 1000（实际 100），批次 L1；生产从 L1 扣 300；之后没有盘点；更正为 100 | L1 **−200**；账外缺口 **0**；返回 `STOCK_SHORTFALL` |
 | 更正多次后冲销 | 报损 10 → 更正为 8 → 更正为 6 → 冲销 | 冲销退回 **6**；报损合计 **0** |
 | 重复冲销 | 同一事件冲销两次 | 第二次 `409 ALREADY_REVERSED` |
 | 冲销后更正 | 冲销后再更正同一事件 | `409 ALREADY_REVERSED` |
+| 闭店重盘 | 成品账面 100；先盘为 80，再盘为 90；销售 0 | 调整净和 **−10**；未解释损耗 **10** |
+| 销售示例 | 生产 100、报损 8、闭店实数 5（调整 −87）、销售 84 | 未解释损耗 **3** |
 
 ## 未来功能（本期不实现）
 
