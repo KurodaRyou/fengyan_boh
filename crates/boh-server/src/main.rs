@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use boh_app::background::BackupTasks;
-use boh_app::{AppState, http};
+use boh_app::{AppState, InvariantCheckHealth, http};
 use boh_server::config::{Config, parse_config};
 use boh_storage::backup::{Backup, BackupHealth};
 use boh_storage::clock::Clock;
@@ -103,6 +103,7 @@ async fn run(
     )
     .context("prepare backup directory")?;
     let backup_health = BackupHealth::default();
+    let invariant_health = InvariantCheckHealth::default();
     let listener = tokio::net::TcpListener::bind(config.listen_addr)
         .await
         .with_context(|| format!("bind {}", config.listen_addr))?;
@@ -112,8 +113,10 @@ async fn run(
         backup_health.clone(),
         config.timezone.clone(),
         config.closing_backup_time,
+        readers.clone(),
+        invariant_health.clone(),
     )
-    .context("start backup scheduler")?;
+    .context("start backup scheduler and submit startup invariant check")?;
     let stop_backups = tasks.stop_handle();
     let shutdown = async move {
         tokio::select! {
@@ -132,6 +135,7 @@ async fn run(
         dev_actor_stub: config.dev_actor_stub,
         db_path: config.db_path,
         backup_health,
+        invariant_health,
     });
     tracing::info!(addr = %config.listen_addr, "listening");
     let served = axum::serve(listener, app)
@@ -139,12 +143,12 @@ async fn run(
         .await
         .context("http server");
 
-    tracing::info!("http stopped, draining backups");
+    tracing::info!("http stopped, draining backups and invariant checks");
     let stopped = tasks
         .shutdown()
         .await
-        .context("drain and stop backup tasks");
-    tracing::info!("backups stopped, draining writer");
+        .context("drain and stop backups, closing flows and invariant checks");
+    tracing::info!("background tasks stopped, draining writer");
     served?;
     stopped?;
     Ok(())

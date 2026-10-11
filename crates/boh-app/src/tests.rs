@@ -51,6 +51,7 @@ async fn node(dev_actor_stub: bool) -> Node {
         dev_actor_stub,
         db_path: dir.path().join("boh.db"),
         backup_health: Default::default(),
+        invariant_health: Default::default(),
     });
     Node {
         _dir: dir,
@@ -572,6 +573,7 @@ async fn health_reports_wal_io_failure_and_missing_wal_without_exposing_paths() 
             dev_actor_stub: false,
             db_path: path,
             backup_health: Default::default(),
+            invariant_health: Default::default(),
         });
         let (status, body) = send(router, Method::GET, "/health", json!({})).await;
         assert_eq!(status, expected_status);

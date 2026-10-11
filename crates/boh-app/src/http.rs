@@ -482,6 +482,7 @@ struct Health {
     last_backup_seq: Option<i64>,
     last_backup_failed_at: Option<boh_domain::UnixMillis>,
     wal_size_bytes: u64,
+    invariant_check: crate::invariant_check::InvariantCheckStatus,
 }
 
 async fn health(State(state): State<AppState>) -> Result<Json<Envelope<Health>>, ApiError> {
@@ -515,8 +516,12 @@ async fn health(State(state): State<AppState>) -> Result<Json<Envelope<Health>>,
     .await
     .map_err(|error| ApiError::from(StorageError::join("等待 WAL 文件查询", error)))??;
     let backup = state.backup_health.snapshot();
+    let invariant_check = state.invariant_health.snapshot();
     Ok(ok(Health {
-        status: if clock_regression_ms > 300_000 || backup.last_failed_at.is_some() {
+        status: if clock_regression_ms > 300_000
+            || backup.last_failed_at.is_some()
+            || invariant_check.degraded()
+        {
             "degraded"
         } else {
             "ok"
@@ -527,6 +532,7 @@ async fn health(State(state): State<AppState>) -> Result<Json<Envelope<Health>>,
         last_backup_seq: backup.last_seq,
         last_backup_failed_at: backup.last_failed_at,
         wal_size_bytes,
+        invariant_check,
     }))
 }
 

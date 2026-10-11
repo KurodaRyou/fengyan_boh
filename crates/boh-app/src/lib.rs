@@ -3,6 +3,10 @@
 pub mod actor;
 pub mod background;
 pub mod http;
+mod invariant_check;
+pub use invariant_check::InvariantCheckHealth;
+#[doc(hidden)]
+pub use invariant_check::InvariantCheckHold;
 mod service;
 pub use service::master_data::initialize_store;
 #[cfg(test)]
@@ -34,6 +38,7 @@ pub struct AppState {
     pub dev_actor_stub: bool,
     pub db_path: PathBuf,
     pub backup_health: BackupHealth,
+    pub invariant_health: InvariantCheckHealth,
 }
 
 /// 构造与生产入口共用路由的 HTTP 黑盒测试入口。
@@ -62,6 +67,7 @@ pub fn test_router(db_path: &Path, clock: Clock) -> Result<Router, StorageError>
         dev_actor_stub: true,
         db_path: db_path.to_owned(),
         backup_health: BackupHealth::default(),
+        invariant_health: InvariantCheckHealth::default(),
     }))
 }
 
@@ -79,12 +85,25 @@ pub struct TestNode {
     backup: Backup,
     tasks: background::BackupTasks,
     writer_handle: boh_storage::WriterHandle,
+    writer: Writer,
 }
 
 impl TestNode {
     #[allow(clippy::disallowed_methods)] // Locked backup tests pause execution through this test-node entry point.
     pub fn hold_backups(&self) -> BackupHold {
         self.backup.hold()
+    }
+
+    pub fn writer(&self) -> Writer {
+        self.writer.clone()
+    }
+
+    pub async fn run_invariant_check(&self) {
+        self.tasks.run_invariant_check().await;
+    }
+
+    pub fn hold_invariant_checks(&self) -> InvariantCheckHold {
+        self.tasks.hold_invariant_checks()
     }
 
     pub async fn shutdown(self) -> Result<(), StorageError> {
@@ -122,12 +141,15 @@ pub async fn test_node(
         return Err(error);
     }
     let backup_health = BackupHealth::default();
+    let invariant_health = InvariantCheckHealth::default();
     let tasks = match background::BackupTasks::start(
         backup.clone(),
         clock.clone(),
         backup_health.clone(),
         timezone.clone(),
         closing,
+        storage.readers.clone(),
+        invariant_health.clone(),
     ) {
         Ok(tasks) => tasks,
         Err(error) => {
@@ -136,7 +158,7 @@ pub async fn test_node(
         }
     };
     let router = http::router(AppState {
-        writer: storage.writer,
+        writer: storage.writer.clone(),
         readers: storage.readers,
         clock,
         timezone,
@@ -144,12 +166,14 @@ pub async fn test_node(
         dev_actor_stub: true,
         db_path: db_path.to_owned(),
         backup_health,
+        invariant_health,
     });
     Ok(TestNode {
         router,
         backup,
         tasks,
         writer_handle: storage.writer_handle,
+        writer: storage.writer,
     })
 }
 

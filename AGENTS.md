@@ -3,7 +3,7 @@
 烘焙门店后厨（BOH）系统的门店本地节点。部署在每家门店的一台 Linux 机器上，局域网内的平板通过浏览器（门店节点托管的 Web SPA）访问。
 **断网是常态，不是异常**：所有门店内核心操作必须在完全离线时正常工作，联网后再把事件同步到总部。
 
-业务决策、事件目录与领域规则见 [docs/domain.md](docs/domain.md)；系统依赖的门店操作规范见 [docs/sop.md](docs/sop.md)；规范用词见 [docs/glossary.md](docs/glossary.md)；锁定测试使用的接口见 [docs/interfaces.md](docs/interfaces.md)；备份模块的细则见 [docs/backup.md](docs/backup.md)。
+业务决策、事件目录与领域规则见 [docs/domain.md](docs/domain.md)；系统依赖的门店操作规范见 [docs/sop.md](docs/sop.md)；规范用词见 [docs/glossary.md](docs/glossary.md)；锁定测试使用的接口见 [docs/interfaces.md](docs/interfaces.md)；备份模块的细则见 [docs/backup.md](docs/backup.md)；不变量自检的细则见 [docs/invariant-check.md](docs/invariant-check.md)。
 
 本文件是所有编码 agent（Codex、Antigravity、Claude Code 等）共用的项目规则。
 
@@ -157,7 +157,7 @@
                 └─ INSERT processed_commands（含响应和 warnings）
               COMMIT
 
-   定时任务（读连接 / 备份连接）：不变量自检、备份
+   后台任务（读连接 / 备份连接）：备份、不变量自检
    同步 worker（待实现，与请求完全解耦）
    └─ SELECT store_events WHERE seq > acked_seq ORDER BY seq ─► mTLS 推送总部 ─► 更新 sync_state
 ```
@@ -208,6 +208,12 @@ scripts/        CI 扫描脚本。
 - 新备份经完整性与 `seq` 校验、文件 fsync、原子重命名和目录 fsync 之后才算成功；失败只记日志并反映在 `/health`，不重试、不退出进程、不影响写入。
 - 禁止并发备份。收到停止信号后不再接受新的触发，先执行完正在进行和已排队的备份，再关写线程。
 - **恢复演练写成测试**：从备份恢复、清空投影并重建，结果必须和原库一致。只验证备份文件生成了不算数。
+
+### 不变量自检
+细则（检查项、报告结构、触发、关闭、测试要求）见 [docs/invariant-check.md](docs/invariant-check.md)。
+- 启动时一次，之后随闭店流程（先备份，再自检）每天一次；没有独立的定时触发。所有检查经同一个入口串行执行。
+- 一次检查只用一个 `Readers::call`，全部检查项看到同一个快照。
+- 结果只放在进程内存中，经 `/health` 报告；不写数据库，不自动修复。发现违规或检查失败都不拒绝启动、不阻止写入和备份、不让进程退出或重启。
 
 ### 迁移
 - 迁移文件一旦发布（合并到主干）**禁止修改**，只能新增下一个编号的文件。schema 测试对每个迁移文件做内容校验和。
@@ -302,7 +308,7 @@ scripts/        CI 扫描脚本。
   crate 级 `clippy.toml` 会覆盖根目录的配置，所以根目录的规则要完整复制进去。
 - 禁止在上表以外的位置豁免这些 lint，禁止用 crate 级 `#![allow]` 放宽任何 deny 的 lint。
 - Release 配置 `panic = "abort"`：任何 panic 都直接结束进程，由 systemd 重启。不要用 `catch_unwind` 吞 panic。
-- 优雅关闭顺序：停止接收 HTTP → 停止同步 worker 和定时任务（执行完正在进行和已排队的备份） → `WriterHandle::shutdown()` 处理完已入队的写任务 → `wal_checkpoint(TRUNCATE)` → 退出。
+- 优雅关闭顺序：停止接收 HTTP → 停止同步 worker 和后台任务（执行完正在进行和已排队的备份、闭店流程与自检） → `WriterHandle::shutdown()` 处理完已入队的写任务 → `wal_checkpoint(TRUNCATE)` → 退出。
   - checkpoint 因读事务未结束而未能截断 WAL（`CheckpointBusy`）时只记 `warn`，正常退出：已提交的事务已持久化在 WAL 中，下次打开时 SQLite 用保留的 WAL 读取并在需要时恢复已提交状态，checkpoint 在之后满足触发条件时执行。
     只有 `CheckpointBusy` 这样处理；I/O 错误、数据库损坏、关闭连接失败等照常报错。
 
@@ -357,15 +363,14 @@ scripts/        CI 扫描脚本。
   | `last_backup_seq` | 该次备份的 `n`（见「备份」）；同上为 `null` |
   | `last_backup_failed_at` | 本进程最近一次备份尝试失败时为该次失败时的 `now()`；最近一次尝试成功或还没有尝试时为 `null` |
   | `wal_size_bytes` | `<数据库文件>-wal` 的大小；文件不存在时为 0 |
+  | `invariant_check` | 本进程最近一次不变量自检的尝试与报告，结构见 [docs/invariant-check.md](docs/invariant-check.md)「报告」 |
 
-  - `clock_regression_ms > 300000`，或 `last_backup_failed_at` 不是 `null`，`status` 为 `degraded`；否则为 `ok`。
+  - `clock_regression_ms > 300000`，`last_backup_failed_at` 不是 `null`，或 `invariant_check.last_attempt.result` 是 `violated` / `failed`，`status` 为 `degraded`；否则为 `ok`。
     `degraded` 只是报告：不阻止任何写入，不让进程退出或重启。
   - 备份字段只反映本进程：`null` 表示「本进程还不知道」，不表示没有备份；重启会清掉失败状态。`ok` 只表示本进程暂未发现异常，不表示已有一份可用备份。
     判断备份是否过期、重启前的历史，留到需要「门店当前是否受有效备份保护」时另行设计。
   - 生成报告成功返回 `200`（含 `degraded`）；查询数据库或读取 WAL 文件失败（文件不存在除外）返回 `500 INTERNAL_ERROR`。监控必须看 `data.status`，不能只看状态码。
-  - 后续加入的字段：认证实现后加 `auth_failures_last_hour`；同步实现后加 `max(seq) − acked_seq` 和最后一次成功同步的时间；
-    不变量自检切片加最近一次的结果（检查范围、结果结构、检查任务自身失败与发现不变量被破坏如何分别报告，随该切片定）。
-  - 不变量自检由定时任务在读连接上执行：启动时一次，之后每个 UTC 整点后 30 分一次；`/health` 只返回最近一次的结果，不现场计算。
+  - 后续加入的字段：认证实现后加 `auth_failures_last_hour`；同步实现后加 `max(seq) − acked_seq` 和最后一次成功同步的时间。
 
 ---
 
