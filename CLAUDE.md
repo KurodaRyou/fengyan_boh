@@ -25,7 +25,7 @@ Review 时以 AGENTS.md 的「不可违反的规则」为检查清单，逐条�
 
 | 时机 | Skill | 用法 |
 |---|---|---|
-| 开发顺序第 4 步，人确认预期值之前 | `engineering:testing-strategy` | 对照 `docs/domain.md` 查锁定测试的覆盖缺口，列给人决定是否补 |
+| 开发顺序第 4 步，人确认预期值之前 | `engineering:testing-strategy` | 对照 `docs/domain.md`、`docs/auth.md` 查锁定测试的覆盖缺口，列给人决定是否补 |
 | 「尚未设计」事项的方案讨论 | `engineering:architecture`、`engineering:system-design` | 产出只放 `workdocs/`，结论按「文档分层」写回 `docs/` |
 | 首次部署门店机之前 | `engineering:deploy-checklist` | 结合 `deploy/`、`docs/backup.md` 与「优雅关闭」生成检查表 |
 

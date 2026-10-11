@@ -3,7 +3,7 @@
 烘焙门店后厨（BOH）系统的门店本地节点。部署在每家门店的一台 Linux 机器上，局域网内的平板通过浏览器（门店节点托管的 Web SPA）访问。
 **断网是常态，不是异常**：所有门店内核心操作必须在完全离线时正常工作，联网后再把事件同步到总部。
 
-业务决策、事件目录与领域规则见 [docs/domain.md](docs/domain.md)；系统依赖的门店操作规范见 [docs/sop.md](docs/sop.md)；规范用词见 [docs/glossary.md](docs/glossary.md)；锁定测试使用的接口见 [docs/interfaces.md](docs/interfaces.md)；备份模块的细则见 [docs/backup.md](docs/backup.md)；不变量自检的细则见 [docs/invariant-check.md](docs/invariant-check.md)。
+业务决策、事件目录与领域规则见 [docs/domain.md](docs/domain.md)；系统依赖的门店操作规范见 [docs/sop.md](docs/sop.md)；规范用词见 [docs/glossary.md](docs/glossary.md)；锁定测试使用的接口见 [docs/interfaces.md](docs/interfaces.md)；备份模块的细则见 [docs/backup.md](docs/backup.md)；不变量自检的细则见 [docs/invariant-check.md](docs/invariant-check.md)；员工认证与设备注册见 [docs/auth.md](docs/auth.md)。
 
 本文件是所有编码 agent（Codex、Antigravity、Claude Code 等）共用的项目规则。
 
@@ -30,7 +30,7 @@
 | 测试 | 编写 | 锁定 | 位置 |
 |---|---|---|---|
 | Schema 测试、迁移校验和 | Claude | 是 | `crates/boh-storage/tests/schema.rs` |
-| 验收用例（`docs/domain.md`「验收用例」） | Claude 写，预期值由人确认 | 是 | `crates/*/tests/spec_*.rs` |
+| 验收用例（`docs/domain.md`、`docs/auth.md` 的「验收用例」） | Claude 写，预期值由人确认 | 是 | `crates/*/tests/spec_*.rs` |
 | Golden payload：每个 `event_type@schema_version` 的每种 payload 结构变体至少一份 | Claude | 是 | `crates/*/tests/golden/` |
 | HTTP 契约：状态码、错误码、信封、重复提交同一 `command_id` | Claude | 是 | `crates/*/tests/spec_*.rs` |
 | 重放一致性：清空投影、重建、逐行比对 | Claude | 是 | `crates/*/tests/spec_*.rs` |
@@ -253,17 +253,18 @@ scripts/        CI 扫描脚本。
 
 ### 幂等
 - 每个写命令必须带客户端生成的 `command_id`（UUIDv7）。超时或结果未知时，客户端**必须用原 ID、原内容重试**。
-- 规范化请求：把命令反序列化成强类型结构体再序列化，剥离 `command_id` 和 `sent_at`，按下述例外处理敏感字段后存进 `processed_commands.request`。
-  普通业务命令只剥离这两个字段（`captured_at` 是业务内容）。比对 `command_type` + 规范化请求（文本，不用哈希）；所有含 PIN 或 PIN 重置授权秘密的命令（含员工主数据权限提升）适用以下例外。
-- 敏感命令的每个秘密字段以独立随机盐的 Argon2id 验证值替代，参数强度不低于员工凭据；非秘密字段仍比对规范化文本，秘密字段用已保存的验证值判等，不重新生成哈希作文本比对。
-- 敏感命令的成功记录绑定发起员工和 `device_id`；原结果重试按保存的原命令核对有效设备和秘密证明，只返回非秘密回执，不重新执行当前 PIN 校验、不重复修改主数据、不重新签发或恢复授权及会话。
-- 秘密字段比对前执行设备锁和限速检查；比对失败计入同一设备和节点的 PIN 失败计数，幂等冲突明细只列字段名，不返回秘密原值、提交值或验证值。
-- PIN（含确认值）和 PIN 重置授权秘密不得明文写入事件、数据库、WAL、备份、日志或留存响应；初始化和 CLI 仅在终端无回显输入 PIN，不接受 PIN 命令行参数。
+- 规范化请求：把命令反序列化成强类型结构体再序列化，剥离 `command_id` 和 `sent_at`，按 [docs/auth.md](docs/auth.md)「敏感命令的幂等」处理敏感字段后存进 `processed_commands.request`。
+  普通业务命令只剥离这两个字段（`captured_at` 是业务内容）。比对 `command_type` + 规范化请求（文本，不用哈希）；所有含 PIN 或 PIN 重置授权秘密的命令（含员工主数据权限提升）适用 [docs/auth.md](docs/auth.md)「敏感命令的幂等」的例外。
 - **幂等检查先于任何业务校验**。
   - 同一 `command_id` + 同一 `command_type` + 同一规范化请求 → 直接返回保存的响应（含 warnings），不重复执行。
   - 同一 `command_id`，但 `command_type` 或规范化请求不同 → `409 IDEMPOTENCY_CONFLICT`，响应中给出差异字段。
 - 只有成功的命令写入 `processed_commands`。被业务校验拒绝的命令不落库，修正后可以用同一个 ID 重提。
 - 命令和事件结构体禁止 `HashMap` / `HashSet`，只用 `Vec` / `BTreeMap`。
+
+### 认证
+细则（设备注册、登录、PIN 设定与重置、限速、敏感命令的幂等、开发桩）见 [docs/auth.md](docs/auth.md)。
+- PIN（含确认值）和 PIN 重置授权秘密不得明文写入事件、数据库、WAL、备份、日志或留存响应；初始化和 CLI 仅在终端无回显输入 PIN，不接受 PIN 命令行参数。
+- 设备令牌、PIN、会话令牌、PIN 重置授权只经 HTTPS 传输；节点未配置 TLS 时不注册认证接口，release 构建启用认证但未配置 TLS 时**拒绝启动**。
 
 ### 上行同步（只定契约，本期不实现）
 - 不建 outbox。连续的 `seq` 就是同步游标。开发同步时新增迁移建单行表 `sync_state`（`acked_seq`、`last_attempt_at`、`last_error`、`consecutive_failures`）。
@@ -402,7 +403,7 @@ ARM 门店机改用 `aarch64-unknown-linux-musl`。部署文件见 `deploy/`。
 - 上行同步的实现：总部接收接口、批量大小、mTLS 证书下发与轮换、失败的重试分类（哪些错误可重试）。**延后**；契约见「上行同步」。
 - 局域网 HTTPS：证书签发与平板信任方式（见 `docs/domain.md` Q9）。**认证切片的前置条件。**
 - 异地备份复制的实现。
-- 门店节点恢复与业务连续性：恢复入口与操作步骤（方向：数据库备份 + 纸面业务凭据 + 人工补录 + 盘点核对），覆盖收货、生产、报损、盘点、幂等重试，以及恢复后的上行同步（恢复到旧备份会让 `seq` 回退，与总部已接收的事件冲突）。恢复后不得重用已贴在货物上的批次号。原则已定：恢复时清空会话、PIN 重置授权、设备注册、设备解锁码、锁定状态与失败计数，平板重新注册；员工 PIN 哈希保留。认证幂等记录不得绕过恢复后的设备注册校验。**延后**；恢复演练测试照常要求。
+- 门店节点恢复与业务连续性：恢复入口与操作步骤（方向：数据库备份 + 纸面业务凭据 + 人工补录 + 盘点核对），覆盖收货、生产、报损、盘点、幂等重试，以及恢复后的上行同步（恢复到旧备份会让 `seq` 回退，与总部已接收的事件冲突）。恢复后不得重用已贴在货物上的批次号。原则已定：恢复时清空会话、PIN 重置授权、设备注册、设备解锁码、锁定状态与失败计数，平板重新注册；员工 PIN 哈希保留（认证状态表见 [docs/auth.md](docs/auth.md)）。认证幂等记录不得绕过恢复后的设备注册校验。**延后**；恢复演练测试照常要求。
 
 ---
 
@@ -425,4 +426,4 @@ ARM 门店机改用 `aarch64-unknown-linux-musl`。部署文件见 `deploy/`。
 - 写命令缺少幂等处理，或缺少重复提交同一 `command_id` 的测试。
 - 认证接口、PIN 或令牌可经明文 HTTP 访问或传输。
 
-`spec:` / `docs:` 提交是设计变更：检查内容是否自洽、是否与 `docs/domain.md` 一致；其中修改已合入的迁移仍按 P0 处理。
+`spec:` / `docs:` 提交是设计变更：检查内容是否自洽、是否与 `docs/domain.md`、`docs/auth.md` 一致；其中修改已合入的迁移仍按 P0 处理。

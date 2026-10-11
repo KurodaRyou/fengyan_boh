@@ -236,7 +236,7 @@ pub fn test_router(db_path: &Path, clock: Clock) -> Result<Router, StorageError>
   | `store_id` | `01890a5d-ac96-774b-bcce-b302099a8050` |
   | `timezone` | `Asia/Shanghai` |
   | `business_day_cutoff` | `04:00` |
-  | `dev_actor_stub` | `true`（身份由请求头提供，见 domain.md「员工认证」开发桩） |
+  | `dev_actor_stub` | `true`（身份由请求头提供，见 auth.md「开发桩」） |
 
 - `store_meta` 为空时，用与 `boh-server init` 写 `store_meta` 相同的代码写入上表的 `store_id`，`created_at` 取 `clock.now()`；已存在且 `store_id` 不同时返回 `Err`。
   - 不写预置主数据（报损原因），也不写 `processed_commands`：测试节点的账本从空开始。

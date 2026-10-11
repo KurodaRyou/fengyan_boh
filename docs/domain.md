@@ -1,6 +1,6 @@
 # BOH 领域模型
 
-本文件定义业务决策、事件目录、投影与业务规则。工程规则见 [AGENTS.md](../AGENTS.md)，门店操作规范见 [sop.md](sop.md)，规范用词见 [glossary.md](glossary.md)。
+本文件定义业务决策、事件目录、投影与业务规则。工程规则见 [AGENTS.md](../AGENTS.md)，门店操作规范见 [sop.md](sop.md)，规范用词见 [glossary.md](glossary.md)，员工认证见 [auth.md](auth.md)。
 实现落地后，字段与表结构以代码为准（`boh-domain` 结构体、迁移 SQL），本文件只保留语义与不变量。
 「待确认问题」中的条目，确认前不要实现依赖它的部分。
 
@@ -18,7 +18,7 @@
 | 8 | 录错 | 只有数量错用数量更正（保持原批次，差额可使原批次变负）；其他错误整条冲销 | 纠错 |
 | 9 | 账面不足 | 报损先提示，员工确认实际数量后入账：指定批次的差额留在该批次（余量可为负），未指定批次的差额记入账外缺口；下次盘点处理。纠错时批次已被消耗的处理见「纠错」 | 批次、纠错 |
 | 10 | 营业日 | 时区 `Asia/Shanghai`，日切 `04:00` | 时间 |
-| 11 | 操作人 | 员工在已注册的平板上用 PIN 登录；平板安装时注册一次；会话按班次有效 | 主数据、待确认问题 |
+| 11 | 操作人 | 员工在已注册的平板上用 PIN 登录；平板安装时注册一次；会话按班次有效 | [auth.md](auth.md)、待确认问题 |
 | 12 | 总部 | 本期不开发。主数据由总部维护统一的 JSON 主数据包，`code` 和 UUID 全部门店统一 | 主数据 |
 | 13 | 不存在的业务 | 调拨、套餐、半批生产本期都不存在 | 未来功能 |
 
@@ -95,12 +95,9 @@ occurred_at = recorded_at − lag
 - HTTP 修改命令携带客户端看到的 `base_revision`，与当前 `revision` 不等时返回 `409 REVISION_CONFLICT`（`details` 为 `{"current_revision": n}`），不写事件或 `processed_commands`。新建命令不带 `base_revision`；主数据包导入按快照逐行比对，不适用此规则。
 - 命令引用已停用的主数据照常受理，停用只在界面上隐藏。
 - 主数据写接口只允许 `MANAGER`。
-- HTTP `EMPLOYEE` 命令新建 `MANAGER`、将 `STAFF` 改为 `MANAGER`，或将停用员工启用且新 `role = MANAGER` 时，首次执行须校验已验证会话所属店长的当前 PIN；条件在同一写事务内按变更前投影和新快照判定，不因 `source = HQ_PACKAGE` 豁免。
-- 上述 PIN 仅为命令的敏感字段，不进入 `EMPLOYEE` 快照或事件 payload，适用 AGENTS.md「幂等」的敏感命令规则；错误计入设备 PIN 失败次数，设备锁定时拒绝校验，拒绝时不改员工、不写事件或 `processed_commands`。
-- `EMPLOYEE` 变更后必须至少保留一名已设定 PIN 且启用的 `MANAGER`，否则返回 `409 LAST_ACTIVE_MANAGER`，不写事件或 `processed_commands`。
+- `EMPLOYEE` 的权限提升、最后一名店长和认证状态表见 [auth.md](auth.md)「员工主数据」。
 - 每次变更写一条 `MASTER_DATA_CHANGED`：聚合类型是实体名，聚合 ID 是行的主键，`aggregate_version` 是变更后的 `revision`；payload 是 `{entity, source, snapshot}`，`source`（`LOCAL` / `HQ_PACKAGE`）。主数据表是投影，可以从事件流重建。
 - 内容没有变化的变更不写事件（导入主数据包时逐行比对快照）。
-- **认证状态不进事件流**：`employee_credentials`（PIN 的 Argon2id 哈希）、设备注册、设备解锁码哈希、设备锁定状态与失败计数、会话、PIN 重置授权都是普通状态表，不同步，不参与重建。
 - **系统操作人**：初始化和主数据包导入在没有登录员工时，`actor_id` 使用保留 ID `00000000-0000-7000-8000-000000000000`。
 - **系统设备**：初始化和没有登录平板的主数据包导入，`device_id` 使用保留 ID `00000000-0000-7000-8000-000000000001`，表示产生事件的本门店节点。该身份不需要设备注册、设备令牌、解锁码或员工会话，不写入设备注册表；事件的 `device_id` 仍为非空 UUIDv7。
 - 两个保留 ID 不得分配给真实员工或注册平板。系统身份只由节点内部的初始化和主数据包导入入口填写，表示事件来源，不授予 HTTP 访问权限。
@@ -119,254 +116,6 @@ occurred_at = recorded_at − lag
     | `OTHER` | 其他 |
 
   - 没有登录平板的总部包导入同样使用这两个系统 ID，`source = HQ_PACKAGE`。启动时 `store_meta` 为空（未初始化）或与配置里的 `store_id` 不一致，拒绝启动。`store_meta` 已存在时 `init` 拒绝执行，不改动任何数据，以非 0 退出码结束。
-
-### 主数据接口
-
-| 实体 | 路径 | `command_type` 前缀 | 行的 ID 字段 | 单行键 / 列表键 |
-|---|---|---|---|---|
-| `EQUIPMENT` | `/api/v1/equipment` | `equipment` | `equipment_id` | `equipment` / `equipment` |
-| `ITEM` | `/api/v1/items` | `item` | `item_id` | `item` / `items` |
-| `RECIPE` | `/api/v1/recipes` | `recipe` | `recipe_id` | `recipe` / `recipes` |
-| `SUPPLIER` | `/api/v1/suppliers` | `supplier` | `supplier_id` | `supplier` / `suppliers` |
-| `WASTE_REASON` | `/api/v1/waste-reasons` | `waste_reason` | `waste_reason_id` | `waste_reason` / `waste_reasons` |
-
-- 每个实体有三个接口：`POST <路径>` 新建（`<前缀>.create`）、`PUT <路径>/{<ID 字段>}` 修改（`<前缀>.update`）、`GET <路径>` 查询。配方另有追加版本的接口。写接口只允许 `MANAGER`，查询允许已认证员工。
-- 新建请求体：`command_id` 加快照的全部字段（配方例外，见下文）。修改请求体：`command_id`、`base_revision` 加快照中可修改的字段；不可修改的字段不在请求体中，取当前值。各实体的字段见下文。
-- 写命令成功的 `data` 是 `{<单行键>: 行}`，行为该命令执行后的实体：`<ID 字段>`、快照的全部字段、`revision`，可选字段缺省时省略该键。查询的 `data` 是 `{<列表键>: [行…]}`，含停用的，按 `code` 的字节序升序。
-- 取值：`code`、`name` 非空，首尾不能有空白字符；`base_revision` 是正整数；其余字段见下文。不满足时 `400 VALIDATION_FAILED`。
-- 不带 `captured_at` / `sent_at`：`occurred_at = recorded_at`，`business_date` 由它计算。
-- **新建**：服务端生成 UUIDv7 作为 ID，写一条 `aggregate_version = 1` 的 `MASTER_DATA_CHANGED`。`code` 已被同一实体的其他行使用（含停用的）：`409 CODE_ALREADY_EXISTS`，`details` 为 `{"code", <ID 字段>}`（已占用该 `code` 的行）。
-- **修改**：行不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": <实体>, "id"}`。`base_revision` 规则见上。
-  - 新快照与当前快照相同时不写事件，命令照常成功并写入 `processed_commands`，响应为当前行。
-- **引用**：引用其他主数据的字段必须指向已有的行（含停用的），否则 `404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": <被引用的实体>, "id"}`。
-- 同时命中多个业务错误时，返回哪一个不作规定。
-
-**设备**：请求体与行见 `boh_domain::equipment` 的 `CreateEquipment`、`UpdateEquipment`、`Equipment`。
-
-**物料**：请求体与行见 `boh_domain::master_data` 的 `CreateItem`、`UpdateItem`、`Item`。
-
-- `default_shelf_life_ms` 可以省略，出现时是正整数，不接受 `null`。修改时省略表示没有默认保质期。
-- `units` 是数组，可以为空，不接受 `null`。每项 `{unit_code, base_qty_per_unit}`：`unit_code` 非空、首尾不能有空白字符、不等于 `base_unit`；`base_qty_per_unit` 是正整数。
-- `units` 必须按 `unit_code` 的字节序严格升序（因此不重复），服务端不重新排序。
-- 修改换算系数、增删单位照常受理，不影响已入账的事件；离线录入的命令按「单位」核对。
-
-**配方**：
-
-| 方法与路径 | `command_type` | 请求体（`boh_domain::master_data`） |
-|---|---|---|
-| `POST /api/v1/recipes` | `recipe.create` | `CreateRecipe` |
-| `PUT /api/v1/recipes/{recipe_id}` | `recipe.update` | `UpdateRecipe` |
-| `POST /api/v1/recipes/{recipe_id}/versions` | `recipe.add_version` | `AddRecipeVersion` |
-
-- 行见 `boh_domain::master_data::Recipe`。
-
-- 新建时 `output_qty_per_batch` 和 `lines` 构成版本 1。
-- **追加版本**：新版本号是当前最大版本 + 1，写一条 `MASTER_DATA_CHANGED`，`revision` + 1。权限、`base_revision`、配方不存在和成功的 `data` 同「修改」。
-  - `output_qty_per_batch` 和 `lines`（含行顺序）都与最新版本相同时，不新增版本、不写事件，`revision` 不变；命令照常成功并写入 `processed_commands`，响应为当前配方。只与最新版本比较：从 A 改为 B 再改回 A，仍新增版本。
-- `output_qty_per_batch`、`qty_per_batch` 是正整数。`lines` 非空，每项 `{item_id, qty_per_batch}`，同一版本内 `item_id` 不重复，按提交顺序保存。
-- `output_item_id` 和每个 `lines[].item_id` 引用 `ITEM`（规则见「引用」）。不限制物料的 `category`，不检查产出物料是否出现在自己的 `lines` 中。
-
-**供应商**：请求体与行见 `boh_domain::master_data` 的 `CreateSupplier`、`UpdateSupplier`、`Supplier`。
-
-- `contact_phone` 可以省略，出现时非空、首尾不能有空白字符，不接受 `null`。修改时省略表示删除联系电话。
-
-**报损原因**：请求体与行见 `boh_domain::master_data` 的 `CreateWasteReason`、`UpdateWasteReason`、`WasteReason`。预置的报损原因同样可以修改和停用。
-
-### 温度记录接口
-
-| 方法与路径 | `command_type` | 请求体 / 查询参数（`boh_domain::temperature`） | 权限 |
-|---|---|---|---|
-| `POST /api/v1/temperature-readings` | `temperature.log` | `LogTemperature` | 已认证员工 |
-| `GET /api/v1/temperature-readings` | — | `TemperatureQuery` | 已认证员工 |
-
-- 写命令成功的 `data` 是 `{"temperature_reading": 行}`，查询的 `data` 是 `{"temperature_readings": [行…]}`；行为 `boh_domain::temperature::TemperatureReading`。
-- **取值**：不满足时 `400 VALIDATION_FAILED`。
-  - `celsius_x10` 是 0.1 °C 的整数，`-500`～`5000`（-50.0～500.0 °C），两端可取。它只拦截单位或数量级录错，不是食安阈值，不产生警告。
-  - `note` 可以省略；出现时非空、首尾不能有空白字符、最多 200 个字符（按 Unicode 字符计），不接受 `null`。首尾以外的空白和换行原样保存。
-  - 请求体不接受 `occurred_at`（补录入口见「时间」）。
-- **新建**：服务端生成 UUIDv7 作为读数 ID（聚合 ID），写一条 `aggregate_version = 1` 的 `TEMPERATURE_LOGGED`。
-  - `occurred_at`、`business_date` 按「时间」的相对校准计算。相对校准和营业日计算属于业务校验，在幂等检查之后执行。
-    - 理由：`recorded_at` 在写事务内才确定，`sent_at` 不在规范化请求中。重试即使带着会超限或溢出的新 `sent_at`，也返回首次响应，不重新校准。
-  - `CAPTURE_TOO_OLD`、时间溢出的 `VALIDATION_FAILED` 以及警告 `CAPTURE_TIME_ADJUSTED` 的 `details` 都是 `{}`。
-  - 设备不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": "EQUIPMENT", "id"}`。停用的设备照常受理；不限制 `equipment_type`。
-  - 同时命中多个业务错误时，返回哪一个不作规定。
-- **查询**：`business_date`（`'YYYY-MM-DD'`，真实日期）必填，`equipment_id` 可选；不分页。按 `occurred_at` 升序，相同时按 `seq` 升序；含停用设备的读数。
-  - 参数缺失、取值非法、未知或重复的参数：`400 VALIDATION_FAILED`。`equipment_id` 合法但不存在时返回空数组。
-- 投影 `temperature_readings` 每条读数一行，字段以迁移 003 为准。冲销在投影和查询中的体现随纠错切片设计。
-
-### 收货接口
-
-| 方法与路径 | `command_type` | 权限 |
-|---|---|---|
-| `POST /api/v1/receipts` | `receipt.create` | 已认证员工 |
-
-- 请求体与行见 `boh_domain::receiving` 的 `CreateReceipt`、`Receipt`；`input` 见「单位」。
-- 写命令成功的 `data` 是 `{"receipt": 行}`；行的 `lines` 与 payload 的 `lines` 相同。
-- **取值**：不满足时 `400 VALIDATION_FAILED`，`details` 为 `{}`。
-  - `lines` 非空。同一物料可以有多行，各行分别建批次。
-  - `input.qty`、`input.base_qty_per_unit` 是正整数；`input.unit_code` 非空、首尾不能有空白字符。`input.qty × input.base_qty_per_unit` 不超出 `i64`。
-  - `line_cost_cents` 是该行总金额（分），`>= 0`。
-  - `manufacturer_lot_no` 可以省略；出现时非空、首尾不能有空白字符、最多 64 个字符（按 Unicode 字符计），不接受 `null`。
-  - `produced_on`（生产日期）、`expires_on`（到期日）必填，是包装标签上的门店当地日期，格式 `'YYYY-MM-DD'`（真实日期），`produced_on <= expires_on`，`expires_on` 不晚于 `9998-12-31`（`expires_at` 由次日当地 0 点换算，须在时间戳范围内）。标签只印保质期时长时，由客户端按日历推算 `expires_on`。
-  - 请求体不接受 `occurred_at`（补录入口见「时间」）。
-- **新建**：服务端生成 UUIDv7 作为收货 ID（聚合 ID），每行按「批次」生成一个批次号 `lot_id`，写一条 `aggregate_version = 1` 的 `GOODS_RECEIVED@2`。
-  - `occurred_at`、`business_date` 按「时间」的相对校准计算，规则与温度记录相同（`CAPTURE_TOO_OLD`、时间溢出的 `VALIDATION_FAILED`、`CAPTURE_TIME_ADJUSTED` 的 `details` 都是 `{}`）。
-  - payload 每行：`qty = input.qty × input.base_qty_per_unit`；`expires_at` 是 `expires_on` 在门店时区（配置 `timezone`）的当日最后一毫秒，即次日当地 0 点的 UTC 毫秒减 1。
-    - 理由：`projections::apply` 不读配置，换算结果必须写进 payload。
-  - 批次日期是 `occurred_at` 的门店当地日历日期，与下面 `INVALID_LOT_DATES` 的 D 相同。
-- **业务校验**（幂等检查之后）：同时命中多个业务错误时，返回哪一个不作规定；都不写事件或 `processed_commands`。
-  - 供应商、物料不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": "SUPPLIER" / "ITEM", "id"}`。停用的照常受理。
-  - `unit_code` 既不是物料的 `base_unit` 也不在 `units` 中：`400 UNKNOWN_UNIT`，`details` 为 `{"line", "item_id", "unit_code"}`。
-  - 系数与当前值不同：`409 UNIT_CONVERSION_CHANGED`，`details` 为 `{"line", "item_id", "unit_code", "base_qty_per_unit": 当前值}`。`unit_code` 等于 `base_unit` 时当前值为 1。
-  - 日期与收货时间矛盾：`400 INVALID_LOT_DATES`，`details` 为 `{"line", "item_id", "reason"}`。以 `occurred_at` 在门店时区的日历日期 D 判定（不是营业日）：`produced_on > D` 时 `reason = "PRODUCED_IN_FUTURE"`；`expires_on < D` 时 `reason = "EXPIRED_ON_RECEIPT"`。等于 D 都允许。
-    - 用日历日期而不是营业日：日切前（如凌晨 2 点）收到当天生产的货是正常的。
-  - 流水号用尽：`409 LOT_SERIAL_EXHAUSTED`（见「批次」）。
-  - `line` 是行在 `lines` 中的下标。
-- **警告**：`CAPTURE_TIME_ADJUSTED` 在前，之后按 `line` 升序的 `EXPIRES_BEFORE_OLDER_STOCK`（见「批次」）。
-- **吸收**：收货行新建批次，不被盘点吸收（见「盘点吸收」）。
-- **投影**：每行在 `inventory_lots` 建一个 `origin = 'RECEIPT'` 的批次（`lot_id` 及由它拆出的批次日期和流水号，`source_line_no` 是行下标，`remaining_qty = qty`），在 `inventory_movements` 写一条 `kind = 'RECEIPT'`、`alloc_source = 'NEW_LOT'` 的流水，`physical_at = occurred_at`。`line_cost_cents`、`produced_on` 只在事件中。
-- **`GOODS_RECEIVED@1` 不支持**：`@1` 的 `lot_id` 是 UUID，payload 中没有生成批次号所需的类型和编码，不能 upcast，也不推测。
-  - 账本中有 `@1` 收货时，迁移 007 报错并拒绝执行（节点不能启动）；重建投影遇到 `@1` 收货也报错。
-  - 门店节点从空库 `init` 开始，不会有 `@1` 收货；只影响开发库，开发库需要重新初始化。
-
-### 报损接口
-
-| 方法与路径 | `command_type` | 权限 |
-|---|---|---|
-| `POST /api/v1/waste-records/precheck` | —（只读，不是写命令） | 已认证员工 |
-| `POST /api/v1/waste-records` | `waste.log` | 已认证员工 |
-
-报损先预检；账面不足的行由员工确认实际报损数量后，再正式提交。系统不自动确认，也不自动重提。
-
-**正式提交**：
-
-- 请求体与行见 `boh_domain::waste` 的 `LogWaste`、`WasteRecord`；`input` 见「单位」。`lot_id` 是员工指定的批次，`reason_code` 是 `WASTE_REASON` 的 `code`，`confirm_shortage` 见下方「不足确认」。
-- 写命令成功的 `data` 是 `{"waste_record": 行}`；行的 `lines` 与 payload 的 `lines` 相同。
-- **取值**：不满足时 `400 VALIDATION_FAILED`，`details` 为 `{}`。
-  - `lines` 非空。同一物料、同一批次都可以出现在多行（例如不同原因）。
-  - `input` 的规则同收货：`input.qty`、`input.base_qty_per_unit` 是正整数；`input.unit_code` 非空、首尾不能有空白字符；`input.qty × input.base_qty_per_unit` 不超出 `i64`。
-  - `reason_code` 非空、首尾不能有空白字符。
-  - `lot_id` 可以省略；出现时符合批次号格式（同「批次查询」），不接受 `null`。
-  - `confirm_shortage` 可以省略；出现时是布尔值，不接受 `null`。省略与 `false` 等价，两者的规范化请求相同；`true` 保留在规范化请求中，参与幂等比对。
-  - 请求体不接受 `occurred_at`（补录入口见「时间」）。
-- **新建**：服务端生成 UUIDv7 作为报损 ID（聚合 ID），写一条 `aggregate_version = 1` 的 `WASTE_LOGGED`。
-  - `occurred_at`、`business_date` 按「时间」的相对校准计算，规则与温度记录相同（`CAPTURE_TOO_OLD`、时间溢出的 `VALIDATION_FAILED`、`CAPTURE_TIME_ADJUSTED` 的 `details` 都是 `{}`）。
-  - payload 每行：`qty = input.qty × input.base_qty_per_unit`；`lot_id` 取请求中指定的批次，未指定时省略；`item_book_qty`、`lot_book_qty` 和 `alloc` 按下方「逐行处理」得出。
-  - payload 结构与键顺序见 `boh_domain::waste::WasteLogged`；样本 `crates/boh-app/tests/golden/WASTE_LOGGED@1/`。
-  - `confirm_shortage` 不写进 payload。
-    理由：账面值记录当时是否不足，确认标记记录员工的选择，两者含义不同；后者保存在规范化请求中。
-- **业务校验**（幂等检查之后）：同时命中多个业务错误时，返回哪一个不作规定；都不写事件或 `processed_commands`。不足确认在其余业务校验都通过之后判定。
-  - 物料不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": "ITEM", "id"}`。指定的批次不存在：`details` 为 `{"entity": "LOT", "id"}`。
-  - 报损原因不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": "WASTE_REASON", "code"}`。
-  - 停用的物料、报损原因照常受理；指定余量为 0 或为负的批次照常受理（按下方规则需要确认）。
-  - 指定的批次属于其他物料：`400 LOT_ITEM_MISMATCH`，`details` 为 `{"line", "item_id", "lot_id"}`。
-  - 物料还没有任何批次（从未收货入库）：`409 ITEM_HAS_NO_LOTS`，`details` 为 `{"line", "item_id"}`。带确认标记也拒绝：确认只处理数量不足，不授予报损资格。
-    - 依据是 `inventory_lots` 中有没有该物料的批次，不是 `inventory_on_hand` 的行（视图对每个物料都有一行）。批次由收货建立（生产产出随生产切片加入），余量为 0 后也保留，所以曾经入库、现已耗尽的物料照常按下方规则处理。
-  - 数量越界：逐行处理中的物料净账面（含最后一行扣减之后的）、批次余量或账外缺口超出 `i64`，即使各批次余量和账外缺口本身都可表示：`400 VALIDATION_FAILED`，`details` 为 `{}`。整条命令不入账，前面的正常行也不入账；不得绕回、截断或钳制后继续。
-  - `UNKNOWN_UNIT`、`UNIT_CONVERSION_CHANGED`：同收货。
-  - `line` 是行在 `lines` 中的下标。
-- **逐行处理**：按 `lines` 顺序，每行看到的账面是同一命令中前面各行处理之后的值。
-  1. **吸收**：按「盘点吸收」判定（随盘点切片实现；在此之前每行都不被吸收）。被吸收的行写 `absorbed_by_event_id`，不需要确认，带了确认标记也忽略，不改变后续各行看到的账面。
-  2. **账面**：`item_book_qty` 是该行之前的物料净账面（该物料全部批次余量之和，含负数，加账外缺口，即视图 `inventory_on_hand` 的值）。指定批次的行另记 `lot_book_qty`，即该行之前该批次的余量。被吸收的行同样记录。
-  3. **是否需要确认**（未被吸收的行）：
-
-     | 行 | 需要确认的条件 |
-     |---|---|
-     | 指定批次 | `qty > lot_book_qty`（批次余量为 0 或为负也算）或 `qty > item_book_qty` |
-     | 不指定批次 | `qty > item_book_qty` |
-
-     报损量等于账面时不需要确认。
-  4. **分配**（未被吸收的行）：
-     - 指定批次：整行扣在该批次上，`alloc` 恰好一项 `{lot_id, qty, "SPECIFIED"}`，不转去扣其他批次，该批次余量可以为负。
-     - 不指定批次：按「批次」的 FIFO 顺序，在该物料余量大于 0 的批次中逐个扣到 0 或扣完为止，每个批次一项，记 `FIFO`；仍有剩余时，剩余部分一项，不带 `lot_id`，记 `SHORTFALL`（记入账外缺口）。
-       - 净账面不小于报损量时，正余量批次之和一定足够，所以只有经过确认的行才会产生 `SHORTFALL`。
-     - `alloc` 每项 `qty` 为正，合计等于该行 `qty`。
-- **不足确认**：
-  - `confirm_shortage: true` 表示员工确认这一行的数量确实发生，允许账面不足时入账。它不绑定预检时的账面或分配：带确认的行按提交时的账面入账，不足程度比预检时更大也有效。
-  - 需要确认但没带确认的行，照确认后的结果继续试算后续各行。全部行处理完后，存在这样的行时整条命令不入账，返回 `409 WASTE_CONFIRMATION_REQUIRED`，`details` 为 `{"lines": [{line, item_id, lot_id?, qty, item_book_qty, lot_book_qty?}]}`，按 `line` 升序列出全部这样的行，一次确认完。
-  - 账面足够的行带了确认标记照常处理。
-- **重提**：
-  - 只有明确收到拒绝（如 `WASTE_CONFIRMATION_REQUIRED`）之后，才可以用同一个 `command_id` 修改内容重提：被拒绝的命令不落库。确认后重提时 `captured_at` 沿用首次填写的值，只更新 `sent_at`；超过 72 小时返回 `CAPTURE_TOO_OLD`，改走补录。
-  - 结果未知（超时、断线）时，先用原 ID、原内容重试取回结果，不能直接加确认标记。首次已成功时，原内容重试返回首次响应，即使已超过 72 小时（幂等检查先于时间校准）。
-  - 成功之后用同一个 ID 去掉或改变确认标记：`409 IDEMPOTENCY_CONFLICT`，`fields` 为 `["lines"]`。
-  - 修改某行的物料、批次或数量后，客户端清除该行的确认，重新预检。
-- **警告**：本切片只有 `CAPTURE_TIME_ADJUSTED`。盘点切片实现吸收判定后，被吸收的行另返回 `ABSORBED_BY_COUNT`（见「盘点吸收」）。
-  - 报损不返回 `STOCK_SHORTFALL`：不足已在入账前提示并确认，事件中有提交时的账面。
-- **投影**：
-  - 未被吸收的行：`alloc` 按顺序每项写一条 `inventory_movements`，`kind = 'WASTE'`，`alloc_source` 取该项的 `source`，`lot_id` 取该项的 `lot_id`（`SHORTFALL` 为 `NULL`），`nominal_qty = qty_delta = −qty`，`physical_at = occurred_at`。
-    带 `lot_id` 的项把该批次的 `remaining_qty` 减去 `qty`；`SHORTFALL` 项把该物料的账外缺口减去 `qty`，`inventory_unallocated` 没有该物料的行时新建。
-  - 被吸收的行：写一条 `kind = 'WASTE'`、`alloc_source = 'ABSORBED'`、`lot_id` 为 `NULL`、`nominal_qty = −qty`、`qty_delta = 0` 的流水，`absorbed_by_event_id` 取自 payload，不改动批次和账外缺口。
-  - `reason_code`、`item_book_qty`、`lot_book_qty` 只在事件中。
-
-**预检**：
-
-- 请求体见 `boh_domain::waste::PrecheckWaste`，只有 `lines`，取值规则同正式提交；不接受 `command_id`、`captured_at`、`sent_at` 和 `confirm_shortage`。
-- 在一个读事务中执行，不写事件、`processed_commands` 或任何表；没有幂等处理。
-- 校验与正式提交相同（取值、引用、`LOT_ITEM_MISMATCH`、`ITEM_HAS_NO_LOTS`、单位、数量越界），错误码与 `details` 也相同。不做时间校准，也不做吸收判定（没有发生时间）。
-- 成功的 `data` 是 `{"lines": [{line, item_id, lot_id?, qty, item_book_qty, lot_book_qty?, needs_confirmation, alloc}]}`，每行一项：按正式提交的逐行处理计算，假设全部行都不被吸收、需要确认的行都已确认。`warnings` 为空数组。
-- 结果是按当前账面的估算：正式提交在写事务内重新计算，两次请求之间账面可能变化。界面把 `alloc` 显示为「按当前账面预计扣减」。
-
-### 库存明细查询
-
-| 方法与路径 | 查询参数 | 权限 |
-|---|---|---|
-| `GET /api/v1/inventory` | `item_id`（可选） | 已认证员工 |
-
-- 查询参数与 `data` 见 `boh_domain::inventory` 的 `InventoryQuery`、`Inventory`、`InventoryItem`，全部内容读自同一个读事务。
-  - `business_date` 是门店节点按当前时间计算的营业日（盘点草稿用它核对，见「盘点」第 1 条）。
-  - `items` 每个物料一项，含停用的，按 `code` 的字节序升序；带 `item_id` 时只含该物料。
-    `on_hand_qty` 是账面数（视图 `inventory_on_hand`），`unallocated_qty` 是账外缺口（`<= 0`，没有时为 0）。
-  - `lots` 是该物料余量不为 0 的批次（含负余量），按 FIFO 顺序（批次日期、流水号）排列。每项是一个批次行（`LotDetails`，见「批次查询」），不含 `item_id`。
-- 参数取值非法、未知或重复的参数：`400 VALIDATION_FAILED`。`item_id` 合法但不存在时 `items` 为空数组。
-
-### 批次查询
-
-| 方法与路径 | 权限 |
-|---|---|
-| `GET /api/v1/lots/{lot_id}` | 已认证员工 |
-
-- 按标签上的批次号查一个批次，余量为 0 的也能查到（盘点补加历史批次用，见「盘点」）。
-- `data` 是 `{"lot": 批次行}`，批次行见 `boh_domain::inventory::Lot`（库存明细中的批次行是其中不含 `item_id` 的 `LotDetails`）。
-  `source_occurred_at` 是建批次事件的 `occurred_at`；`expires_at`、`manufacturer_lot_no` 没有时省略该键。
-- 路径中的 `lot_id` 不符合批次号格式（类型为 `RAW` / `SEMI` / `FINISHED`，编码只含 `A`–`Z`、`0`–`9`、`_`，日期为真实日期，流水号 `001`–`999`）：`400 VALIDATION_FAILED`。格式合法但不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": "LOT", "id"}`。
-
-### 员工认证
-
-- **设备注册**（平板安装时做一次）：在节点上运行 `boh-server enroll-code` 生成一次性注册码。新平板提交注册码和设备名，服务端签发设备令牌，作为 `device_id` 的来源，同时生成这台设备的解锁码。
-  - 注册不使用 PIN：否则局域网内任何人都能对店长 PIN 试错。
-  - 注册码由 CSPRNG 生成，不少于 40 bit，一次有效，10 分钟过期；错误的注册码尝试整个节点每分钟最多 10 次。
-  - 在节点上运行 `boh-server revoke-device <设备>` 吊销设备。
-- **解锁码**：每台设备一个，注册成功时由 CSPRNG 生成，不少于 80 bit（例如 16 位 Base32），只在注册界面显示一次，由店长自行保存（例如存在手机里）。节点只保存 Argon2id 哈希。
-  - 丢失或泄露时在节点上运行 `boh-server reset-unlock-code <设备>` 重新生成，旧码立即失效。
-- **员工登录**：只接受带有效设备令牌的请求。PIN 由服务端用 Argon2id 校验，签发会话令牌（服务端状态表）。PIN 一律 6 位数字。会话按班次有效（结束判定见 Q7）。
-- **PIN 设定与重置**：新员工没有 PIN，不能登录。
-  - 店长在已注册平板上登录后，选中另一名启用状态的员工，每次首次发起「设置 / 重置 PIN」都输入并校验自己的当前 PIN；失败计入设备 PIN 失败次数，设备锁定时不校验。服务端在同一事务中吊销该设备上的全部员工会话、使该设备已有的未用 PIN 重置授权失效并创建新授权，再把平板交给该员工本人输入两次新 PIN。店长不输入、也看不到员工的新 PIN。
-  - PIN 重置授权的秘密由平板在发起命令前用 CSPRNG 生成，不少于 128 bit，随命令经 HTTPS 提交；节点只保存 Argon2id 验证值，响应只含非秘密的范围、状态和期限。授权 10 分钟过期，绑定发起店长、目标员工、`device_id` 和「设置 / 重置 PIN」操作，只能成功执行一次，不是员工会话，不授予其他 HTTP 权限。
-  - 店长不能通过重置授权设定或重置自己的 PIN，返回 `409 SELF_RESET_NOT_ALLOWED`；自己的 PIN 照常经旧 PIN 校验后修改，无法校验旧 PIN 时用 CLI 恢复。
-  - 员工凭有效设备令牌和 PIN 重置授权秘密提交新 PIN，无需员工会话；服务端核对秘密、设备与授权一致、设备未被吊销、目标员工启用且不是发起人、发起人仍为启用的 `MANAGER`，在同一事务中完成 PIN 变更、消费授权及会话和相关授权的失效。
-  - 已登录员工可以修改自己的 PIN：输入旧 PIN 和两次新 PIN。旧 PIN 校验失败计入该设备的 PIN 失败次数；设备锁定时拒绝旧 PIN 校验（见「在线限速」）。
-  - 节点命令 `boh-server reset-pin <员工 code>` 在终端输入两次新 PIN，用于没有可登录店长的情况。
-  - 设定、重置、修改成功后，该员工在所有设备上的已有会话及以其为发起人或目标的未用 PIN 重置授权立即失效；不产生事件。
-  - 每次操作记日志，含来源（`HTTP` / `CLI`）、目标员工、发起人和 `device_id`；HTTP 的发起人和 `device_id` 取已验证会话或 PIN 重置授权保存的身份，CLI 的发起人和 `device_id` 为 `null`，不使用保留系统身份。
-- **业务事件身份**：HTTP 业务事件的 `actor_id` 来自已验证的员工会话，`device_id` 来自该会话所属的注册平板设备令牌。`Actor` 提取器不接受客户端指定的系统身份，缺少或无效的设备令牌 / 员工会话必须拒绝请求，不回退到系统身份。
-- **员工状态**：登录和每个已认证请求都读取 `employees` 投影，员工必须是启用状态，否则与无效会话同样拒绝。权限按投影中的当前 `role` 判断，不使用登录时的角色。停用员工不改动认证状态表，已有会话在下一次请求时失效。
-- **在线限速**（PIN 能安全使用的前提）：
-  - 按设备计数：同一设备 1 小时内 PIN 校验失败 5 次（不论输入的是哪个员工），该设备的登录 PIN 校验、修改 PIN 的旧码校验、店长重置授权签发和员工主数据权限提升的 PIN 校验及敏感字段幂等比对均锁定，界面显示设备名并提示由店长解锁。登录或 PIN 操作成功不清零计数。
-    - 按时间窗口计数，不按「连续失败」：否则夹一次自己的成功登录就能无限试错。
-  - 锁定不自动过期，只能输入该设备的解锁码解锁，或在节点上运行 `boh-server unlock-device <设备>`。解锁后计数清零。锁定不影响已有会话的其他业务操作。
-  - 不按员工锁定：否则任何人都能针对性地锁住某个员工（尤其是店长）。
-  - 解锁码校验每台设备每 10 秒最多一次，失败不锁定，记 `warn` 日志。
-    - 解锁码失败不锁定：解锁码无法猜中，再加锁定只会让人能把平板推到只能在节点上解锁的状态。
-  - 整个节点每小时 PIN 失败超过 50 次时，所有 PIN 校验额外延迟 5 秒，并在 `/health` 中报告 `auth_failures_last_hour`。
-  - 每次 PIN 失败记 `warn` 日志，含员工和 `device_id`。
-- 客户端不缓存 PIN 哈希。
-- 含 PIN 或 PIN 重置授权秘密的命令只在当前页面内存暂存，不进 `IndexedDB`；结果未知时用原 `command_id`、原内容和原秘密重试，丢失内存后不得用同一 ID 替换秘密。
-- 丢失内存后，登录或自行改 PIN 以新命令登录核实当前 PIN；重新创建重置授权须店长重新登录、校验当前 PIN 并使用新 `command_id`。
-- **传输加密**：设备令牌、PIN、会话令牌、PIN 重置授权只经 HTTPS 传输。局域网 HTTPS（证书方案见 Q9）是认证切片的前置条件；节点未配置 TLS 时不注册认证接口，release 构建启用认证但未配置 TLS 时**拒绝启动**。
-- 认证落地之前，业务切片只依赖 `Actor` 提取器，开发桩同时提供员工 ID 和 `role`。开发桩只在 debug 构建中可用；release 构建配置了开发桩时**拒绝启动**。
-  - 配置项 `dev_actor_stub = true` 时启用，默认 `false`。未启用时没有任何身份来源，业务接口一律 `401 UNAUTHENTICATED`。
-  - 开发桩按请求读取 `X-Dev-Employee-Id`（UUIDv7，作为 `actor_id`）、`X-Dev-Device-Id`（UUIDv7，作为 `device_id`）和 `X-Dev-Role`（`STAFF` / `MANAGER`）。缺少任一个、取值非法或使用保留系统 ID：`401 UNAUTHENTICATED`。
-  - 开发桩不查 `employees` 投影，也不校验设备注册。
 
 ## 单位
 
@@ -635,6 +384,218 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 - 主数据表也是投影：`equipment`（迁移 002），`items`、`item_units`、`recipes`、`recipe_versions`、`recipe_lines`、`suppliers`、`waste_reasons`（迁移 005）；`employees` 随认证切片加入。
 - 所有投影都必须能通过 `boh-server rebuild-projections` 从 `store_events` **按 `seq`** 完整重建，结果与在线写入逐行一致。
 
+## 接口
+
+### 主数据接口
+
+| 实体 | 路径 | `command_type` 前缀 | 行的 ID 字段 | 单行键 / 列表键 |
+|---|---|---|---|---|
+| `EQUIPMENT` | `/api/v1/equipment` | `equipment` | `equipment_id` | `equipment` / `equipment` |
+| `ITEM` | `/api/v1/items` | `item` | `item_id` | `item` / `items` |
+| `RECIPE` | `/api/v1/recipes` | `recipe` | `recipe_id` | `recipe` / `recipes` |
+| `SUPPLIER` | `/api/v1/suppliers` | `supplier` | `supplier_id` | `supplier` / `suppliers` |
+| `WASTE_REASON` | `/api/v1/waste-reasons` | `waste_reason` | `waste_reason_id` | `waste_reason` / `waste_reasons` |
+
+- 每个实体有三个接口：`POST <路径>` 新建（`<前缀>.create`）、`PUT <路径>/{<ID 字段>}` 修改（`<前缀>.update`）、`GET <路径>` 查询。配方另有追加版本的接口。写接口只允许 `MANAGER`，查询允许已认证员工。
+- 新建请求体：`command_id` 加快照的全部字段（配方例外，见下文）。修改请求体：`command_id`、`base_revision` 加快照中可修改的字段；不可修改的字段不在请求体中，取当前值。各实体的字段见下文。
+- 写命令成功的 `data` 是 `{<单行键>: 行}`，行为该命令执行后的实体：`<ID 字段>`、快照的全部字段、`revision`，可选字段缺省时省略该键。查询的 `data` 是 `{<列表键>: [行…]}`，含停用的，按 `code` 的字节序升序。
+- 取值：`code`、`name` 非空，首尾不能有空白字符；`base_revision` 是正整数；其余字段见下文。不满足时 `400 VALIDATION_FAILED`。
+- 不带 `captured_at` / `sent_at`：`occurred_at = recorded_at`，`business_date` 由它计算。
+- **新建**：服务端生成 UUIDv7 作为 ID，写一条 `aggregate_version = 1` 的 `MASTER_DATA_CHANGED`。`code` 已被同一实体的其他行使用（含停用的）：`409 CODE_ALREADY_EXISTS`，`details` 为 `{"code", <ID 字段>}`（已占用该 `code` 的行）。
+- **修改**：行不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": <实体>, "id"}`。`base_revision` 规则见「主数据」。
+  - 新快照与当前快照相同时不写事件，命令照常成功并写入 `processed_commands`，响应为当前行。
+- **引用**：引用其他主数据的字段必须指向已有的行（含停用的），否则 `404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": <被引用的实体>, "id"}`。
+- 同时命中多个业务错误时，返回哪一个不作规定。
+
+**设备**：请求体与行见 `boh_domain::equipment` 的 `CreateEquipment`、`UpdateEquipment`、`Equipment`。
+
+**物料**：请求体与行见 `boh_domain::master_data` 的 `CreateItem`、`UpdateItem`、`Item`。
+
+- `default_shelf_life_ms` 可以省略，出现时是正整数，不接受 `null`。修改时省略表示没有默认保质期。
+- `units` 是数组，可以为空，不接受 `null`。每项 `{unit_code, base_qty_per_unit}`：`unit_code` 非空、首尾不能有空白字符、不等于 `base_unit`；`base_qty_per_unit` 是正整数。
+- `units` 必须按 `unit_code` 的字节序严格升序（因此不重复），服务端不重新排序。
+- 修改换算系数、增删单位照常受理，不影响已入账的事件；离线录入的命令按「单位」核对。
+
+**配方**：
+
+| 方法与路径 | `command_type` | 请求体（`boh_domain::master_data`） |
+|---|---|---|
+| `POST /api/v1/recipes` | `recipe.create` | `CreateRecipe` |
+| `PUT /api/v1/recipes/{recipe_id}` | `recipe.update` | `UpdateRecipe` |
+| `POST /api/v1/recipes/{recipe_id}/versions` | `recipe.add_version` | `AddRecipeVersion` |
+
+- 行见 `boh_domain::master_data::Recipe`。
+
+- 新建时 `output_qty_per_batch` 和 `lines` 构成版本 1。
+- **追加版本**：新版本号是当前最大版本 + 1，写一条 `MASTER_DATA_CHANGED`，`revision` + 1。权限、`base_revision`、配方不存在和成功的 `data` 同「修改」。
+  - `output_qty_per_batch` 和 `lines`（含行顺序）都与最新版本相同时，不新增版本、不写事件，`revision` 不变；命令照常成功并写入 `processed_commands`，响应为当前配方。只与最新版本比较：从 A 改为 B 再改回 A，仍新增版本。
+- `output_qty_per_batch`、`qty_per_batch` 是正整数。`lines` 非空，每项 `{item_id, qty_per_batch}`，同一版本内 `item_id` 不重复，按提交顺序保存。
+- `output_item_id` 和每个 `lines[].item_id` 引用 `ITEM`（规则见「引用」）。不限制物料的 `category`，不检查产出物料是否出现在自己的 `lines` 中。
+
+**供应商**：请求体与行见 `boh_domain::master_data` 的 `CreateSupplier`、`UpdateSupplier`、`Supplier`。
+
+- `contact_phone` 可以省略，出现时非空、首尾不能有空白字符，不接受 `null`。修改时省略表示删除联系电话。
+
+**报损原因**：请求体与行见 `boh_domain::master_data` 的 `CreateWasteReason`、`UpdateWasteReason`、`WasteReason`。预置的报损原因同样可以修改和停用。
+
+### 温度记录接口
+
+| 方法与路径 | `command_type` | 请求体 / 查询参数（`boh_domain::temperature`） | 权限 |
+|---|---|---|---|
+| `POST /api/v1/temperature-readings` | `temperature.log` | `LogTemperature` | 已认证员工 |
+| `GET /api/v1/temperature-readings` | — | `TemperatureQuery` | 已认证员工 |
+
+- 写命令成功的 `data` 是 `{"temperature_reading": 行}`，查询的 `data` 是 `{"temperature_readings": [行…]}`；行为 `boh_domain::temperature::TemperatureReading`。
+- **取值**：不满足时 `400 VALIDATION_FAILED`。
+  - `celsius_x10` 是 0.1 °C 的整数，`-500`～`5000`（-50.0～500.0 °C），两端可取。它只拦截单位或数量级录错，不是食安阈值，不产生警告。
+  - `note` 可以省略；出现时非空、首尾不能有空白字符、最多 200 个字符（按 Unicode 字符计），不接受 `null`。首尾以外的空白和换行原样保存。
+  - 请求体不接受 `occurred_at`（补录入口见「时间」）。
+- **新建**：服务端生成 UUIDv7 作为读数 ID（聚合 ID），写一条 `aggregate_version = 1` 的 `TEMPERATURE_LOGGED`。
+  - `occurred_at`、`business_date` 按「时间」的相对校准计算。相对校准和营业日计算属于业务校验，在幂等检查之后执行。
+    - 理由：`recorded_at` 在写事务内才确定，`sent_at` 不在规范化请求中。重试即使带着会超限或溢出的新 `sent_at`，也返回首次响应，不重新校准。
+  - `CAPTURE_TOO_OLD`、时间溢出的 `VALIDATION_FAILED` 以及警告 `CAPTURE_TIME_ADJUSTED` 的 `details` 都是 `{}`。
+  - 设备不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": "EQUIPMENT", "id"}`。停用的设备照常受理；不限制 `equipment_type`。
+  - 同时命中多个业务错误时，返回哪一个不作规定。
+- **查询**：`business_date`（`'YYYY-MM-DD'`，真实日期）必填，`equipment_id` 可选；不分页。按 `occurred_at` 升序，相同时按 `seq` 升序；含停用设备的读数。
+  - 参数缺失、取值非法、未知或重复的参数：`400 VALIDATION_FAILED`。`equipment_id` 合法但不存在时返回空数组。
+- 投影 `temperature_readings` 每条读数一行，字段以迁移 003 为准。冲销在投影和查询中的体现随纠错切片设计。
+
+### 收货接口
+
+| 方法与路径 | `command_type` | 权限 |
+|---|---|---|
+| `POST /api/v1/receipts` | `receipt.create` | 已认证员工 |
+
+- 请求体与行见 `boh_domain::receiving` 的 `CreateReceipt`、`Receipt`；`input` 见「单位」。
+- 写命令成功的 `data` 是 `{"receipt": 行}`；行的 `lines` 与 payload 的 `lines` 相同。
+- **取值**：不满足时 `400 VALIDATION_FAILED`，`details` 为 `{}`。
+  - `lines` 非空。同一物料可以有多行，各行分别建批次。
+  - `input.qty`、`input.base_qty_per_unit` 是正整数；`input.unit_code` 非空、首尾不能有空白字符。`input.qty × input.base_qty_per_unit` 不超出 `i64`。
+  - `line_cost_cents` 是该行总金额（分），`>= 0`。
+  - `manufacturer_lot_no` 可以省略；出现时非空、首尾不能有空白字符、最多 64 个字符（按 Unicode 字符计），不接受 `null`。
+  - `produced_on`（生产日期）、`expires_on`（到期日）必填，是包装标签上的门店当地日期，格式 `'YYYY-MM-DD'`（真实日期），`produced_on <= expires_on`，`expires_on` 不晚于 `9998-12-31`（`expires_at` 由次日当地 0 点换算，须在时间戳范围内）。标签只印保质期时长时，由客户端按日历推算 `expires_on`。
+  - 请求体不接受 `occurred_at`（补录入口见「时间」）。
+- **新建**：服务端生成 UUIDv7 作为收货 ID（聚合 ID），每行按「批次」生成一个批次号 `lot_id`，写一条 `aggregate_version = 1` 的 `GOODS_RECEIVED@2`。
+  - `occurred_at`、`business_date` 按「时间」的相对校准计算，规则与温度记录相同（`CAPTURE_TOO_OLD`、时间溢出的 `VALIDATION_FAILED`、`CAPTURE_TIME_ADJUSTED` 的 `details` 都是 `{}`）。
+  - payload 每行：`qty = input.qty × input.base_qty_per_unit`；`expires_at` 是 `expires_on` 在门店时区（配置 `timezone`）的当日最后一毫秒，即次日当地 0 点的 UTC 毫秒减 1。
+    - 理由：`projections::apply` 不读配置，换算结果必须写进 payload。
+  - 批次日期是 `occurred_at` 的门店当地日历日期，与下面 `INVALID_LOT_DATES` 的 D 相同。
+- **业务校验**（幂等检查之后）：同时命中多个业务错误时，返回哪一个不作规定；都不写事件或 `processed_commands`。
+  - 供应商、物料不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": "SUPPLIER" / "ITEM", "id"}`。停用的照常受理。
+  - `unit_code` 既不是物料的 `base_unit` 也不在 `units` 中：`400 UNKNOWN_UNIT`，`details` 为 `{"line", "item_id", "unit_code"}`。
+  - 系数与当前值不同：`409 UNIT_CONVERSION_CHANGED`，`details` 为 `{"line", "item_id", "unit_code", "base_qty_per_unit": 当前值}`。`unit_code` 等于 `base_unit` 时当前值为 1。
+  - 日期与收货时间矛盾：`400 INVALID_LOT_DATES`，`details` 为 `{"line", "item_id", "reason"}`。以 `occurred_at` 在门店时区的日历日期 D 判定（不是营业日）：`produced_on > D` 时 `reason = "PRODUCED_IN_FUTURE"`；`expires_on < D` 时 `reason = "EXPIRED_ON_RECEIPT"`。等于 D 都允许。
+    - 用日历日期而不是营业日：日切前（如凌晨 2 点）收到当天生产的货是正常的。
+  - 流水号用尽：`409 LOT_SERIAL_EXHAUSTED`（见「批次」）。
+  - `line` 是行在 `lines` 中的下标。
+- **警告**：`CAPTURE_TIME_ADJUSTED` 在前，之后按 `line` 升序的 `EXPIRES_BEFORE_OLDER_STOCK`（见「批次」）。
+- **吸收**：收货行新建批次，不被盘点吸收（见「盘点吸收」）。
+- **投影**：每行在 `inventory_lots` 建一个 `origin = 'RECEIPT'` 的批次（`lot_id` 及由它拆出的批次日期和流水号，`source_line_no` 是行下标，`remaining_qty = qty`），在 `inventory_movements` 写一条 `kind = 'RECEIPT'`、`alloc_source = 'NEW_LOT'` 的流水，`physical_at = occurred_at`。`line_cost_cents`、`produced_on` 只在事件中。
+- **`GOODS_RECEIVED@1` 不支持**：`@1` 的 `lot_id` 是 UUID，payload 中没有生成批次号所需的类型和编码，不能 upcast，也不推测。
+  - 账本中有 `@1` 收货时，迁移 007 报错并拒绝执行（节点不能启动）；重建投影遇到 `@1` 收货也报错。
+  - 门店节点从空库 `init` 开始，不会有 `@1` 收货；只影响开发库，开发库需要重新初始化。
+
+### 报损接口
+
+| 方法与路径 | `command_type` | 权限 |
+|---|---|---|
+| `POST /api/v1/waste-records/precheck` | —（只读，不是写命令） | 已认证员工 |
+| `POST /api/v1/waste-records` | `waste.log` | 已认证员工 |
+
+报损先预检；账面不足的行由员工确认实际报损数量后，再正式提交。系统不自动确认，也不自动重提。
+
+**正式提交**：
+
+- 请求体与行见 `boh_domain::waste` 的 `LogWaste`、`WasteRecord`；`input` 见「单位」。`lot_id` 是员工指定的批次，`reason_code` 是 `WASTE_REASON` 的 `code`，`confirm_shortage` 见下方「不足确认」。
+- 写命令成功的 `data` 是 `{"waste_record": 行}`；行的 `lines` 与 payload 的 `lines` 相同。
+- **取值**：不满足时 `400 VALIDATION_FAILED`，`details` 为 `{}`。
+  - `lines` 非空。同一物料、同一批次都可以出现在多行（例如不同原因）。
+  - `input` 的规则同收货：`input.qty`、`input.base_qty_per_unit` 是正整数；`input.unit_code` 非空、首尾不能有空白字符；`input.qty × input.base_qty_per_unit` 不超出 `i64`。
+  - `reason_code` 非空、首尾不能有空白字符。
+  - `lot_id` 可以省略；出现时符合批次号格式（同「批次查询」），不接受 `null`。
+  - `confirm_shortage` 可以省略；出现时是布尔值，不接受 `null`。省略与 `false` 等价，两者的规范化请求相同；`true` 保留在规范化请求中，参与幂等比对。
+  - 请求体不接受 `occurred_at`（补录入口见「时间」）。
+- **新建**：服务端生成 UUIDv7 作为报损 ID（聚合 ID），写一条 `aggregate_version = 1` 的 `WASTE_LOGGED`。
+  - `occurred_at`、`business_date` 按「时间」的相对校准计算，规则与温度记录相同（`CAPTURE_TOO_OLD`、时间溢出的 `VALIDATION_FAILED`、`CAPTURE_TIME_ADJUSTED` 的 `details` 都是 `{}`）。
+  - payload 每行：`qty = input.qty × input.base_qty_per_unit`；`lot_id` 取请求中指定的批次，未指定时省略；`item_book_qty`、`lot_book_qty` 和 `alloc` 按下方「逐行处理」得出。
+  - payload 结构与键顺序见 `boh_domain::waste::WasteLogged`；样本 `crates/boh-app/tests/golden/WASTE_LOGGED@1/`。
+  - `confirm_shortage` 不写进 payload。
+    理由：账面值记录当时是否不足，确认标记记录员工的选择，两者含义不同；后者保存在规范化请求中。
+- **业务校验**（幂等检查之后）：同时命中多个业务错误时，返回哪一个不作规定；都不写事件或 `processed_commands`。不足确认在其余业务校验都通过之后判定。
+  - 物料不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": "ITEM", "id"}`。指定的批次不存在：`details` 为 `{"entity": "LOT", "id"}`。
+  - 报损原因不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": "WASTE_REASON", "code"}`。
+  - 停用的物料、报损原因照常受理；指定余量为 0 或为负的批次照常受理（按下方规则需要确认）。
+  - 指定的批次属于其他物料：`400 LOT_ITEM_MISMATCH`，`details` 为 `{"line", "item_id", "lot_id"}`。
+  - 物料还没有任何批次（从未收货入库）：`409 ITEM_HAS_NO_LOTS`，`details` 为 `{"line", "item_id"}`。带确认标记也拒绝：确认只处理数量不足，不授予报损资格。
+    - 依据是 `inventory_lots` 中有没有该物料的批次，不是 `inventory_on_hand` 的行（视图对每个物料都有一行）。批次由收货建立（生产产出随生产切片加入），余量为 0 后也保留，所以曾经入库、现已耗尽的物料照常按下方规则处理。
+  - 数量越界：逐行处理中的物料净账面（含最后一行扣减之后的）、批次余量或账外缺口超出 `i64`，即使各批次余量和账外缺口本身都可表示：`400 VALIDATION_FAILED`，`details` 为 `{}`。整条命令不入账，前面的正常行也不入账；不得绕回、截断或钳制后继续。
+  - `UNKNOWN_UNIT`、`UNIT_CONVERSION_CHANGED`：同收货。
+  - `line` 是行在 `lines` 中的下标。
+- **逐行处理**：按 `lines` 顺序，每行看到的账面是同一命令中前面各行处理之后的值。
+  1. **吸收**：按「盘点吸收」判定（随盘点切片实现；在此之前每行都不被吸收）。被吸收的行写 `absorbed_by_event_id`，不需要确认，带了确认标记也忽略，不改变后续各行看到的账面。
+  2. **账面**：`item_book_qty` 是该行之前的物料净账面（该物料全部批次余量之和，含负数，加账外缺口，即视图 `inventory_on_hand` 的值）。指定批次的行另记 `lot_book_qty`，即该行之前该批次的余量。被吸收的行同样记录。
+  3. **是否需要确认**（未被吸收的行）：
+
+     | 行 | 需要确认的条件 |
+     |---|---|
+     | 指定批次 | `qty > lot_book_qty`（批次余量为 0 或为负也算）或 `qty > item_book_qty` |
+     | 不指定批次 | `qty > item_book_qty` |
+
+     报损量等于账面时不需要确认。
+  4. **分配**（未被吸收的行）：
+     - 指定批次：整行扣在该批次上，`alloc` 恰好一项 `{lot_id, qty, "SPECIFIED"}`，不转去扣其他批次，该批次余量可以为负。
+     - 不指定批次：按「批次」的 FIFO 顺序，在该物料余量大于 0 的批次中逐个扣到 0 或扣完为止，每个批次一项，记 `FIFO`；仍有剩余时，剩余部分一项，不带 `lot_id`，记 `SHORTFALL`（记入账外缺口）。
+       - 净账面不小于报损量时，正余量批次之和一定足够，所以只有经过确认的行才会产生 `SHORTFALL`。
+     - `alloc` 每项 `qty` 为正，合计等于该行 `qty`。
+- **不足确认**：
+  - `confirm_shortage: true` 表示员工确认这一行的数量确实发生，允许账面不足时入账。它不绑定预检时的账面或分配：带确认的行按提交时的账面入账，不足程度比预检时更大也有效。
+  - 需要确认但没带确认的行，照确认后的结果继续试算后续各行。全部行处理完后，存在这样的行时整条命令不入账，返回 `409 WASTE_CONFIRMATION_REQUIRED`，`details` 为 `{"lines": [{line, item_id, lot_id?, qty, item_book_qty, lot_book_qty?}]}`，按 `line` 升序列出全部这样的行，一次确认完。
+  - 账面足够的行带了确认标记照常处理。
+- **重提**：
+  - 只有明确收到拒绝（如 `WASTE_CONFIRMATION_REQUIRED`）之后，才可以用同一个 `command_id` 修改内容重提：被拒绝的命令不落库。确认后重提时 `captured_at` 沿用首次填写的值，只更新 `sent_at`；超过 72 小时返回 `CAPTURE_TOO_OLD`，改走补录。
+  - 结果未知（超时、断线）时，先用原 ID、原内容重试取回结果，不能直接加确认标记。首次已成功时，原内容重试返回首次响应，即使已超过 72 小时（幂等检查先于时间校准）。
+  - 成功之后用同一个 ID 去掉或改变确认标记：`409 IDEMPOTENCY_CONFLICT`，`fields` 为 `["lines"]`。
+  - 修改某行的物料、批次或数量后，客户端清除该行的确认，重新预检。
+- **警告**：本切片只有 `CAPTURE_TIME_ADJUSTED`。盘点切片实现吸收判定后，被吸收的行另返回 `ABSORBED_BY_COUNT`（见「盘点吸收」）。
+  - 报损不返回 `STOCK_SHORTFALL`：不足已在入账前提示并确认，事件中有提交时的账面。
+- **投影**：
+  - 未被吸收的行：`alloc` 按顺序每项写一条 `inventory_movements`，`kind = 'WASTE'`，`alloc_source` 取该项的 `source`，`lot_id` 取该项的 `lot_id`（`SHORTFALL` 为 `NULL`），`nominal_qty = qty_delta = −qty`，`physical_at = occurred_at`。
+    带 `lot_id` 的项把该批次的 `remaining_qty` 减去 `qty`；`SHORTFALL` 项把该物料的账外缺口减去 `qty`，`inventory_unallocated` 没有该物料的行时新建。
+  - 被吸收的行：写一条 `kind = 'WASTE'`、`alloc_source = 'ABSORBED'`、`lot_id` 为 `NULL`、`nominal_qty = −qty`、`qty_delta = 0` 的流水，`absorbed_by_event_id` 取自 payload，不改动批次和账外缺口。
+  - `reason_code`、`item_book_qty`、`lot_book_qty` 只在事件中。
+
+**预检**：
+
+- 请求体见 `boh_domain::waste::PrecheckWaste`，只有 `lines`，取值规则同正式提交；不接受 `command_id`、`captured_at`、`sent_at` 和 `confirm_shortage`。
+- 在一个读事务中执行，不写事件、`processed_commands` 或任何表；没有幂等处理。
+- 校验与正式提交相同（取值、引用、`LOT_ITEM_MISMATCH`、`ITEM_HAS_NO_LOTS`、单位、数量越界），错误码与 `details` 也相同。不做时间校准，也不做吸收判定（没有发生时间）。
+- 成功的 `data` 是 `{"lines": [{line, item_id, lot_id?, qty, item_book_qty, lot_book_qty?, needs_confirmation, alloc}]}`，每行一项：按正式提交的逐行处理计算，假设全部行都不被吸收、需要确认的行都已确认。`warnings` 为空数组。
+- 结果是按当前账面的估算：正式提交在写事务内重新计算，两次请求之间账面可能变化。界面把 `alloc` 显示为「按当前账面预计扣减」。
+
+### 库存明细查询
+
+| 方法与路径 | 查询参数 | 权限 |
+|---|---|---|
+| `GET /api/v1/inventory` | `item_id`（可选） | 已认证员工 |
+
+- 查询参数与 `data` 见 `boh_domain::inventory` 的 `InventoryQuery`、`Inventory`、`InventoryItem`，全部内容读自同一个读事务。
+  - `business_date` 是门店节点按当前时间计算的营业日（盘点草稿用它核对，见「盘点」第 1 条）。
+  - `items` 每个物料一项，含停用的，按 `code` 的字节序升序；带 `item_id` 时只含该物料。
+    `on_hand_qty` 是账面数（视图 `inventory_on_hand`），`unallocated_qty` 是账外缺口（`<= 0`，没有时为 0）。
+  - `lots` 是该物料余量不为 0 的批次（含负余量），按 FIFO 顺序（批次日期、流水号）排列。每项是一个批次行（`LotDetails`，见「批次查询」），不含 `item_id`。
+- 参数取值非法、未知或重复的参数：`400 VALIDATION_FAILED`。`item_id` 合法但不存在时 `items` 为空数组。
+
+### 批次查询
+
+| 方法与路径 | 权限 |
+|---|---|
+| `GET /api/v1/lots/{lot_id}` | 已认证员工 |
+
+- 按标签上的批次号查一个批次，余量为 0 的也能查到（盘点补加历史批次用，见「盘点」）。
+- `data` 是 `{"lot": 批次行}`，批次行见 `boh_domain::inventory::Lot`（库存明细中的批次行是其中不含 `item_id` 的 `LotDetails`）。
+  `source_occurred_at` 是建批次事件的 `occurred_at`；`expires_at`、`manufacturer_lot_no` 没有时省略该键。
+- 路径中的 `lot_id` 不符合批次号格式（类型为 `RAW` / `SEMI` / `FINISHED`，编码只含 `A`–`Z`、`0`–`9`、`_`，日期为真实日期，流水号 `001`–`999`）：`400 VALIDATION_FAILED`。格式合法但不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": "LOT", "id"}`。
+
 ## 已知限制
 
 - **批次追溯是账面推定**。员工实际拿的批次和系统推定的不一致时，批次余量会偏离实物，直到下一次盘点。
@@ -704,27 +665,6 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 | 更正多次后冲销 | 报损 10 → 更正为 8 → 更正为 6 → 冲销 | 冲销退回 **6**；报损合计 **0** |
 | 重复冲销 | 同一事件冲销两次 | 第二次 `409 ALREADY_REVERSED` |
 | 冲销后更正 | 冲销后再更正同一事件 | `409 ALREADY_REVERSED` |
-| 员工停用 | 员工已登录；之后该员工被停用 | 已有会话的请求与无效会话同样被拒绝，不入账；该员工 PIN 登录被拒绝 |
-| 店长降级 | 另有一名已设定 PIN 且启用的店长；当前店长已登录，之后 `role` 改为 `STAFF` | 已有会话立即只有 `STAFF` 权限 |
-| 新员工无 PIN | 新建员工后未设定 PIN 即登录 | 登录被拒绝 |
-| 重置 PIN 吊销会话 | 员工在两台设备上各有会话；店长为其重置 PIN | 两个会话的请求都被拒绝；新 PIN 可以登录，旧 PIN 不能 |
-| 普通员工不能重置 | `STAFF` 会话为其他员工发起重置 PIN | 被拒绝，PIN 不变 |
-| 自行修改 PIN 旧码错误 | 已登录员工修改 PIN 时旧 PIN 输错 | 被拒绝，PIN 不变；计入该设备的 PIN 失败次数 |
-| 锁定设备修改 PIN | 已有会话在同一设备 1 小时内输错旧 PIN 5 次，再提交旧 PIN | 不再校验旧 PIN，PIN 不变；已有会话的其他业务操作仍可用 |
-| 终端重置 PIN 审计 | 在节点运行 `reset-pin` 成功重置员工 PIN | 日志含 `CLI` 来源和目标员工，发起人与 `device_id` 为 `null`，不用保留系统身份 |
-| 交接平板权限 | 店长发起员工 A 的 PIN 重置，平板另一标签页也有员工会话，再交给 A | 该设备所有旧会话失效；新授权只能在该设备设置 A 的 PIN，不能访问主数据写接口或重置 B 的 PIN |
-| PIN 重置授权失效 | 用新命令提交已成功使用或已过期的授权，或从另一设备提交 | 拒绝，PIN 不变；同一授权不能再次执行 PIN 变更 |
-| PIN 变更使旧授权失效 | 员工已有未用重置授权（作为发起人或目标），之后该员工的 PIN 被设定、重置或修改 | 这些授权立即失效，不能再执行 PIN 变更 |
-| 最后一名可登录店长 | 仅有一名已设定 PIN 且启用的店长，另一个店长尚未设 PIN；停用或降级前者 | `409 LAST_ACTIVE_MANAGER`，员工、事件和 `processed_commands` 不变 |
-| 店长权限提升验 PIN | A、B 的 PIN 不同；持有店长 A 会话，提升 STAFF B 或新建 MANAGER；输入 B 的 PIN 或锁定设备提交 | 拒绝，员工、事件和 `processed_commands` 不变；须 A 的当前 PIN 正确且设备未锁定才能首次执行，错误计入同设备失败次数 |
-| 店长重新启用验 PIN | 启用停用的 MANAGER，或同时启用停用 STAFF 并改为 MANAGER；另编辑已启用 MANAGER 的姓名 | 前两者须校验会话店长的当前 PIN；仅编辑姓名不要求再次验 PIN，仍须有效 MANAGER 会话 |
-| 权限提升原命令重试 | 员工提升成功后再被降级或停用，以原 ID、原内容和原 PIN 重试；再省略或改变 PIN | 原命令须核对保存的秘密证明，只返回原非秘密回执，不恢复权限或新增事件；省略或改变 PIN 为幂等冲突，受设备锁和限速约束 |
-| 店长重置再次验 PIN | 持有有效店长会话，发起其他员工的 PIN 重置但店长 PIN 错误，或设备已锁定 | 不创建授权；错误 PIN 计入失败次数，锁定后不再校验；不能仅凭会话重置 PIN |
-| 店长不能自重置 | 店长以自己为重置授权的目标 | `409 SELF_RESET_NOT_ALLOWED`；旧 PIN 保护的自行修改和 CLI 恢复仍可用 |
-| 敏感认证幂等 | 首次成功后用原 ID 和原内容重试；再用同一 ID 改变旧 PIN、新 PIN 或授权秘密 | 原内容返回原非秘密回执，不重复执行或恢复权限；改变秘密返回 `409 IDEMPOTENCY_CONFLICT`，只列字段名，失败比对受设备锁和限速约束 |
-| 敏感命令秘密不落库 | 完成初始化、终端重置、自行修改、授权创建和兑换、店长权限提升或重新启用，再检查数据库、WAL、备份、日志及留存请求和响应 | 没有明文 PIN、确认 PIN 或授权秘密；秘密字段只有带独立盐的 Argon2id 验证值，授权响应只有非秘密元数据 |
-| 授权响应丢失 | 平板已保存原命令与授权秘密于内存，授权创建或兑换成功但响应丢失 | 原命令可取回原非秘密回执；不重复创建、兑换或恢复已失效授权，仍核对有效设备 |
-| 自行改 PIN 后刷新 | 员工自行改 PIN 已成功但响应丢失，刷新后原命令内存丢失 | 以新命令用新 PIN 登录，不要求店长重置授权，不用旧 ID 提交替换内容 |
 
 ## 未来功能（本期不实现）
 
