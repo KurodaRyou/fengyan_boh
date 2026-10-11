@@ -29,7 +29,7 @@
 | Idempotency | 幂等 | 同一 `command_id` 重复提交时返回原结果、不重复执行；内容不同时返回 `409 IDEMPOTENCY_CONFLICT` | AGENTS「幂等」 |
 | Canonical request | 规范化请求 | 命令反序列化成强类型结构体后再序列化、剥离 `command_id` 和 `sent_at` 得到的文本，用于幂等比对 | AGENTS「幂等」 |
 | Envelope | 信封 | 所有 HTTP 响应共用的外层结构：`success`、`data`、`warnings`、`error` | AGENTS「HTTP 约定」 |
-| Invariant self-check | 不变量自检 | 定时任务在读连接上检查投影是否满足不变量，`/health` 返回最近一次的结果 | domain「投影表」 |
+| Invariant self-check | 不变量自检 | 启动时和闭店时在读连接上检查投影是否满足不变量，`/health` 返回最近一次的结果 | invariant-check「触发」 |
 | Sync cursor | 同步游标 | `sync_state.acked_seq`：总部已确认收到的最大 `seq`，上行同步从它之后推送 | AGENTS「上行同步」 |
 
 ## 业务领域

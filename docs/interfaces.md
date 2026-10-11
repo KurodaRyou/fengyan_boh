@@ -241,7 +241,7 @@ pub fn test_router(db_path: &Path, clock: Clock) -> Result<Router, StorageError>
 - `store_meta` 为空时，用与 `boh-server init` 写 `store_meta` 相同的代码写入上表的 `store_id`，`created_at` 取 `clock.now()`；已存在且 `store_id` 不同时返回 `Err`。
   - 不写预置主数据（报损原因），也不写 `processed_commands`：测试节点的账本从空开始。
 - 写线程不经 `shutdown`：`Router` 及其全部克隆释放后，写线程自行退出。
-- 不启动备份调度等后台任务：`/health` 的备份字段一直为 `null`。
+- 不启动备份调度、不变量自检等后台任务：`/health` 的备份字段和 `invariant_check` 的两个字段一直为 `null`。
 - 两份 `clippy.toml` 禁用 `test_router`，只有锁定测试及 `spec_support/` 可以 `#[allow]`。
 
 ## boh-app：带后台任务的测试节点
@@ -265,6 +265,9 @@ pub struct TestNode {
 }
 impl TestNode {
     pub fn hold_backups(&self) -> BackupHold;
+    pub fn writer(&self) -> Writer;
+    pub async fn run_invariant_check(&self);
+    pub fn hold_invariant_checks(&self) -> InvariantCheckHold;
     pub async fn shutdown(self) -> Result<(), StorageError>;
 }
 
@@ -273,16 +276,29 @@ pub struct BackupHold { /* 私有 */ }
 impl BackupHold {
     pub async fn started(&self);
 }
+
+#[doc(hidden)]
+pub struct InvariantCheckHold { /* 私有 */ }
+impl InvariantCheckHold {
+    pub async fn started(&self);
+}
 ```
 
 - 在 tokio 运行时内调用。与生产启动相同：`boh_storage::open()`；`store_meta` 处理同 `test_router`；创建 `backup_dir`（含上级目录），失败或不是目录时返回 `Err`；启动备份调度。
   - 配置：`store_id`、`business_day_cutoff`、开发桩同 `test_router`；`timezone` 同时用于营业日和闭店备份；时区或 `closing_backup_time` 非法时返回 `Err`。
-  - 返回时，调度任务已按 `clock` 当时的时间算好第一个触发时刻。
-- `router`：与生产入口相同的路由；`/health` 反映本节点的备份结果。
+  - 返回时，调度任务已按 `clock` 当时的时间算好第一个触发时刻，启动检查已提交到检查入口（不等待它完成）。
+- `router`：与生产入口相同的路由；`/health` 反映本节点的备份与自检结果。
 - `hold_backups`：返回的句柄存在期间，每次开始的备份在取得开始时间（文件名中的时间）并读取 `seq_before` 之后、执行 `VACUUM INTO` 之前等待；所有句柄释放后继续。
   - `started()`：有备份正在等待该句柄时返回（已在等待则立即返回）。
   - 句柄不借用 `TestNode`：持有句柄时也可以调用 `shutdown`，`shutdown` 会等到句柄释放、队列执行完。
-- `shutdown`：不再接受新的触发，执行完正在进行和已排队的备份，再 `WriterHandle::shutdown()`。返回后不留任何后台任务。
+- `writer`：本节点唯一写连接的 `Writer`（克隆）。锁定测试只用它在节点运行中修改投影表，制造或修复违规；不另开写连接。
+- 启动检查和闭店检查的结果，锁定测试轮询 `/health` 的 `invariant_check.last_attempt` 等待。
+- `run_invariant_check`：向检查入口提交一次检查，等到这次检查的结果（含 `failed`）交给 `/health` 后返回。入口中已有检查时排在它们之后。
+- `hold_invariant_checks`：返回的句柄存在期间，每次检查在入口中开始执行之后、开启读快照之前等待；所有句柄释放后继续。
+  - `started()`：有检查正在等待时返回（已在等待则立即返回）。
+  - 句柄不借用 `TestNode`，规则同 `hold_backups`；`shutdown` 会等到句柄释放、已提交的检查执行完。
+  - 暂停机制只在 `boh-app` 内部，不对外提供其他入口。
+- `shutdown`：不再接受新的触发，执行完正在进行和已提交的检查、已接受的闭店流程和已排队的备份，再 `WriterHandle::shutdown()`。返回后不留任何后台任务。
 - 两份 `clippy.toml` 禁用 `test_node`，只有锁定测试及 `spec_support/` 可以 `#[allow]`。
 
 ## boh-server：配置

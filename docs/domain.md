@@ -626,7 +626,7 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
   - 一条 payload 行可能分到多个批次，所以流水不按 payload 行号编号。
 - `kind`：收货 `RECEIPT`，生产产出 `PRODUCE`，生产用料 `CONSUME`，报损 `WASTE`，盘点调整 `ADJUST`；纠错行沿用原行的 `kind`（见「纠错」）。
 - `alloc_source`：新建批次 `NEW_LOT`；盘点对已有批次和账外缺口的调整 `COUNT`；被吸收 `ABSORBED`；其余直接取 payload 中 `alloc` 的 `source`。
-- **不变量**（测试和定时自检都检查）：
+- **不变量**（锁定测试和[不变量自检](invariant-check.md)都检查）：
   - 批次余量 `remaining_qty` = 该批次所有流水的 `qty_delta` 之和；
   - 账外缺口 = 该物料 `lot_id IS NULL` 的流水 `qty_delta` 之和，且 `<= 0`；
   - 账面数（视图 `inventory_on_hand`）= 批次余量之和 + 账外缺口。
