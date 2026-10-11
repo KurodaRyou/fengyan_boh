@@ -20,13 +20,16 @@ pub struct BackupTasks {
 }
 
 #[derive(Clone)]
-pub struct BackupStop(watch::Sender<bool>, CheckHandle);
+pub struct BackupStop {
+    backup_triggers: watch::Sender<bool>,
+    external_check_triggers: CheckHandle,
+}
 
 impl BackupStop {
     /// Stop accepting triggers immediately; the task still drains accepted backups.
     pub fn stop(&self) {
-        self.0.send_replace(true);
-        self.1.stop();
+        self.backup_triggers.send_replace(true);
+        self.external_check_triggers.stop();
     }
 }
 
@@ -128,6 +131,8 @@ fn schedule_error(error: boh_domain::time::TimeError) -> StorageError {
 
 impl BackupTasks {
     /// Compute initial deadlines before returning, without firing a startup backup.
+    /// Submit exactly one startup invariant check before returning, without waiting
+    /// for it to finish.
     pub fn start(
         backup: Backup,
         clock: Clock,
@@ -155,7 +160,10 @@ impl BackupTasks {
             VecDeque::new(),
         ));
         Ok(Self {
-            stop: BackupStop(stop, check_handle),
+            stop: BackupStop {
+                backup_triggers: stop,
+                external_check_triggers: check_handle,
+            },
             task,
             checks,
         })

@@ -47,6 +47,14 @@ struct Report {
     samples_truncated: bool,
 }
 
+struct SnapshotResult {
+    max_seq: i64,
+    checks: Vec<Check>,
+    violation_count: u64,
+    samples: Vec<Sample>,
+    samples_truncated: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct Check {
     check: &'static str,
@@ -76,29 +84,38 @@ impl InvariantCheckHealth {
         lock(&self.0).clone()
     }
 
-    fn record(&self, result: Result<Report, StorageError>, finished_at: UnixMillis) {
-        let mut status = lock(&self.0);
-        let outcome = match result {
-            Ok(mut report) => {
-                report.finished_at = finished_at;
+    fn record(&self, result: Result<SnapshotResult, StorageError>, finished_at: UnixMillis) {
+        let (outcome, report) = match result {
+            Ok(snapshot) => {
+                let report = Report {
+                    finished_at,
+                    max_seq: snapshot.max_seq,
+                    checks: snapshot.checks,
+                    violation_count: snapshot.violation_count,
+                    samples: snapshot.samples,
+                    samples_truncated: snapshot.samples_truncated,
+                };
                 let outcome = if report.violation_count == 0 {
                     Outcome::Passed
                 } else {
                     tracing::error!(checks = ?report.checks, samples = ?report.samples, "inventory invariants violated");
                     Outcome::Violated
                 };
-                status.last_report = Some(report);
-                outcome
+                (outcome, Some(report))
             }
             Err(error) => {
                 tracing::error!(error = %boh_storage::Diagnostic(&error), "invariant check failed");
-                Outcome::Failed
+                (Outcome::Failed, None)
             }
         };
+        let mut status = lock(&self.0);
         status.last_attempt = Some(Attempt {
             finished_at,
             result: outcome,
         });
+        if let Some(report) = report {
+            status.last_report = Some(report);
+        }
     }
 }
 
@@ -118,6 +135,12 @@ struct Queue {
     sender: Option<mpsc::UnboundedSender<oneshot::Sender<()>>>,
 }
 
+enum CheckTrigger {
+    Startup,
+    External,
+    Closing,
+}
+
 impl InvariantChecks {
     pub(crate) fn start(readers: Readers, clock: Clock, health: InvariantCheckHealth) -> Self {
         let (sender, mut receiver) = mpsc::unbounded_channel::<oneshot::Sender<()>>();
@@ -129,7 +152,7 @@ impl InvariantChecks {
             gate: Arc::new(Gate::default()),
         };
         // Enqueue exactly one startup check before returning, without waiting for it.
-        let _startup = handle.submit(false);
+        let _startup = handle.submit(CheckTrigger::Startup);
         let gate = handle.gate.clone();
         let task = tokio::spawn(async move {
             while let Some(completed) = receiver.recv().await {
@@ -161,9 +184,9 @@ impl InvariantChecks {
 }
 
 impl CheckHandle {
-    fn submit(&self, external: bool) -> Option<oneshot::Receiver<()>> {
+    fn submit(&self, trigger: CheckTrigger) -> Option<oneshot::Receiver<()>> {
         let queue = lock(&self.queue);
-        if external && !queue.accepting {
+        if matches!(trigger, CheckTrigger::External) && !queue.accepting {
             return None;
         }
         let (completed, result) = oneshot::channel();
@@ -176,14 +199,14 @@ impl CheckHandle {
     }
 
     pub(crate) async fn run(&self) {
-        if let Some(result) = self.submit(true) {
+        if let Some(result) = self.submit(CheckTrigger::External) {
             let _ = result.await;
         }
     }
 
     pub(crate) async fn closing(&self) {
         // Accepted closing flows must still submit their check while draining.
-        if let Some(result) = self.submit(false) {
+        if let Some(result) = self.submit(CheckTrigger::Closing) {
             let _ = result.await;
         }
     }
@@ -254,7 +277,7 @@ impl Drop for InvariantCheckHold {
     }
 }
 
-fn check_snapshot(conn: &Connection) -> Result<Report, StorageError> {
+fn check_snapshot(conn: &Connection) -> Result<SnapshotResult, StorageError> {
     let max_seq = conn
         .query_row(
             "SELECT coalesce(max(seq), 0) FROM store_events",
@@ -262,8 +285,7 @@ fn check_snapshot(conn: &Connection) -> Result<Report, StorageError> {
             |row| row.get(0),
         )
         .map_err(|error| StorageError::sqlite("读取自检快照 max_seq", error))?;
-    let mut report = Report {
-        finished_at: UnixMillis(0),
+    let mut snapshot = SnapshotResult {
         max_seq,
         checks: Vec::new(),
         violation_count: 0,
@@ -328,7 +350,7 @@ fn check_snapshot(conn: &Connection) -> Result<Report, StorageError> {
                 violations = violations
                     .checked_add(1)
                     .ok_or_else(|| StorageError::external(operation, QuantityOverflow))?;
-                if report.samples.len() < 20 {
+                if snapshot.samples.len() < 20 {
                     let subject = if lot {
                         Subject::Lot {
                             item_id,
@@ -338,7 +360,7 @@ fn check_snapshot(conn: &Connection) -> Result<Report, StorageError> {
                     } else {
                         Subject::Item { item_id }
                     };
-                    report.samples.push(Sample {
+                    snapshot.samples.push(Sample {
                         check,
                         subject,
                         actual,
@@ -347,14 +369,14 @@ fn check_snapshot(conn: &Connection) -> Result<Report, StorageError> {
                 }
             }
         }
-        report.violation_count = report
+        snapshot.violation_count = snapshot
             .violation_count
             .checked_add(violations)
             .ok_or_else(|| StorageError::external(operation, QuantityOverflow))?;
-        report.checks.push(Check { check, violations });
+        snapshot.checks.push(Check { check, violations });
     }
-    report.samples_truncated = report.violation_count > report.samples.len() as u64;
-    Ok(report)
+    snapshot.samples_truncated = snapshot.violation_count > snapshot.samples.len() as u64;
+    Ok(snapshot)
 }
 
 #[derive(Debug)]
@@ -394,11 +416,11 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), hold.started())
             .await
             .unwrap();
-        drop(handle.submit(true).unwrap());
-        let first = handle.submit(true).unwrap();
-        let second = handle.submit(true).unwrap();
+        drop(handle.submit(CheckTrigger::External).unwrap());
+        let first = handle.submit(CheckTrigger::External).unwrap();
+        let second = handle.submit(CheckTrigger::External).unwrap();
         handle.stop();
-        assert!(handle.submit(true).is_none());
+        assert!(handle.submit(CheckTrigger::External).is_none());
         let mut shutdown = std::pin::pin!(checks.shutdown());
         assert!(
             tokio::time::timeout(Duration::from_millis(50), &mut shutdown)
@@ -417,7 +439,7 @@ mod tests {
         let status = health.snapshot();
         assert_eq!(status.last_attempt.unwrap().result, Outcome::Passed);
         assert_eq!(status.last_report.unwrap().finished_at, UnixMillis(9));
-        assert!(handle.submit(true).is_none());
+        assert!(handle.submit(CheckTrigger::External).is_none());
         storage.writer_handle.shutdown().await.unwrap();
     }
 

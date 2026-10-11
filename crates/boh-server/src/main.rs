@@ -116,7 +116,7 @@ async fn run(
         readers.clone(),
         invariant_health.clone(),
     )
-    .context("start backup scheduler")?;
+    .context("start backup scheduler and submit startup invariant check")?;
     let stop_backups = tasks.stop_handle();
     let shutdown = async move {
         tokio::select! {
