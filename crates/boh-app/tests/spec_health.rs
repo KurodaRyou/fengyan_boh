@@ -9,7 +9,7 @@ use std::path::Path;
 use boh_domain::UnixMillis;
 use boh_storage::clock::ManualClock;
 use serde_json::{Value, json};
-use spec_support::{MANAGER, assert_success, health};
+use spec_support::{MANAGER, assert_success, health, wait_for_health};
 
 const NOW: UnixMillis = UnixMillis(1_791_248_400_000); // 2026-10-06 09:00 +08:00
 
@@ -40,7 +40,8 @@ async fn create_equipment(router: &axum::Router, n: u16) {
     assert_success(&reply);
 }
 
-// 「data 的字段」恰好是这七个；新节点：账本为空、本进程还没有备份结果，状态 ok。不需要身份。
+// 「data 的字段」恰好是这八个；新节点：账本为空、本进程还没有备份结果，启动检查在空账本上通过，状态 ok。不需要身份。
+// invariant_check 的结构见 docs/invariant-check.md「报告」，各种结果见 spec_invariant_check.rs。
 #[tokio::test]
 async fn new_node_reports_ok_and_unknown_backup_state() {
     let dir = tempfile::tempdir().unwrap();
@@ -51,7 +52,10 @@ async fn new_node_reports_ok_and_unknown_backup_state() {
         .await
         .unwrap();
 
-    let data = health(&node.router).await;
+    let data = wait_for_health(&node.router, "startup check", |d| {
+        !d["invariant_check"]["last_attempt"].is_null()
+    })
+    .await;
 
     let mut keys: Vec<&str> = data
         .as_object()
@@ -64,6 +68,7 @@ async fn new_node_reports_ok_and_unknown_backup_state() {
         keys,
         [
             "clock_regression_ms",
+            "invariant_check",
             "last_backup_failed_at",
             "last_backup_ok_at",
             "last_backup_seq",
@@ -82,6 +87,24 @@ async fn new_node_reports_ok_and_unknown_backup_state() {
     assert_eq!(data["last_backup_seq"], Value::Null);
     assert_eq!(data["last_backup_failed_at"], Value::Null);
     assert_eq!(data["wal_size_bytes"], json!(wal_size(&db_path)));
+    assert_eq!(
+        data["invariant_check"],
+        json!({
+            "last_attempt": { "finished_at": NOW.0, "result": "passed" },
+            "last_report": {
+                "finished_at": NOW.0,
+                "max_seq": 0,
+                "checks": [
+                    { "check": "INVENTORY_LOT_REMAINING", "violations": 0 },
+                    { "check": "INVENTORY_UNALLOCATED", "violations": 0 },
+                    { "check": "INVENTORY_ON_HAND", "violations": 0 },
+                ],
+                "violation_count": 0,
+                "samples": [],
+                "samples_truncated": false,
+            },
+        })
+    );
     node.shutdown().await.unwrap();
 }
 
@@ -122,7 +145,8 @@ async fn clock_regression_measures_how_far_the_latest_record_is_ahead() {
     assert_eq!(data["status"], json!("ok"));
 }
 
-// 「wal_size_bytes：<数据库文件>-wal 的大小」：现场读取，写入后与文件大小一致。test_router 不启动后台任务，备份字段为 null。
+// 「wal_size_bytes：<数据库文件>-wal 的大小」：现场读取，写入后与文件大小一致。test_router 不启动后台任务，
+// 备份字段和 invariant_check 的两个字段为 null。
 #[tokio::test]
 async fn wal_size_is_read_from_the_wal_file() {
     let dir = tempfile::tempdir().unwrap();
@@ -139,5 +163,9 @@ async fn wal_size_is_read_from_the_wal_file() {
     assert_eq!(data["wal_size_bytes"], json!(size));
     assert_eq!(data["last_backup_ok_at"], Value::Null);
     assert_eq!(data["last_backup_failed_at"], Value::Null);
+    assert_eq!(
+        data["invariant_check"],
+        json!({ "last_attempt": null, "last_report": null })
+    );
     assert_eq!(data["status"], json!("ok"));
 }
