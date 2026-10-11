@@ -1,4 +1,4 @@
-//! 锁定测试：`Actor` 开发桩与权限。规则见 docs/domain.md「员工认证」开发桩、「主数据」，
+//! 锁定测试：`Actor` 开发桩与权限。规则见 docs/auth.md「开发桩」、docs/domain.md「主数据」，
 //! AGENTS.md「HTTP 约定」（401 / 403、写命令处理顺序）。
 
 mod spec_support;

@@ -1899,7 +1899,7 @@ async fn validation_precedes_the_idempotency_check() {
     assert_eq!(node.state(), before);
 }
 
-// domain「员工认证」开发桩与 AGENTS「HTTP 约定」：正式提交和预检都要求身份；缺少身份时 401 UNAUTHENTICATED，身份检查先于请求体——
+// auth「开发桩」与 AGENTS「HTTP 约定」：正式提交和预检都要求身份；缺少身份时 401 UNAUTHENTICATED，身份检查先于请求体——
 // 请求体无法解析或取值非法时，无身份仍是 401。有身份时，请求体不是 JSON 对象、缺少 Content-Type 或不是 application/json
 // 都是 400 VALIDATION_FAILED。两个路径都只有 POST，其他方法 405 METHOD_NOT_ALLOWED。什么都不写。
 #[tokio::test]

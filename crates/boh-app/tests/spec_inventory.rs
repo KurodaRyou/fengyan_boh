@@ -398,7 +398,7 @@ async fn invalid_detail_queries_are_validation_failed() {
     }
 }
 
-// domain「员工认证」开发桩与 AGENTS「HTTP 约定」：查询允许已认证员工（STAFF、MANAGER）；缺少身份时 401 UNAUTHENTICATED，
+// auth「开发桩」与 AGENTS「HTTP 约定」：查询允许已认证员工（STAFF、MANAGER）；缺少身份时 401 UNAUTHENTICATED，
 // 身份检查先于查询参数。查询走读连接，不写任何内容。只有 GET，其他方法 405 METHOD_NOT_ALLOWED。
 #[tokio::test]
 async fn detail_requires_identity_and_does_not_write() {
@@ -702,7 +702,7 @@ async fn lot_numbers_carry_digit_and_underscore_codes() {
     }
 }
 
-// domain「员工认证」开发桩与 AGENTS「HTTP 约定」：批次查询允许已认证员工（STAFF、MANAGER）；缺少身份时 401 UNAUTHENTICATED，
+// auth「开发桩」与 AGENTS「HTTP 约定」：批次查询允许已认证员工（STAFF、MANAGER）；缺少身份时 401 UNAUTHENTICATED，
 // 身份检查先于路径参数校验和存在性检查。查询不写任何内容。只有 GET，其他方法 405 METHOD_NOT_ALLOWED。
 #[tokio::test]
 async fn lot_lookup_requires_identity_and_does_not_write() {

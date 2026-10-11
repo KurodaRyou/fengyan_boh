@@ -890,7 +890,7 @@ async fn validation_precedes_the_idempotency_check() {
     assert_eq!(node.state(), before);
 }
 
-// domain「员工认证」开发桩与 AGENTS「HTTP 约定」：写入和查询缺少或使用非法身份时 401 UNAUTHENTICATED；
+// auth「开发桩」与 AGENTS「HTTP 约定」：写入和查询缺少或使用非法身份时 401 UNAUTHENTICATED；
 // 身份检查先于请求体和查询参数——请求体无法解析、取值非法或查询参数非法时，无身份仍是 401。什么都不写。
 #[tokio::test]
 async fn identity_is_required_and_checked_first() {

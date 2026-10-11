@@ -1007,7 +1007,7 @@ async fn list_returns_all_rows_ordered_by_code_bytes() {
     }
 }
 
-// domain「主数据」与「员工认证」开发桩：写接口只允许 MANAGER（STAFF 为 403 FORBIDDEN），查询任何已认证员工可用；
+// domain「主数据」与 auth「开发桩」：写接口只允许 MANAGER（STAFF 为 403 FORBIDDEN），查询任何已认证员工可用；
 // 没有身份时一律 401 UNAUTHENTICATED。被拒绝的请求不落库。
 #[tokio::test]
 async fn writes_require_manager_and_all_calls_require_identity() {
