@@ -955,7 +955,7 @@ async fn identity_is_required_and_checked_first() {
     assert_eq!(node.counts().unwrap(), (0, 0));
 }
 
-// 温度记录接口「取值」与 AGENTS「HTTP 约定」：字段缺失、未知字段（含补录用的 occurred_at）、类型或取值不对、
+// domain「温度记录接口」取值、「写命令通用规则」取值与发生时间、AGENTS「HTTP 约定」：字段缺失、未知字段（含补录用的 occurred_at）、类型或取值不对、
 // 请求体无法解析，一律 400 VALIDATION_FAILED，什么都不写。
 #[tokio::test]
 async fn invalid_commands_are_rejected_with_validation_failed() {
@@ -1010,7 +1010,7 @@ async fn invalid_commands_are_rejected_with_validation_failed() {
         with("sent_at", too_big),
         with("command_id", json!("not-a-uuid")),
         with("command_id", json!("01890a5d-ac96-474b-bcce-b302099a8401")), // v4
-        with("occurred_at", json!(NOW)),                                   // 补录不属于本切片
+        with("occurred_at", json!(NOW)), // 请求体不接受 occurred_at
         with("started_captured_at", json!(SENT)),
         with("unit", json!("C")),
     ];

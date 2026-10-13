@@ -850,7 +850,7 @@ async fn relative_calibration_and_business_date_apply() {
 // 不足确认（验收用例）
 // ---------------------------------------------------------------------------------------------
 
-// 验收用例「指定批次不足」：批次 A 5、B 10；报损 8 g，指定 A。
+// 场景「指定批次不足」（domain「报损接口」是否需要确认、分配）：批次 A 5、B 10；报损 8 g，指定 A。
 // - 不带确认：409 WASTE_CONFIRMATION_REQUIRED，details.lines 列出该行（lot_book_qty 5、item_book_qty 15），不写任何内容。
 // - 同一 command_id 加确认重提：入账，A 8 SPECIFIED，不转去扣 B；A −3、B 10；没有账外缺口；warnings 为空（不返回 STOCK_SHORTFALL）。
 // - 确认标记 true 保存在规范化请求中；payload 不带确认标记。
@@ -888,7 +888,7 @@ async fn specified_lot_shortage_requires_confirmation() {
     assert_eq!(stored["lines"][0]["confirm_shortage"], json!(true));
 }
 
-// 验收用例「指定批次、净账面不足」：只有批次 A 5 时报损 15 g（不指定批次，确认）→ A 0、账外缺口 −10；再收货建批次 B 5
+// 场景「指定批次、净账面不足」（domain「报损接口」是否需要确认）：只有批次 A 5 时报损 15 g（不指定批次，确认）→ A 0、账外缺口 −10；再收货建批次 B 5
 // （RAW-FLOUR-20261006-002）。指定 B 报 3 g：批次够（5 ≥ 3），但物料净账面 0 + 5 − 10 = −5 不足，需要确认；
 // 确认后 B 3 SPECIFIED，B 2，账外缺口仍为 −10（指定批次的差额不进账外缺口），账面 −8。
 #[tokio::test]
@@ -929,7 +929,7 @@ async fn specified_lot_also_checks_the_item_book() {
     assert_eq!(node.on_hand(&flour), -8);
 }
 
-// 验收用例「有负批次时不指定批次」：A 5、B 10，先指定 A 报 8（确认）→ A −3、B 10，净账面 7。再报 8 g，不指定批次：
+// 场景「有负批次时不指定批次」（domain「报损接口」账面与分配、「批次」负余量）：A 5、B 10，先指定 A 报 8（确认）→ A −3、B 10，净账面 7。再报 8 g，不指定批次：
 // 正余量批次 B 足够分配，但净账面 7 < 8，需要确认（item_book_qty 7，不带 lot_id、lot_book_qty）；
 // 确认后 FIFO 跳过余量不大于 0 的 A，分配 B 8 FIFO；A −3、B 2，不新增账外缺口，账面 −1。
 #[tokio::test]
@@ -959,11 +959,11 @@ async fn unspecified_line_checks_the_item_book_including_negative_lots() {
     assert_eq!(node.on_hand(&flour), -1);
 }
 
-// 验收用例「不足记入账外缺口」：只有批次 A 5；报损 8 g，不指定批次。
+// 验收用例「报损不足确认与分配」（domain「报损接口」分配、「批次」账面不足）：只有批次 A 5；报损 8 g，不指定批次。
 // - 不带确认：409，item_book_qty 5。
 // - 确认后 A 5 FIFO + 3 SHORTFALL（不带 lot_id）；A 0，账外缺口 −3，账面 −3；warnings 为空，不返回 STOCK_SHORTFALL。
 //   SHORTFALL 流水的 lot_id 为 NULL；inventory_unallocated 没有该物料的行时新建。
-// - 验收用例「收货后耗尽」：再报 2 g。面粉曾经收货（有批次 A），不受「从未收货」的限制：不带确认时照常 409
+// - 场景「收货后耗尽」：再报 2 g。面粉曾经收货（有批次 A），不受「从未收货」的限制：不带确认时照常 409
 //   WASTE_CONFIRMATION_REQUIRED（item_book_qty −3）；确认后 A 余量为 0，被 FIFO 跳过，整行 2 SHORTFALL；
 //   账外缺口累加到 −5，仍是一行。
 #[tokio::test]
@@ -1021,7 +1021,7 @@ async fn shortfall_beyond_positive_lots_goes_off_book() {
     assert_eq!(node.on_hand(&flour), -5);
 }
 
-// 验收用例「从未收货的物料」与 domain「报损接口」：物料还没有任何批次时 409 ITEM_HAS_NO_LOTS，details 为 {line, item_id}，
+// 场景「从未收货的物料」与 domain「报损接口」业务校验：物料还没有任何批次时 409 ITEM_HAS_NO_LOTS，details 为 {line, item_id}，
 // 整条命令不入账，不生成 SHORTFALL。
 // - 带确认标记也拒绝：确认只处理数量不足，不授予报损资格。
 // - 同一命令中面粉的正常行也不入账；line 是糖所在的行。
@@ -1057,7 +1057,7 @@ async fn item_without_lots_cannot_be_wasted() {
     assert_eq!(node.state(), before);
 }
 
-// 验收用例「数量越界」与 domain「报损接口」：逐行处理中的账面、扣减后的批次余量或账外缺口超出 i64 时 400 VALIDATION_FAILED，
+// 场景「数量越界」与 domain「报损接口」业务校验：逐行处理中的账面、扣减后的批次余量或账外缺口超出 i64 时 400 VALIDATION_FAILED，
 // details 为 {}，整条命令不入账（前面的正常行也不入账），不绕回、不截断、不钳制；预检同样拒绝。其他前提都满足：物料已收货、
 // 引用与单位合法、带确认。
 // - 准备：糖批次 S 1 g，指定 S 报 i64::MAX（确认）→ S 为 i64::MIN + 2；面粉 A 5、B 10，不指定批次报 i64::MAX（确认）
@@ -1210,7 +1210,7 @@ async fn item_book_beyond_i64_rejects_the_whole_command() {
     assert_eq!(node.on_hand(&flour), i64::MIN);
 }
 
-// 验收用例「同一命令的后续行」：A 5、B 10；一次报损两行：lines[0] 不指定批次 8 g，lines[1] 指定 A 1 g。
+// 场景「同一命令的后续行」（domain「报损接口」逐行处理）：A 5、B 10；一次报损两行：lines[0] 不指定批次 8 g，lines[1] 指定 A 1 g。
 // 每行看到的是前面各行处理之后的账面：lines[0] 不需要确认（净账面 15），分配 A 5 + B 3；lines[1] 看到 A 0、净账面 7，
 // 批次不足，需要确认。409 只列 line 1（lot_book_qty 0、item_book_qty 7）。只给 lines[1] 加确认后入账：A −1、B 7。
 #[tokio::test]
@@ -1363,10 +1363,10 @@ async fn confirmation_on_a_sufficient_line_is_accepted() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// 预检（验收用例「预检只读」「确认后不足加大」「提交时新出现的不足」）
+// 预检（场景「预检只读」「确认后不足加大」「提交时新出现的不足」）
 // ---------------------------------------------------------------------------------------------
 
-// 验收用例「预检只读」与 domain「报损接口」预检：data.lines 每行 {line, item_id, lot_id?, qty, item_book_qty, lot_book_qty?,
+// 场景「预检只读」与 domain「报损接口」预检：data.lines 每行 {line, item_id, lot_id?, qty, item_book_qty, lot_book_qty?,
 // needs_confirmation, alloc}，按正式提交的逐行规则计算，假设需要确认的行都已确认。面粉 A 5、B 10（净账面 15），糖 S 20：
 // - lines[0] 面粉指定 A 8：批次 5，需要确认，预计 A 8 SPECIFIED（之后 A −3，面粉净账面 7）；
 // - lines[1] 糖 3：item_book_qty 是糖自己的 20，不受面粉的扣减或两种物料合计的影响；预计 S 3（之后糖 17）；
@@ -1427,7 +1427,7 @@ async fn precheck_reports_each_line_and_writes_nothing() {
     assert_eq!(node.state(), before);
 }
 
-// 验收用例「确认后不足加大」：A 5；预检指定 A 报 8（lot_book_qty 5，需要确认）后员工确认；提交前另一台平板报损 A 2
+// 场景「确认后不足加大」（domain「报损接口」不足确认）：A 5；预检指定 A 报 8（lot_book_qty 5，需要确认）后员工确认；提交前另一台平板报损 A 2
 // （不需要确认）已入账；带确认提交照常入账，确认不绑定预检时的账面：lot_book_qty、item_book_qty 记提交时的值 3、13；A −5。
 #[tokio::test]
 async fn confirmation_holds_when_the_shortage_grows() {
@@ -1458,7 +1458,7 @@ async fn confirmation_holds_when_the_shortage_grows() {
     assert_eq!(node.lots(), [pair(A, -5), pair(B, 10)]);
 }
 
-// 验收用例「提交时新出现的不足」：A 5；预检指定 A 报 4 不需要确认；提交前另一台平板报损 A 2 已入账；不带确认提交时
+// 场景「提交时新出现的不足」（domain「报损接口」不足确认）：A 5；预检指定 A 报 4 不需要确认；提交前另一台平板报损 A 2 已入账；不带确认提交时
 // 在写事务内重新计算：409 WASTE_CONFIRMATION_REQUIRED（lot_book_qty 3、item_book_qty 13），不入账。
 #[tokio::test]
 async fn a_shortage_appearing_at_submit_requires_confirmation() {
@@ -1540,10 +1540,10 @@ async fn confirmation_is_judged_after_other_business_checks() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// FIFO（验收用例「同次收货多个批次」「同次收货重复提交」「批次日期与流水号」）
+// FIFO（验收用例「批次号与 FIFO」，场景「同次收货多个批次」「同次收货重复提交」）
 // ---------------------------------------------------------------------------------------------
 
-// 验收用例「同次收货多个批次」「同次收货重复提交」（日期换成 10-06）：一次收货面粉两行，lines[0] 建 A（…-001）5 g、
+// 场景「同次收货多个批次」「同次收货重复提交」（domain「批次」FIFO 分配；日期为 10-06）：一次收货面粉两行，lines[0] 建 A（…-001）5 g、
 // lines[1] 建 B（…-002）10 g；报损 8 g，不指定批次：按批次号分配 A 5 FIFO + B 3 FIFO，余量 A 0、B 7。
 // 之后用原 command_id、原内容（sent_at 不同）重发收货：返回原批次号 A、B，seq 不增加，余量仍为 A 0、B 7。
 #[tokio::test]
@@ -1586,11 +1586,11 @@ async fn fifo_follows_lot_numbers_within_one_receipt() {
     assert_eq!(node.lots(), [pair(A, 0), pair(B, 7)]);
 }
 
-// 验收用例「批次日期与流水号」与 domain「批次」FIFO：按批次日期升序、同一日期内按流水号升序扣减，
+// 验收用例「批次号与 FIFO」与 domain「批次」FIFO 分配：按批次日期升序、同一日期内按流水号升序扣减，
 // 不按 seq、到期日或实物发生钟点。现在是 10-06 09:00：
 // - A：当天收货 5 g，到期 10-15，RAW-FLOUR-20261006-001；
 // - C：当天收货 5 g，occurred_at 为 07:00，但后于 A 入账，因此流水号为 002（…-20261006-002）；到期 10-10（最早到期）；
-// - D：最后入账、补 10-04 的收货 5 g，到期 10-30，…-20261004-001。
+// - D：最后入账、经相对校准（lag 48 小时）入账的 10-04 收货 5 g，到期 10-30，…-20261004-001。
 // 报损 12 g，不指定批次：D 5 → A 5 → C 2。
 #[tokio::test]
 async fn fifo_orders_by_lot_date_then_serial() {
@@ -1638,7 +1638,7 @@ async fn fifo_orders_by_lot_date_then_serial() {
 // 幂等与处理顺序
 // ---------------------------------------------------------------------------------------------
 
-// 验收用例「幂等」「确认标记与幂等」与 domain「报损接口」重提：
+// 验收用例「幂等」、场景「确认标记与幂等」与 domain「报损接口」重提：
 // - 带确认的报损成功后，库存又被另一条报损改变；一小时后用原 command_id、原内容（含确认标记）重发，
 //   sent_at 不同（包括会超过 72 小时的值）：原样返回首次响应（含 warnings 和首次的账面、分配），seq 不增加，不重新计算。
 // - 确认标记省略与 false 等价：原请求省略的行改写为 false，或原请求为 false 的行改为省略，都返回首次响应，不是冲突。
@@ -2032,7 +2032,7 @@ fn invalid_lines(valid: &Value) -> Vec<(&'static str, Value)> {
     cases
 }
 
-// domain「报损接口」取值与 AGENTS「HTTP 约定」：结构或取值错误一律 400 VALIDATION_FAILED，details 为 {}，什么都不写。
+// domain「报损接口」取值、「写命令通用规则」取值与 AGENTS「HTTP 约定」：结构或取值错误一律 400 VALIDATION_FAILED，details 为 {}，什么都不写。
 // lot_id 按批次号格式校验（同「批次查询」）；confirm_shortage 只接受布尔值，不接受 null、字符串或数字。
 #[tokio::test]
 async fn invalid_values_are_validation_failed() {

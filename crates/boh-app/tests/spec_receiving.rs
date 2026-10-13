@@ -468,7 +468,7 @@ fn assert_warnings(reply: &JsonReply, expected: &[(&str, Value)]) {
 // - qty = input.qty × base_qty_per_unit；expires_at = expires_on 当日最后一毫秒（Asia/Shanghai）。
 // - 批次号 <类型>-<编码>-<批次日期>-<流水号>：面粉的两行按行序取 001、002，黄油另从 001 开始；批次日期是 occurred_at
 //   （10-06 08:50）的当地日期；投影的 lot_date、lot_serial 由批次号拆出。
-// - 同一物料的两行分别建批次，source_line_no 为原下标（「来源行序」）；用基本单位提交时系数为 1。
+// - 同一物料的两行分别建批次，source_line_no 为原下标（domain「批次」来源）；用基本单位提交时系数为 1。
 // - payload 的键顺序锁定在 golden 样本中；这里按 JSON 值比对。manufacturer_lot_no 省略时 payload、投影、响应都没有它。
 // - 相对校准抵消平板时钟偏差；规范化请求保留 captured_at，剥离 command_id、sent_at。
 #[tokio::test]
@@ -811,7 +811,7 @@ async fn relative_calibration_applies() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// 到期提醒与日期校验（验收用例「到期早于先扣的批次」「到货即过期」「凌晨收当天生产的货」）
+// 到期提醒与日期校验（验收用例「收货日期」，场景「到期早于先扣的批次」「到货即过期」）
 // ---------------------------------------------------------------------------------------------
 
 // domain「批次」EXPIRES_BEFORE_OLDER_STOCK：同一天已有批次 A（RAW-FLOUR-20261006-001）余量 5、到期 10-20，
@@ -978,7 +978,7 @@ async fn equal_or_later_expiry_does_not_warn() {
     }
 }
 
-// 验收用例「到货即过期」：occurred_at 的当地日期为 10-08，expires_on 10-07 时 400 INVALID_LOT_DATES，
+// 场景「到货即过期」（domain「收货接口」业务校验）：occurred_at 的当地日期为 10-08，expires_on 10-07 时 400 INVALID_LOT_DATES，
 // details 为 {line, item_id, reason: "EXPIRED_ON_RECEIPT"}，什么都不写；expires_on 10-08 照常受理。
 #[tokio::test]
 async fn expired_on_receipt_is_rejected() {
@@ -1026,7 +1026,7 @@ async fn expired_on_receipt_is_rejected() {
     assert_eq!(receipt["lines"][0]["expires_at"], json!(END_OF_10_08));
 }
 
-// 验收用例「凌晨收当天生产的货」：10-08 02:00 收货（营业日 10-07），produced_on 10-08 照常受理——判定用 occurred_at 的
+// 验收用例「收货日期」（domain「收货接口」业务校验）：10-08 02:00 收货（营业日 10-07），produced_on 10-08 照常受理——判定用 occurred_at 的
 // 日历日期，不用营业日；produced_on 10-09 时 400 INVALID_LOT_DATES，reason 为 PRODUCED_IN_FUTURE，什么都不写。
 #[tokio::test]
 async fn produced_on_is_checked_against_the_calendar_date() {
@@ -1091,7 +1091,7 @@ async fn lot_dates_follow_occurred_at_not_recorded_at() {
 // 单位与引用
 // ---------------------------------------------------------------------------------------------
 
-// 验收用例「换算变化」：离线录入「2 袋，每袋 25000 g」；提交前换算改为 20000：409 UNIT_CONVERSION_CHANGED，
+// 验收用例「单位换算」（domain「单位」）：离线录入「2 袋，每袋 25000 g」；提交前换算改为 20000：409 UNIT_CONVERSION_CHANGED，
 // details 为 {line, item_id, unit_code, base_qty_per_unit: 当前值}，不入账。按当前系数重新录入后可以用同一个 command_id 重提。
 #[tokio::test]
 async fn changed_conversion_is_a_conflict() {
@@ -1211,7 +1211,7 @@ async fn unknown_references_are_not_found() {
 // 取值校验
 // ---------------------------------------------------------------------------------------------
 
-// domain「收货接口」取值与 AGENTS「HTTP 约定」：结构或取值错误一律 400 VALIDATION_FAILED，details 为 {}，什么都不写。
+// domain「收货接口」取值、「写命令通用规则」取值与 AGENTS「HTTP 约定」：结构或取值错误一律 400 VALIDATION_FAILED，details 为 {}，什么都不写。
 // 引用都存在、单位合法，只有被改动的字段不合法。
 #[tokio::test]
 async fn invalid_values_are_validation_failed() {
@@ -1411,7 +1411,7 @@ async fn out_of_range_times_are_validation_failed() {
 // 幂等与处理顺序
 // ---------------------------------------------------------------------------------------------
 
-// 验收用例「同次收货重复提交」「幂等」：一小时后用原 command_id、原内容重发（sent_at 不同，包括会超过 72 小时的值），
+// 验收用例「幂等」、场景「同次收货重复提交」：一小时后用原 command_id、原内容重发（sent_at 不同，包括会超过 72 小时的值），
 // 原样返回首次响应（含 warnings、原批次号 …-001、…-002），seq 不增加，批次与流水不变；不重新计算到期提醒，
 // 也不重新分配流水号。
 // 幂等检查先于业务校验：首次成功后换算系数变了，原内容重试仍返回首次响应，不是 409 UNIT_CONVERSION_CHANGED。

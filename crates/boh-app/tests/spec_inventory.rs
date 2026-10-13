@@ -208,7 +208,7 @@ fn with_item(mut row: Value, item_id: &str) -> Value {
 // 库存明细查询：data 为 {business_date, items}。
 // - items 每个物料一项，含停用的和没有库存的，按 code 的字节序升序（"BUTTER" 在 "B_2" 之前：'U' < '_'）；
 //   每项 {item_id, on_hand_qty, unallocated_qty, lots}，没有库存时 on_hand_qty、unallocated_qty 为 0，lots 为空数组。
-// - lots 按 FIFO（批次日期、流水号）排列，不按到期日或入账先后：补录的 10-04 批次 D 排最前，之后是 10-06 的 A、B、C。
+// - lots 按 FIFO（批次日期、流水号）排列，不按到期日或入账先后：迟到入账（lag 48 小时）的 10-04 批次 D 排最前，之后是 10-06 的 A、B、C。
 //   每行 {lot_id, origin, remaining_qty, source_occurred_at, expires_at, manufacturer_lot_no?}，不含 item_id；
 //   source_occurred_at 是收货的 occurred_at；manufacturer_lot_no 出现时照原样返回，没有时省略该键。
 // - 带 item_id 时 items 只含该物料一项（停用、没有库存的也照常返回）。
@@ -621,7 +621,7 @@ async fn lot_lookup_rejects_malformed_and_unknown_lot_numbers() {
     assert_eq!(node.state(), before);
 }
 
-// domain「物料」编码与「批次」「批次查询」：物料编码可以含数字、下划线，也可以只有一个字符（A_1、_、0），批次号的编码段原样取它。
+// domain「主数据」ITEM 编码与「批次」「批次查询」：物料编码可以含数字、下划线，也可以只有一个字符（A_1、_、0），批次号的编码段原样取它。
 // 收货生成的批次号在库存明细（物料按 code 字节序："0" < "A_1" < "_"）和批次查询中原样返回；
 // 这些编码格式合法但不存在的批次号 404 REFERENCE_NOT_FOUND，不是 400。
 #[tokio::test]

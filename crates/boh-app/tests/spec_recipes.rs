@@ -500,7 +500,7 @@ async fn missing_references_and_stale_revisions_are_rejected() {
     assert_success(&node.add_version(&id, &node.version_body(&cmd(2), 1)).await);
 }
 
-// domain「主数据」：引用已停用的物料照常受理；不限制物料的 category，产出物料可以出现在自己的用料中。
+// domain「主数据」：引用已停用的物料照常受理；「主数据接口」配方：不限制物料的 category，产出物料可以出现在自己的用料中。
 #[tokio::test]
 async fn inactive_items_and_any_category_are_accepted() {
     let node = node().await;
