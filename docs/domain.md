@@ -122,7 +122,7 @@ occurred_at = recorded_at − lag
 - 每个物料只有一个基本单位。账本、投影中的数量都是基本单位的 `i64`。换算系数必须是**正整数**基本单位（`> 0`）。
   - 主数据写入时校验（本地编辑和总部包导入都一样），系数不合格的变更整条拒绝，不进入事件流。
 - 命令用 `input {qty, unit_code, base_qty_per_unit}` 提交，其中系数是客户端录入时看到的值。
-  - 取值：`input.qty`、`input.base_qty_per_unit` 是正整数；`input.unit_code` 非空、首尾不能有空白字符；`input.qty × input.base_qty_per_unit` 不超出 `i64`。不满足时 `400 VALIDATION_FAILED`。
+  - 取值：`input.qty` 是正整数（数量更正的新数量可以为 0，见「纠错」）；`input.base_qty_per_unit` 是正整数；`input.unit_code` 非空、首尾不能有空白字符；`input.qty × input.base_qty_per_unit` 不超出 `i64`。不满足时 `400 VALIDATION_FAILED`。
 - 写入线程用当前换算核对（业务校验）：
   - `unit_code` 既不是物料的 `base_unit` 也不在 `units` 中：`400 UNKNOWN_UNIT`，`details` 为 `{"line", "item_id", "unit_code"}`；
   - 系数和当前值不一致：`409 UNIT_CONVERSION_CHANGED`，`details` 为 `{"line", "item_id", "unit_code", "base_qty_per_unit": 当前值}`（`unit_code` 等于 `base_unit` 时当前值为 1），不入账，由人工确认后重新提交。
@@ -689,6 +689,7 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 | 冲销含账外缺口的报损 | 只有批次 A 5；报损 8 g、不指定批次（确认）→ A 0，账外缺口 −3；之后没有盘点；冲销这条报损 | A 加回 **5**，账外缺口加回 **3** 归零，账面 **5**；alloc `A 5 REVERSAL` + `3 REVERSAL`（不带 `lot_id`） |
 | 退回会让账外缺口变正 | 只有批次 A 5；10:00 报损 8 g（确认）→ A 0，账外缺口 −3；一台离线平板 09:00 完成的盘点 10:30 才入账（A 清点 5 → A 5，账外缺口清零）；冲销 10:00 的报损 | `409 COUNT_REQUIRED`；整条命令不入账。重新盘点该物料（观察时点晚于 10:00）后再冲销，冲销被新盘点吸收 |
 | FIFO 报损减量按逆序退回 | 批次 A 5、B 10（A 在前），之后没有能吸收更正的盘点；报损 8 g、不指定批次 → `A 5 FIFO` + `B 3 FIFO`（A 0、B 7）；更正为 6 | 先退最后分配的 B：alloc `B 2 CORRECTION`；A **0**、B **9** |
+| 将报损中的一行更正为零 | 面粉批次 A 20 g、黄油批次 B 10 g，之后没有盘点；同一报损误录面粉 10 g、正确记录黄油 3 g → A 10、B 7；实际没有面粉报损，将面粉行更正为 0，`input` 为 `{qty: 0, unit_code: "g", base_qty_per_unit: 1}` | 更正成功，`delta` **−10**；alloc `A 10 CORRECTION`；A **20**、B **7**；报损有效数量面粉 **0**、黄油 **3**；原事件不变 |
 | 补录时间边界 | 未触发锁账限制；补录 `occurred_at` 等于 `recorded_at`；另一次晚 1 ms | 前者照常受理；后者 `400 INVALID_OCCURRED_AT` |
 | 补录旧日期收货的批次号 | 面粉在 09-10、09-11 已有批次，09-09 没有批次；09-12 经补录入口补一张 `occurred_at` 为 09-09 的收货，未被锁账限制拒绝 | 批次号为 `…-20260909-001`；FIFO 排在 09-10、09-11 的批次之前 |
 | 盘点不接受补录 | 盘点请求体带 `occurred_at` | `400 VALIDATION_FAILED`；不入账 |
