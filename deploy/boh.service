@@ -13,7 +13,7 @@ Environment=RUST_LOG=info
 Restart=always
 RestartSec=2
 
-# 优雅关闭：SIGTERM → 停 HTTP → 排空备份 → 排空写队列 → WAL checkpoint
+# 优雅关闭：SIGTERM → 停 HTTP → 执行完进行中和已排队的备份、闭店流程与自检 → 排空写队列 → WAL checkpoint（见 AGENTS.md「Rust」优雅关闭顺序）
 KillSignal=SIGTERM
 TimeoutStopSec=120
 

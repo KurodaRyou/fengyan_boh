@@ -236,7 +236,7 @@ scripts/        CI 扫描脚本。
 ### ID 与时间
 - 所有实体 / 事件主键用 **UUIDv7**（`TEXT`，36 位小写带连字符，版本位 `7`，变体位 `8`–`b`）。禁止自增整数 ID。
   例外：`store_events.seq`（门店内提交顺序，由 SQLite 分配）；批次以人可读的批次号 `lot_id` 为主键（格式与生成规则见 `docs/domain.md`「批次」，生成后不变）。投影表中的 `line_no`、`source_line_no`、`movement_no` 是行号或展开编号，不是自增键。
-- 客户端提交的 ID（如 `command_id`，含请求体、路径参数、查询参数和开发桩请求头中的 ID）在 `boh-domain` 中校验必须是 v7，文本只接受与存储相同的 36 位小写带连字符形式；大写、无连字符、花括号、`urn:` 前缀都按取值非法处理。客户端提交的批次号按 `docs/domain.md`「批次」的格式校验。
+- 客户端提交的 ID（如 `command_id`，含请求体、路径参数、查询参数和开发桩请求头中的 ID）在 `boh-domain` 中校验必须是 v7，文本只接受与存储相同的 36 位小写带连字符形式；大写、无连字符、花括号、`urn:` 前缀都按取值非法处理。客户端提交的批次号按 `docs/domain.md`「批次」中批次号的格式校验。
 - 服务端生成的 UUIDv7 在写事务内构造：时间部分取该命令的 `recorded_at`（负值按 0），随机部分取 SQLite `randomblob(10)`，由 `boh-domain` 的纯函数拼装。不用 `Uuid::now_v7()`。
   - `now_v7()` 在 uuid crate 内部读系统时钟，绕过时钟模块，`disallowed-methods` 也拦不住。
 - 时间戳一律 `INTEGER`，UTC Unix **毫秒**。禁止存格式化的日期时间字符串。
@@ -245,7 +245,7 @@ scripts/        CI 扫描脚本。
 - **批次间的 FIFO 顺序看批次号**：同一物料内先比批次日期，再比流水号。批次日期在建批次时由 `occurred_at` 确定，写进 payload 中的批次号，之后不重算。
 - `recorded_at` 取系统时钟原值，**不做单调钳制**。
   - 顺序已由 `seq` 保证；钳制会让一次跳到未来的时钟把之后的时间全部卡在未来。
-- `occurred_at` 由相对校准计算（或补录时显式给出），`business_date` 由 `occurred_at` 计算（`SALES_IMPORTED` 例外，由命令显式给出）。规则见 `docs/domain.md`「时间」。
+- `occurred_at` 由相对校准计算（或补录时显式给出）；主数据命令和初始化取 `recorded_at`，冲销和数量更正取原事件的值。`business_date` 由 `occurred_at` 计算（`SALES_IMPORTED` 例外，由命令显式给出）。规则见 `docs/domain.md`「时间」。
 - 系统时间只通过时钟模块读取，业务代码显式接收时间。
 
 ### 只追加（Append-only）

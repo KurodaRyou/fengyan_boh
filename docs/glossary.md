@@ -36,7 +36,7 @@
 
 | 规范名 | 中文用词 | 定义 | 详见 |
 |---|---|---|---|
-| Business date | 营业日 | 门店当地日期，早于日切时刻（默认 `04:00`）的发生时间算前一营业日 | domain「时间」 |
+| Business date | 营业日 | 门店当地日期，早于日切时刻（必填配置 `business_day_cutoff`，如 `04:00`）的发生时间算前一营业日 | domain「时间」 |
 | Relative calibration | 相对校准 | 用平板同一时钟算出 `lag = sent_at − captured_at`，以节点的 `recorded_at − lag` 作为 `occurred_at`，抵消平板时钟偏差 | domain「时间」 |
 | Backfill | 补录 | 经显式入口直接提交过去的 `occurred_at`，不走相对校准 | domain「时间」 |
 | Lot | 批次 | 一次收货行或生产产出形成的一份库存，以批次号标识 | domain「批次」 |
