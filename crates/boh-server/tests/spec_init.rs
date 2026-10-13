@@ -358,7 +358,7 @@ where
     response
 }
 
-// domain「主数据」报损原因：「预置的报损原因同样可以修改和停用」。init 之后，接口按 code 字节序列出 5 条预置原因
+// domain「主数据接口」报损原因：「预置的报损原因同样可以修改和停用」。init 之后，接口按 code 字节序列出 5 条预置原因
 // （revision 1、启用）；店长修改并停用其中一条，接着 init 的事件追加 seq 6、aggregate_version 2。
 #[tokio::test]
 async fn preset_waste_reasons_are_listed_and_editable_over_http() {

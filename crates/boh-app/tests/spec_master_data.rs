@@ -449,7 +449,7 @@ fn event(node: &Node, id: &str, version: i64, command_id: &str, at: i64, payload
     }
 }
 
-// 主数据接口「新建」：写一条 aggregate_version 1 的 MASTER_DATA_CHANGED（payload 为完整快照，source = LOCAL）、
+// domain「写命令通用规则」新建、发生时间与「主数据接口」新建：写一条 aggregate_version 1 的 MASTER_DATA_CHANGED（payload 为完整快照，source = LOCAL）、
 // 主表一行和 processed_commands；身份取自开发桩；occurred_at = recorded_at，营业日按门店时区计算。
 // 响应与查询的行是 ID 字段、快照全部字段和 revision。
 #[tokio::test]
@@ -561,7 +561,7 @@ async fn update_writes_next_revision_and_keeps_code() {
     }
 }
 
-// domain「主数据」：内容没有变化的修改不写事件，命令照常成功并写入 processed_commands，响应为当前行；
+// domain「主数据」「主数据接口」修改：内容没有变化的修改不写事件，命令照常成功并写入 processed_commands，响应为当前行；
 // revision 不变，下一次修改仍以原 revision 为基准。
 #[tokio::test]
 async fn unchanged_update_succeeds_without_an_event() {
@@ -673,7 +673,7 @@ async fn the_same_code_may_be_used_by_different_entities() {
     assert_eq!(assert_success(&reply)["equipment"]["code"], json!("SHARED"));
 }
 
-// domain「时间」营业日：主数据命令 occurred_at = recorded_at；Asia/Shanghai 当地 04:00 之前归前一营业日，恰好 04:00 归当日。
+// domain「写命令通用规则」发生时间与「时间」营业日：主数据命令 occurred_at = recorded_at；Asia/Shanghai 当地 04:00 之前归前一营业日，恰好 04:00 归当日。
 #[tokio::test]
 async fn business_date_follows_store_timezone_and_cutoff() {
     for entity in ENTITIES {
@@ -1007,7 +1007,7 @@ async fn list_returns_all_rows_ordered_by_code_bytes() {
     }
 }
 
-// domain「主数据」与「员工认证」开发桩：写接口只允许 MANAGER（STAFF 为 403 FORBIDDEN），查询任何已认证员工可用；
+// domain「主数据」「主数据接口」与 auth「开发桩」：写接口只允许 MANAGER（STAFF 为 403 FORBIDDEN），查询任何已认证员工可用；
 // 没有身份时一律 401 UNAUTHENTICATED。被拒绝的请求不落库。
 #[tokio::test]
 async fn writes_require_manager_and_all_calls_require_identity() {

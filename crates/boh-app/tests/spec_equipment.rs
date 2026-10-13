@@ -1,4 +1,4 @@
-//! 锁定测试：设备主数据接口（walking skeleton）。规则见 docs/domain.md「主数据」「设备接口」「时间」，
+//! 锁定测试：设备主数据接口（walking skeleton）。规则见 docs/domain.md「主数据」「主数据接口」「写命令通用规则」「时间」，
 //! AGENTS.md「幂等」「HTTP 约定」，接口见 docs/interfaces.md。
 
 mod spec_support;
@@ -251,7 +251,7 @@ fn snapshot(code: &str, name: &str, equipment_type: &str, active: bool) -> Value
     })
 }
 
-// 设备接口「新建」：写一条 aggregate_version 1 的 MASTER_DATA_CHANGED、投影行和 processed_commands；
+// domain「写命令通用规则」新建与「主数据接口」：写一条 aggregate_version 1 的 MASTER_DATA_CHANGED、投影行和 processed_commands；
 // 身份取自开发桩；主数据命令 occurred_at = recorded_at，营业日按门店时区计算。
 #[tokio::test]
 async fn create_writes_event_projection_and_command() {
@@ -340,7 +340,7 @@ async fn business_date_follows_store_timezone_and_cutoff() {
     );
 }
 
-// 设备接口「修改」：revision +1，code 保持不变，事件 aggregate_version 等于新 revision；
+// domain「主数据接口」修改与「主数据」revision：revision +1，code 保持不变，事件 aggregate_version 等于新 revision；
 // 规范化请求含路径参数 equipment_id，不含 command_id。
 #[tokio::test]
 async fn update_writes_next_revision_and_keeps_code() {
@@ -403,7 +403,7 @@ async fn update_writes_next_revision_and_keeps_code() {
     );
 }
 
-// domain「主数据」：内容没有变化的修改不写事件，命令照常成功并写入 processed_commands，响应为当前行。
+// domain「主数据」「主数据接口」修改：内容没有变化的修改不写事件，命令照常成功并写入 processed_commands，响应为当前行。
 #[tokio::test]
 async fn unchanged_update_succeeds_without_an_event() {
     let node = node();
@@ -482,7 +482,7 @@ async fn stale_base_revision_conflicts_even_when_content_is_unchanged() {
     assert_eq!(node.counts().unwrap(), (2, 2));
 }
 
-// 设备接口「新建」：code 已被其他设备使用（含停用的）时 409 CODE_ALREADY_EXISTS，不落库。
+// domain「主数据接口」新建：code 已被其他设备使用（含停用的）时 409 CODE_ALREADY_EXISTS，不落库。
 #[tokio::test]
 async fn duplicate_code_conflicts_even_with_inactive_equipment() {
     let node = node();
@@ -502,7 +502,7 @@ async fn duplicate_code_conflicts_even_with_inactive_equipment() {
     assert_eq!(node.counts().unwrap(), (1, 1));
 }
 
-// 设备接口「修改」：设备不存在时 404 REFERENCE_NOT_FOUND，details 给 entity 和 id，不落库。
+// domain「主数据接口」修改：设备不存在时 404 REFERENCE_NOT_FOUND，details 给 entity 和 id，不落库。
 #[tokio::test]
 async fn updating_unknown_equipment_is_not_found() {
     let node = node();
@@ -522,7 +522,7 @@ async fn updating_unknown_equipment_is_not_found() {
     assert_eq!(node.counts().unwrap(), (1, 1));
 }
 
-// 设备接口「取值」与 AGENTS「HTTP 约定」「ID 与时间」：字段缺失、未知字段、类型或取值不对、路径参数无法解析，
+// domain「主数据接口」取值、「写命令通用规则」取值与 AGENTS「HTTP 约定」「ID 与时间」：字段缺失、未知字段、类型或取值不对、路径参数无法解析，
 // 以及 command_id 或路径参数不是 36 位小写带连字符的 UUIDv7 文本（大写、无连字符、花括号、urn:），一律 400 VALIDATION_FAILED，不落库。
 #[tokio::test]
 async fn invalid_commands_are_rejected_with_validation_failed() {
@@ -624,7 +624,7 @@ async fn invalid_commands_are_rejected_with_validation_failed() {
     assert_eq!(node.counts().unwrap(), (1, 1));
 }
 
-// 设备接口「取值」：首尾以外的空白和非 ASCII 文本照常受理、原样保存。
+// domain「主数据接口」取值：首尾以外的空白和非 ASCII 文本照常受理、原样保存。
 #[tokio::test]
 async fn inner_whitespace_and_unicode_are_kept_verbatim() {
     let node = node();
@@ -863,7 +863,7 @@ async fn validation_precedes_the_idempotency_check() {
     assert_eq!(node.counts().unwrap(), (1, 1));
 }
 
-// 设备接口「查询」：含停用的设备，按 code 的字节序升序；没有设备时为空数组。
+// domain「主数据接口」查询：含停用的设备，按 code 的字节序升序；没有设备时为空数组。
 #[tokio::test]
 async fn list_returns_all_equipment_ordered_by_code_bytes() {
     let node = node();

@@ -3,7 +3,7 @@
 烘焙门店后厨（BOH）系统的门店本地节点。部署在每家门店的一台 Linux 机器上，局域网内的平板通过浏览器（门店节点托管的 Web SPA）访问。
 **断网是常态，不是异常**：所有门店内核心操作必须在完全离线时正常工作，联网后再把事件同步到总部。
 
-业务决策、事件目录与领域规则见 [docs/domain.md](docs/domain.md)；系统依赖的门店操作规范见 [docs/sop.md](docs/sop.md)；规范用词见 [docs/glossary.md](docs/glossary.md)；锁定测试使用的接口见 [docs/interfaces.md](docs/interfaces.md)；备份模块的细则见 [docs/backup.md](docs/backup.md)；不变量自检的细则见 [docs/invariant-check.md](docs/invariant-check.md)。
+业务决策、事件目录与领域规则见 [docs/domain.md](docs/domain.md)；系统依赖的门店操作规范见 [docs/sop.md](docs/sop.md)；规范用词见 [docs/glossary.md](docs/glossary.md)；锁定测试使用的接口见 [docs/interfaces.md](docs/interfaces.md)；备份模块的细则见 [docs/backup.md](docs/backup.md)；不变量自检的细则见 [docs/invariant-check.md](docs/invariant-check.md)；员工认证与设备注册见 [docs/auth.md](docs/auth.md)。
 
 本文件是所有编码 agent（Codex、Antigravity、Claude Code 等）共用的项目规则。
 
@@ -30,7 +30,7 @@
 | 测试 | 编写 | 锁定 | 位置 |
 |---|---|---|---|
 | Schema 测试、迁移校验和 | Claude | 是 | `crates/boh-storage/tests/schema.rs` |
-| 验收用例（`docs/domain.md`「验收用例」） | Claude 写，预期值由人确认 | 是 | `crates/*/tests/spec_*.rs` |
+| 验收用例（`docs/domain.md`、`docs/auth.md` 的「验收用例」） | Claude 写，预期值由人确认 | 是 | `crates/*/tests/spec_*.rs` |
 | Golden payload：每个 `event_type@schema_version` 的每种 payload 结构变体至少一份 | Claude | 是 | `crates/*/tests/golden/` |
 | HTTP 契约：状态码、错误码、信封、重复提交同一 `command_id` | Claude | 是 | `crates/*/tests/spec_*.rs` |
 | 重放一致性：清空投影、重建、逐行比对 | Claude | 是 | `crates/*/tests/spec_*.rs` |
@@ -47,12 +47,16 @@
   Review 的比对基准是切片分支开头连续的 `spec:` / `docs:` 提交中的最后一个，`git diff <比对基准> HEAD -- <锁定路径>` 必须为空；实现开始后要改设计时按「开发顺序」末尾的规定处理。PR 打开后又有新提交时，合入前评论 `@codex review` 重新触发 Codex review。
 
 **独立测试审查**（测试 agent）：
-- 时机：「开发顺序」第 4.2 步，锁定测试和接口说明写好之后、人确认预期值之前。实现交付后（第 5 步之后）做进程级黑盒验收，与 Claude review 并行：切片改动配置、启动路径、信号处理、后台任务生命周期或命令行子命令时必须做，其他切片按影响决定。
-- 审查对象是 Claude 准备的副本：复制工作区，排除 `.git`、`workdocs/`、`target/`。产出（报告、脚本、日志、运行时数据）只写进副本中的 `blindtest/`。
+- 时机：「开发顺序」第 4.2 步做规范审查，在锁定测试和接口说明写好之后、人确认预期值之前；第 6 步做进程级黑盒验收，与 Claude review 并行。
+- **进程级黑盒验收**：测的是锁定测试覆盖不到的真实进程行为，范围是以下五项：配置；启动与拒绝启动；停止信号与关闭顺序；后台任务生命周期（启动、触发、关闭时执行完）；命令行子命令。
+  - 切片改动其中任一项时必须做；其他切片按影响决定，不做时在 review 结论中写明理由。是否需要以 review 时的实际改动为准。
+  - 返修后按改动对上述行为及其依赖（配置解析、启动顺序、后台任务入口、关闭顺序、子命令）的影响决定：不影响时沿用上一轮证据；只影响其中几项时定向补测这几项；影响启动或关闭顺序，或无法判断影响范围时重新完整验收。
+  - 判断影响时，对比本轮 HEAD 与拟沿用证据对应的提交（`workdocs/blindtest/` 中留存的该轮 `SOURCE.md` 记录的提交）。review 结论写明沿用、补测或重验及依据，并引用对应的报告。
+- 审查对象是 Claude 准备的副本：第 4.2 步复制工作区（锁定测试尚未提交），第 6 步导出 review 时 HEAD 的已提交内容；都不含 `.git`、`workdocs/`、`target/` 和与仓库无关的未跟踪文件。产出（报告、脚本、日志、运行时数据、构建产物）只写进副本中的 `blindtest/`。
   - 看不到提交历史、review 记录和过程文档，推演才独立于设计方。
 - 规范依据只有本文件和 `docs/`；代码和测试不是依据。
 - 第一阶段（规范审查）：只读本文件、`docs/`、`migrations/`，先把推演出的场景清单写进报告，写完不改；再读锁定测试逐条对照。不读 `src/`。
-- 黑盒验收只测锁定测试覆盖不到的真实进程行为：配置、启动与拒绝启动、停止信号、命令行子命令。确认了行为缺陷之后才可以读 `src/` 定位原因。
+- 黑盒验收只测上面「进程级黑盒验收」列出的进程行为。确认了行为缺陷之后才可以读 `src/` 定位原因。
 - 发现分为缺用例、预期值存疑、规范不清、实现缺陷，每条带文档依据（路径:行号与原文）和确定程度（确认 / 推测）。
   - 「缺用例」必须写明会让哪一种合理的实现错误漏过锁定测试；只能靠故障注入才能测的不报；现有稳定接口测不到时，写明需要的接口改动。
   - 严重度：一个合理的实现错误会因此漏过锁定测试，并造成数据丢失或错误、备份不可用、幂等失效或规则违反，才算「高」或「中」；其余为「低」。
@@ -73,7 +77,7 @@
 
 ## 开发顺序（每个新功能）
 
-1. **人 + Claude**：在切片分支开头的 `docs:` 提交中，先按「文档分层」整理上一个已合入切片在 `docs/` 中的字段清单（改为指向代码），再在 `docs/domain.md` 中定义本切片的事件类型、payload 字段、投影影响、错误码和警告码。
+1. **人 + Claude**：在切片分支开头的 `docs:` 提交中，先按「文档分层」整理上一个已合入切片在 `docs/` 中的字段清单（改为指向代码），再在 `docs/domain.md` 中定义本切片的事件类型、payload 字段、投影影响、错误码和警告码；员工认证、设备注册与含 PIN 或 PIN 重置授权秘密的命令写在 `docs/auth.md`。
    - 整理不放在本切片的实现提交之后：实现之后的 `docs:` 提交不在分支开头，会让 `git diff <比对基准> HEAD -- <锁定路径>` 非空。
 2. **Claude**：写迁移 SQL（如需新表 / 投影表）。
 3. **Claude**：写 schema 测试，跑通后表结构锁定。
@@ -87,13 +91,16 @@
    - `boh-app::service`：经 `ledger::execute` 组装一个事务；`projections::apply` 增加该事件的投影。
    - `boh-app::http`：handler + 路由。
    - 补自己的单元测试，提交交付说明。
-6. **Claude** 在新会话中用第 4.3 步给出的 review prompt 本地 review 切片分支：按「不可违反的规则」逐条核对，逐个提交核对锁定路径，`git diff <比对基准> HEAD -- <锁定路径>` 为空。
+6. **Claude** 在新会话中用第 4.3 步给出的 review prompt 本地 review 切片分支。以下各项都通过，才给出可以提 PR 的结论：
+   - 清单核对：按「不可违反的规则」逐条核对，逐个提交核对锁定路径，`git diff <比对基准> HEAD -- <锁定路径>` 为空。
+   - `/code-review`：在清单核对之后运行，补查清单以外的问题。
+   - 进程级黑盒验收：按「测试分工」的条件需要时进行，由测试 agent 与 review 并行，Claude 核对报告。
    - 不在写设计、锁定测试或实现 prompt 的会话中 review：那里的上下文会让 review 按设计意图理解实现，看不出偏差。
    - 重新 review 和第 7 步的复审在同一个 review 会话中继续。
 
    有问题退回实现 agent 修改后重新 review；通过后 Claude 给出可以提 PR 的结论，写明 review 时的 HEAD 和比对基准。
 7. **提 PR**，GitHub 上自动运行 **Codex** review（只在 PR 打开后运行，本地不跑）。Codex 的发现由 Claude 判断是否采纳，需要修改的退回实现 agent；
-   PR 打开后又有新提交时，合入前评论 `@codex review` 重新触发，Claude 复审新增的提交并给出新的 HEAD。不采纳的 Codex 发现在 PR 评论中写明理由。
+   PR 打开后又有新提交时，合入前评论 `@codex review` 重新触发，Claude 复审新增的提交并给出新的 HEAD：执行第 6 步中适用的各项（锁定路径仍逐个提交核对，`git diff <比对基准> HEAD -- <锁定路径>` 为空），进程级黑盒验收按新增提交的实际改动决定沿用、补测或重验（见「测试分工」）。不采纳的 Codex 发现在 PR 评论中写明理由。
    人合入的条件：CI `check` 通过，PR 的 HEAD 与 Claude 最近一次结论中的 HEAD 一致。仓库只允许 merge commit 合入，保留 `docs:` / `spec:` / 实现提交的边界。
 
 **实现开始后要改设计**（第 5 步实现中或第 6、7 步 review 中发现需要改 `docs/`、迁移或锁定测试）：
@@ -104,12 +111,18 @@
 
 ### 路线图
 
-1. **Write path 与基础设施**：时钟模块、相对校准、营业日纯函数；`Readers::call` 包读事务、写线程任务计时；信封加 `warnings`；`boh_storage::open()` 收口。
-2. **Walking skeleton 与首批切片**：
-   设备主数据（walking skeleton：`ledger::execute` / `Ledger::append` / `projections::apply` 骨架与 `rebuild-projections`、`Actor` 开发桩、`boh-server init`、`EQUIPMENT` 写接口、迁移 002：`equipment`；打通 write path、幂等、重放、golden payload）
-   → 温度记录（迁移 003：`temperature_readings`）→ 备份模块与恢复演练测试、`/health` 字段（迁移 004：`store_events(recorded_at)` 索引）→ 005：其余主数据与库存投影表 → 收货（迁移 006：批号列改名为 `manufacturer_lot_no`）→ 批次号与库存明细查询（迁移 007：重建 `inventory_lots`、`inventory_movements`，批次号为主键、余量可为负；`GOODS_RECEIVED@2`）→ 报损（指定批次与确认、FIFO、账外缺口）→ 不变量自检 → 盘点（含盘点吸收：已有的报损一并实现吸收判定）→ 局域网 HTTPS → 员工认证。
-   - 设备主数据切片的 `init` 只写 `store_meta`；预置报损原因随 005 加入；`EMPLOYEE`（`employees` 投影、写接口、golden 样本）与第一个店长随认证切片加入。
-3. **扩展**：生产 → 纠错（冲销、数量更正）→ 补录入口 → 销售导入。每一步配对应的验收用例。
+已完成：write path 与基础设施；设备主数据（walking skeleton）；温度记录；备份与 `/health`；其余主数据（物料、配方、供应商、报损原因）与库存投影；收货与批次号；库存明细与批次查询；报损；不变量自检。迁移到 007。
+
+当前实现边界：
+- `init` 写入 `store_meta` 和预置报损原因；第一个店长随认证切片加入。
+- 业务接口经 `Actor` 开发桩取得身份（[docs/auth.md](docs/auth.md)「开发桩」）。
+- 报损不判定吸收，每行都不被吸收。
+- 当前没有显式补录入口；温度记录、收货、报损的发生时间通过相对校准确定。
+- `MASTER_DATA_CHANGED` 只有 `source = LOCAL` 的写入口。
+
+待做，按顺序：
+1. 盘点（含盘点吸收：已有的报损一并实现吸收判定）→ 局域网 HTTPS → 员工认证（`EMPLOYEE` 投影、写接口、golden 样本与第一个店长）。
+2. 扩展：生产 → 纠错（冲销、数量更正）→ 补录入口 → 销售导入。每一步配对应的验收用例。
 
 ---
 
@@ -206,7 +219,7 @@ scripts/        CI 扫描脚本。
 细则（文件名、流程、保留策略、触发、关闭、测试要求）见 [docs/backup.md](docs/backup.md)。
 - 在 `spawn_blocking` 上执行，不占写线程；连接只用「SQLite」中的备份连接。
 - 新备份经完整性与 `seq` 校验、文件 fsync、原子重命名和目录 fsync 之后才算成功；失败只记日志并反映在 `/health`，不重试、不退出进程、不影响写入。
-- 禁止并发备份。收到停止信号后不再接受新的触发，先执行完正在进行和已排队的备份，再关写线程。
+- 禁止并发备份。收到停止信号后不再接受新的触发，先执行完正在进行和已排队的备份及闭店流程中的自检，再关写线程。
 - **恢复演练写成测试**：从备份恢复、清空投影并重建，结果必须和原库一致。只验证备份文件生成了不算数。
 
 ### 不变量自检
@@ -223,7 +236,7 @@ scripts/        CI 扫描脚本。
 ### ID 与时间
 - 所有实体 / 事件主键用 **UUIDv7**（`TEXT`，36 位小写带连字符，版本位 `7`，变体位 `8`–`b`）。禁止自增整数 ID。
   例外：`store_events.seq`（门店内提交顺序，由 SQLite 分配）；批次以人可读的批次号 `lot_id` 为主键（格式与生成规则见 `docs/domain.md`「批次」，生成后不变）。投影表中的 `line_no`、`source_line_no`、`movement_no` 是行号或展开编号，不是自增键。
-- 客户端提交的 ID（如 `command_id`，含请求体、路径参数、查询参数和开发桩请求头中的 ID）在 `boh-domain` 中校验必须是 v7，文本只接受与存储相同的 36 位小写带连字符形式；大写、无连字符、花括号、`urn:` 前缀都按取值非法处理。客户端提交的批次号按 `docs/domain.md`「批次」的格式校验。
+- 客户端提交的 ID（如 `command_id`，含请求体、路径参数、查询参数和开发桩请求头中的 ID）在 `boh-domain` 中校验必须是 v7，文本只接受与存储相同的 36 位小写带连字符形式；大写、无连字符、花括号、`urn:` 前缀都按取值非法处理。客户端提交的批次号按 `docs/domain.md`「批次」中批次号的格式校验。
 - 服务端生成的 UUIDv7 在写事务内构造：时间部分取该命令的 `recorded_at`（负值按 0），随机部分取 SQLite `randomblob(10)`，由 `boh-domain` 的纯函数拼装。不用 `Uuid::now_v7()`。
   - `now_v7()` 在 uuid crate 内部读系统时钟，绕过时钟模块，`disallowed-methods` 也拦不住。
 - 时间戳一律 `INTEGER`，UTC Unix **毫秒**。禁止存格式化的日期时间字符串。
@@ -232,7 +245,7 @@ scripts/        CI 扫描脚本。
 - **批次间的 FIFO 顺序看批次号**：同一物料内先比批次日期，再比流水号。批次日期在建批次时由 `occurred_at` 确定，写进 payload 中的批次号，之后不重算。
 - `recorded_at` 取系统时钟原值，**不做单调钳制**。
   - 顺序已由 `seq` 保证；钳制会让一次跳到未来的时钟把之后的时间全部卡在未来。
-- `occurred_at` 由相对校准计算（或补录时显式给出），`business_date` 由 `occurred_at` 计算（`SALES_IMPORTED` 例外，由命令显式给出）。规则见 `docs/domain.md`「时间」。
+- `occurred_at` 由相对校准计算（或补录时显式给出）；主数据命令和初始化取 `recorded_at`，冲销和数量更正取原事件的值。`business_date` 由 `occurred_at` 计算（`SALES_IMPORTED` 例外，由命令显式给出）。规则见 `docs/domain.md`「时间」。
 - 系统时间只通过时钟模块读取，业务代码显式接收时间。
 
 ### 只追加（Append-only）
@@ -253,17 +266,18 @@ scripts/        CI 扫描脚本。
 
 ### 幂等
 - 每个写命令必须带客户端生成的 `command_id`（UUIDv7）。超时或结果未知时，客户端**必须用原 ID、原内容重试**。
-- 规范化请求：把命令反序列化成强类型结构体再序列化，剥离 `command_id` 和 `sent_at`，按下述例外处理敏感字段后存进 `processed_commands.request`。
-  普通业务命令只剥离这两个字段（`captured_at` 是业务内容）。比对 `command_type` + 规范化请求（文本，不用哈希）；所有含 PIN 或 PIN 重置授权秘密的命令（含员工主数据权限提升）适用以下例外。
-- 敏感命令的每个秘密字段以独立随机盐的 Argon2id 验证值替代，参数强度不低于员工凭据；非秘密字段仍比对规范化文本，秘密字段用已保存的验证值判等，不重新生成哈希作文本比对。
-- 敏感命令的成功记录绑定发起员工和 `device_id`；原结果重试按保存的原命令核对有效设备和秘密证明，只返回非秘密回执，不重新执行当前 PIN 校验、不重复修改主数据、不重新签发或恢复授权及会话。
-- 秘密字段比对前执行设备锁和限速检查；比对失败计入同一设备和节点的 PIN 失败计数，幂等冲突明细只列字段名，不返回秘密原值、提交值或验证值。
-- PIN（含确认值）和 PIN 重置授权秘密不得明文写入事件、数据库、WAL、备份、日志或留存响应；初始化和 CLI 仅在终端无回显输入 PIN，不接受 PIN 命令行参数。
+- 规范化请求：把命令反序列化成强类型结构体再序列化，剥离 `command_id` 和 `sent_at`，按 [docs/auth.md](docs/auth.md)「敏感命令的幂等」处理敏感字段后存进 `processed_commands.request`。
+  普通业务命令只剥离这两个字段（`captured_at` 是业务内容）。比对 `command_type` + 规范化请求（文本，不用哈希）；所有含 PIN 或 PIN 重置授权秘密的命令（含员工主数据权限提升）适用 [docs/auth.md](docs/auth.md)「敏感命令的幂等」的例外。
 - **幂等检查先于任何业务校验**。
   - 同一 `command_id` + 同一 `command_type` + 同一规范化请求 → 直接返回保存的响应（含 warnings），不重复执行。
   - 同一 `command_id`，但 `command_type` 或规范化请求不同 → `409 IDEMPOTENCY_CONFLICT`，响应中给出差异字段。
 - 只有成功的命令写入 `processed_commands`。被业务校验拒绝的命令不落库，修正后可以用同一个 ID 重提。
 - 命令和事件结构体禁止 `HashMap` / `HashSet`，只用 `Vec` / `BTreeMap`。
+
+### 认证
+细则（设备注册、登录、PIN 设定与重置、限速、敏感命令的幂等、开发桩）见 [docs/auth.md](docs/auth.md)。
+- PIN（含确认值）和 PIN 重置授权秘密不得明文写入事件、数据库、WAL、备份、日志或留存响应；初始化和 CLI 仅在终端无回显输入 PIN，不接受 PIN 命令行参数。
+- 设备令牌、PIN、会话令牌、PIN 重置授权只经 HTTPS 传输；节点未配置 TLS 时不注册认证接口，release 构建启用认证但未配置 TLS 时**拒绝启动**。
 
 ### 上行同步（只定契约，本期不实现）
 - 不建 outbox。连续的 `seq` 就是同步游标。开发同步时新增迁移建单行表 `sync_state`（`acked_seq`、`last_attempt_at`、`last_error`、`consecutive_failures`）。
@@ -381,7 +395,7 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 scripts/ci-scan.sh
-cargo run -p boh-server -- init deploy/config.dev.toml   # 新数据库先初始化，只写 store_meta；已初始化时拒绝
+cargo run -p boh-server -- init deploy/config.dev.toml   # 新数据库先初始化：写 store_meta 和预置报损原因；已初始化时拒绝
 cargo run -p boh-server -- deploy/config.dev.toml
 cargo run -p boh-server -- rebuild-projections deploy/config.dev.toml   # 只在服务停止时运行
 ```
@@ -402,7 +416,7 @@ ARM 门店机改用 `aarch64-unknown-linux-musl`。部署文件见 `deploy/`。
 - 上行同步的实现：总部接收接口、批量大小、mTLS 证书下发与轮换、失败的重试分类（哪些错误可重试）。**延后**；契约见「上行同步」。
 - 局域网 HTTPS：证书签发与平板信任方式（见 `docs/domain.md` Q9）。**认证切片的前置条件。**
 - 异地备份复制的实现。
-- 门店节点恢复与业务连续性：恢复入口与操作步骤（方向：数据库备份 + 纸面业务凭据 + 人工补录 + 盘点核对），覆盖收货、生产、报损、盘点、幂等重试，以及恢复后的上行同步（恢复到旧备份会让 `seq` 回退，与总部已接收的事件冲突）。恢复后不得重用已贴在货物上的批次号。原则已定：恢复时清空会话、PIN 重置授权、设备注册、设备解锁码、锁定状态与失败计数，平板重新注册；员工 PIN 哈希保留。认证幂等记录不得绕过恢复后的设备注册校验。**延后**；恢复演练测试照常要求。
+- 门店节点恢复与业务连续性：恢复入口与操作步骤（方向：数据库备份 + 纸面业务凭据 + 人工补录 + 盘点核对），覆盖收货、生产、报损、盘点、幂等重试，以及恢复后的上行同步（恢复到旧备份会让 `seq` 回退，与总部已接收的事件冲突）。恢复后不得重用已贴在货物上的批次号。原则已定：恢复时清空会话、PIN 重置授权、设备注册、设备解锁码、锁定状态与失败计数，平板重新注册；员工 PIN 哈希保留（认证状态表见 [docs/auth.md](docs/auth.md)）。认证幂等记录不得绕过恢复后的设备注册校验。**延后**；恢复演练测试照常要求。
 
 ---
 
@@ -425,4 +439,4 @@ ARM 门店机改用 `aarch64-unknown-linux-musl`。部署文件见 `deploy/`。
 - 写命令缺少幂等处理，或缺少重复提交同一 `command_id` 的测试。
 - 认证接口、PIN 或令牌可经明文 HTTP 访问或传输。
 
-`spec:` / `docs:` 提交是设计变更：检查内容是否自洽、是否与 `docs/domain.md` 一致；其中修改已合入的迁移仍按 P0 处理。
+`spec:` / `docs:` 提交是设计变更：检查内容是否自洽、是否与 `docs/domain.md`、`docs/auth.md` 一致；其中修改已合入的迁移仍按 P0 处理。

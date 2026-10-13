@@ -1933,7 +1933,7 @@ fn recipe_lines_are_checked() {
     assert_eq!(count_rows(&conn, "recipe_lines").unwrap(), 4);
 }
 
-// domain「主数据」SUPPLIER：contact_phone 为 NULL（快照中省略）或非空文本。
+// domain「主数据接口」供应商：contact_phone 为 NULL（快照中省略）或非空文本。
 #[test]
 fn supplier_contact_phone_is_null_or_non_empty() {
     let (_dir, conn) = master_db();
