@@ -1,4 +1,5 @@
 //! 锁定迁移 001、002、003、004、005、006、007 的表结构；每项测试注明对应的规则（AGENTS.md / docs/domain.md）或迁移文件。
+//! 上线之前迁移按 AGENTS.md「开发阶段与上线」直接修改，校验和与用例随之更新；上线之后迁移不可修改。
 
 use std::fmt::Debug;
 
@@ -16,12 +17,12 @@ const MIGRATION_003_FNV1A_64: u64 = 0x68f1_2381_a56a_04c3;
 const MIGRATION_004: &str = include_str!("../../../migrations/004_store_events_recorded_at.sql");
 const MIGRATION_004_FNV1A_64: u64 = 0x401b_6d6e_ba06_70d2;
 const MIGRATION_005: &str = include_str!("../../../migrations/005_master_data_inventory.sql");
-const MIGRATION_005_FNV1A_64: u64 = 0x4191_3449_6be8_86c9;
+const MIGRATION_005_FNV1A_64: u64 = 0xbfbb_8e16_140f_14d9;
 const MIGRATION_006: &str =
     include_str!("../../../migrations/006_inventory_lots_manufacturer_lot_no.sql");
 const MIGRATION_006_FNV1A_64: u64 = 0x3773_286d_a4b7_9106;
 const MIGRATION_007: &str = include_str!("../../../migrations/007_lot_numbers.sql");
-const MIGRATION_007_FNV1A_64: u64 = 0x0676_d9dd_8cea_52c1;
+const MIGRATION_007_FNV1A_64: u64 = 0x9adb_7108_bde2_5440;
 const STORE: &str = "01890a5d-ac96-774b-bcce-b302099a8050";
 const ACTOR: &str = "01890a5d-ac96-774b-bcce-b302099a8051";
 const CMD: &str = "01890a5d-ac96-774b-bcce-b302099a8057";
@@ -159,43 +160,43 @@ fn fnv1a_64(text: &str) -> u64 {
     })
 }
 
-// AGENTS「迁移」不可修改：按 UTF-8 原始字节锁定 001 完整 SQL（包括注释）。
+// AGENTS「迁移」：按 UTF-8 原始字节锁定 001 完整 SQL（包括注释）。
 #[test]
 fn migration_001_matches_frozen_checksum() {
     assert_eq!(fnv1a_64(MIGRATION_001), MIGRATION_001_FNV1A_64);
 }
 
-// AGENTS「迁移」不可修改：按 UTF-8 原始字节锁定 002 完整 SQL（包括注释）。
+// AGENTS「迁移」：按 UTF-8 原始字节锁定 002 完整 SQL（包括注释）。
 #[test]
 fn migration_002_matches_frozen_checksum() {
     assert_eq!(fnv1a_64(MIGRATION_002), MIGRATION_002_FNV1A_64);
 }
 
-// AGENTS「迁移」不可修改：按 UTF-8 原始字节锁定 003 完整 SQL（包括注释）。
+// AGENTS「迁移」：按 UTF-8 原始字节锁定 003 完整 SQL（包括注释）。
 #[test]
 fn migration_003_matches_frozen_checksum() {
     assert_eq!(fnv1a_64(MIGRATION_003), MIGRATION_003_FNV1A_64);
 }
 
-// AGENTS「迁移」不可修改：按 UTF-8 原始字节锁定 004 完整 SQL（包括注释）。
+// AGENTS「迁移」：按 UTF-8 原始字节锁定 004 完整 SQL（包括注释）。
 #[test]
 fn migration_004_matches_frozen_checksum() {
     assert_eq!(fnv1a_64(MIGRATION_004), MIGRATION_004_FNV1A_64);
 }
 
-// AGENTS「迁移」不可修改：按 UTF-8 原始字节锁定 005 完整 SQL（包括注释）。
+// AGENTS「迁移」：按 UTF-8 原始字节锁定 005 完整 SQL（包括注释）。
 #[test]
 fn migration_005_matches_frozen_checksum() {
     assert_eq!(fnv1a_64(MIGRATION_005), MIGRATION_005_FNV1A_64);
 }
 
-// AGENTS「迁移」不可修改：按 UTF-8 原始字节锁定 006 完整 SQL（包括注释）。
+// AGENTS「迁移」：按 UTF-8 原始字节锁定 006 完整 SQL（包括注释）。
 #[test]
 fn migration_006_matches_frozen_checksum() {
     assert_eq!(fnv1a_64(MIGRATION_006), MIGRATION_006_FNV1A_64);
 }
 
-// AGENTS「迁移」不可修改：按 UTF-8 原始字节锁定 007 完整 SQL（包括注释）。
+// AGENTS「迁移」：按 UTF-8 原始字节锁定 007 完整 SQL（包括注释）。
 #[test]
 fn migration_007_matches_frozen_checksum() {
     assert_eq!(fnv1a_64(MIGRATION_007), MIGRATION_007_FNV1A_64);
@@ -1355,7 +1356,7 @@ fn item_unit_row(item_id: &str, unit_code: &str) -> Row {
     vec![
         ("item_id", lit(item_id)),
         ("unit_code", lit(unit_code)),
-        ("base_qty_per_unit", "25000".into()),
+        ("base_qty_per_unit", "25000000000000".into()), // 1 袋 = 25000 g
     ]
 }
 
@@ -1370,21 +1371,29 @@ fn recipe_row(id: &str, code: &str) -> Row {
     ]
 }
 
+/// 每批产出录 2 kg，换算为 2000 g。
 fn recipe_version_row(recipe_id: &str, version: i64) -> Row {
     vec![
         ("recipe_id", lit(recipe_id)),
         ("version", version.to_string()),
-        ("output_qty_per_batch", "10".into()),
+        ("output_qty_per_batch", "2000000".into()),
+        ("output_input_qty", "2000".into()),
+        ("output_input_unit_code", lit("kg")),
+        ("output_input_base_qty_per_unit", "1000000000000".into()),
     ]
 }
 
+/// 每批用量录 0.5 kg，换算为 500 g。
 fn recipe_line_row(recipe_id: &str, version: i64, line_no: i64, item_id: &str) -> Row {
     vec![
         ("recipe_id", lit(recipe_id)),
         ("version", version.to_string()),
         ("line_no", line_no.to_string()),
         ("item_id", lit(item_id)),
-        ("qty_per_batch", "500".into()),
+        ("qty_per_batch", "500000".into()),
+        ("input_qty", "500".into()),
+        ("input_unit_code", lit("kg")),
+        ("input_base_qty_per_unit", "1000000000000".into()),
     ]
 }
 
@@ -1777,7 +1786,8 @@ fn item_enums_and_shelf_life_are_checked() {
     }
 }
 
-// domain「主数据」units：同一物料内 unit_code 唯一、非空，系数是正整数；item_id 引用物料，延迟到提交时检查。
+// domain「主数据」units：同一物料内 unit_code 唯一、非空；domain「单位」系数存十亿分之一基本单位，
+// 大于 0、不超过 10^9 个基本单位（存储值 1～10^18）；item_id 引用物料，延迟到提交时检查。
 #[test]
 fn item_units_are_checked() {
     let (_dir, mut conn) = master_db();
@@ -1791,6 +1801,7 @@ fn item_units_are_checked() {
         ("unit_code", "''"),
         ("base_qty_per_unit", "0"),
         ("base_qty_per_unit", "-1"),
+        ("base_qty_per_unit", "1000000000000000001"),
     ] {
         assert_sqlite_error(
             insert(
@@ -1802,6 +1813,20 @@ fn item_units_are_checked() {
         );
     }
     insert(&conn, "item_units", &item_unit_row(ITEM, "box")).unwrap();
+    // 1 mg = 0.001 g；1 t = 10^6 g；系数上限 10^9 g。
+    for (unit_code, value) in [
+        ("mg", "1000000"),
+        ("t", "1000000000000000"),
+        ("max", "1000000000000000000"),
+        ("min", "1"),
+    ] {
+        insert(
+            &conn,
+            "item_units",
+            &with(item_unit_row(ITEM2, unit_code), "base_qty_per_unit", value),
+        )
+        .unwrap();
+    }
 
     // 自动提交：语句结束即提交，立即拒绝。
     assert_sqlite_error(
@@ -1815,7 +1840,7 @@ fn item_units_are_checked() {
     insert(&tx, "item_units", &item_unit_row(ITEM3, "bag")).unwrap();
     insert(&tx, "items", &item_row(ITEM3, "BUTTER")).unwrap();
     tx.commit().unwrap();
-    assert_eq!(count_rows(&conn, "item_units").unwrap(), 4);
+    assert_eq!(count_rows(&conn, "item_units").unwrap(), 8);
 }
 
 // domain「主数据」RECIPE：output_item_id 引用物料，延迟到提交时检查。
@@ -1837,7 +1862,9 @@ fn recipe_output_item_is_checked_at_commit() {
     assert_eq!(count_rows(&conn, "recipes").unwrap(), 1);
 }
 
-// domain「主数据」versions：version 从 1 开始、在同一配方内唯一，产出数量是正整数；recipe_id 引用配方，延迟检查。
+// domain「主数据」versions：version 从 1 开始、在同一配方内唯一，换算后的每批产出是正整数；
+// domain「主数据接口」配方：每批产出必带 input——录入数量存千分之一录入单位，1～9999999（录入上限 9999.999），
+// 单位非空，系数 1～10^18（domain「单位」）；recipe_id 引用配方，延迟检查。
 #[test]
 fn recipe_versions_are_checked() {
     let (_dir, mut conn) = master_db();
@@ -1852,6 +1879,13 @@ fn recipe_versions_are_checked() {
         ("version", "-1"),
         ("output_qty_per_batch", "0"),
         ("output_qty_per_batch", "-10"),
+        ("output_input_qty", "0"),
+        ("output_input_qty", "-1"),
+        ("output_input_qty", "10000000"),
+        ("output_input_unit_code", "''"),
+        ("output_input_base_qty_per_unit", "0"),
+        ("output_input_base_qty_per_unit", "-1"),
+        ("output_input_base_qty_per_unit", "1000000000000000001"),
     ] {
         assert_sqlite_error(
             insert(
@@ -1862,7 +1896,33 @@ fn recipe_versions_are_checked() {
             ffi::SQLITE_CONSTRAINT_CHECK,
         );
     }
-    insert(&conn, "recipe_versions", &recipe_version_row(RECIPE, 2)).unwrap();
+    for column in [
+        "output_input_qty",
+        "output_input_unit_code",
+        "output_input_base_qty_per_unit",
+    ] {
+        assert_sqlite_error(
+            insert(
+                &conn,
+                "recipe_versions",
+                &with(recipe_version_row(RECIPE, 2), column, "NULL"),
+            ),
+            ffi::SQLITE_CONSTRAINT_NOTNULL,
+        );
+    }
+    // 各列两端可取（schema 不核对换算结果）：录入 9999.999、系数 10^9；录入 0.001、系数 0.000000001。
+    let upper = with(
+        with(recipe_version_row(RECIPE, 2), "output_input_qty", "9999999"),
+        "output_input_base_qty_per_unit",
+        "1000000000000000000",
+    );
+    insert(&conn, "recipe_versions", &upper).unwrap();
+    let lower = with(
+        with(recipe_version_row(RECIPE, 3), "output_input_qty", "1"),
+        "output_input_base_qty_per_unit",
+        "1",
+    );
+    insert(&conn, "recipe_versions", &lower).unwrap();
 
     assert_sqlite_error(
         insert(&conn, "recipe_versions", &recipe_version_row(RECIPE2, 1)),
@@ -1875,10 +1935,11 @@ fn recipe_versions_are_checked() {
     insert(&tx, "recipe_versions", &recipe_version_row(RECIPE2, 1)).unwrap();
     insert(&tx, "recipes", &recipe_row(RECIPE2, "R2")).unwrap();
     tx.commit().unwrap();
-    assert_eq!(count_rows(&conn, "recipe_versions").unwrap(), 3);
+    assert_eq!(count_rows(&conn, "recipe_versions").unwrap(), 4);
 }
 
-// domain「主数据」lines：同一版本内 item_id 不重复、line_no 从 0 起唯一，用量是正整数；
+// domain「主数据」lines：同一版本内 item_id 不重复、line_no 从 0 起唯一，换算后的用量是正整数；
+// 每行必带 input，取值同 recipe_versions 的 output_input_*；
 // (recipe_id, version) 引用配方版本，item_id 引用物料，都延迟到提交时检查。
 #[test]
 fn recipe_lines_are_checked() {
@@ -1901,6 +1962,13 @@ fn recipe_lines_are_checked() {
         ("line_no", "-1"),
         ("qty_per_batch", "0"),
         ("qty_per_batch", "-500"),
+        ("input_qty", "0"),
+        ("input_qty", "-1"),
+        ("input_qty", "10000000"),
+        ("input_unit_code", "''"),
+        ("input_base_qty_per_unit", "0"),
+        ("input_base_qty_per_unit", "-1"),
+        ("input_base_qty_per_unit", "1000000000000000001"),
     ] {
         assert_sqlite_error(
             insert(
@@ -1911,7 +1979,24 @@ fn recipe_lines_are_checked() {
             ffi::SQLITE_CONSTRAINT_CHECK,
         );
     }
+    for column in ["input_qty", "input_unit_code", "input_base_qty_per_unit"] {
+        assert_sqlite_error(
+            insert(
+                &conn,
+                "recipe_lines",
+                &with(recipe_line_row(RECIPE, 1, 1, ITEM2), column, "NULL"),
+            ),
+            ffi::SQLITE_CONSTRAINT_NOTNULL,
+        );
+    }
     insert(&conn, "recipe_lines", &recipe_line_row(RECIPE, 1, 1, ITEM2)).unwrap();
+    // 各列两端可取（schema 不核对换算结果）。
+    let upper = with(
+        with(recipe_line_row(RECIPE, 2, 2, ITEM2), "input_qty", "9999999"),
+        "input_base_qty_per_unit",
+        "1000000000000000000",
+    );
+    insert(&conn, "recipe_lines", &upper).unwrap();
 
     for orphan in [
         recipe_line_row(RECIPE, 3, 0, ITEM),
@@ -1930,7 +2015,13 @@ fn recipe_lines_are_checked() {
     insert(&tx, "recipe_versions", &recipe_version_row(RECIPE, 3)).unwrap();
     insert(&tx, "items", &item_row(ITEM3, "BUTTER")).unwrap();
     tx.commit().unwrap();
-    assert_eq!(count_rows(&conn, "recipe_lines").unwrap(), 4);
+    let lower = with(
+        with(recipe_line_row(RECIPE, 3, 1, ITEM), "input_qty", "1"),
+        "input_base_qty_per_unit",
+        "1",
+    );
+    insert(&conn, "recipe_lines", &lower).unwrap();
+    assert_eq!(count_rows(&conn, "recipe_lines").unwrap(), 6);
 }
 
 // domain「主数据接口」供应商：contact_phone 为 NULL（快照中省略）或非空文本。
@@ -1958,7 +2049,8 @@ fn supplier_contact_phone_is_null_or_non_empty() {
     .unwrap();
 }
 
-// 007 + domain「批次」「投影表」：origin 只有 RECEIPT / PRODUCTION（盘点不新建批次）；source_line_no 从 0 开始；余量可以为负；
+// 007 + domain「批次」「投影表」：origin 只有 RECEIPT / PRODUCTION（盘点不新建批次）；source_line_no 从 0 开始；余量可以为负，
+// 绝对值不超过库存状态上限（domain「数量」，存储值 10^12，两端可取）；
 // (source_event_seq, source_line_no) 唯一；同一物料、同一批次日期内流水号唯一（改分类后类型段不同也不能重号），
 // 不同物料或不同日期可以同号；manufacturer_lot_no 为 NULL 或非空；source_event_seq 立即引用账本中的事件，item_id 延迟引用物料。
 #[test]
@@ -2011,6 +2103,8 @@ fn inventory_lots_are_checked() {
         ("origin", "'TRANSFER'"),
         ("source_line_no", "-1"),
         ("manufacturer_lot_no", "''"),
+        ("remaining_qty", "1000000000001"),
+        ("remaining_qty", "-1000000000001"),
     ] {
         assert_sqlite_error(
             insert(
@@ -2033,6 +2127,22 @@ fn inventory_lots_are_checked() {
         &with(lot_row(LOT3, 1, 0), "remaining_qty", "-3"),
     )
     .unwrap();
+    for (value, accepted) in [
+        (1_000_000_000_000_i64, true),
+        (-1_000_000_000_000, true),
+        (1_000_000_000_001, false),
+        (-1_000_000_000_001, false),
+    ] {
+        let result = conn.execute(
+            "UPDATE inventory_lots SET remaining_qty = ?1 WHERE lot_id = ?2",
+            params![value, LOT3],
+        );
+        if accepted {
+            assert_eq!(result.unwrap(), 1, "{value}");
+        } else {
+            assert_sqlite_error(result, ffi::SQLITE_CONSTRAINT_CHECK);
+        }
+    }
     let full = with(
         with(
             with(
@@ -2173,20 +2283,28 @@ fn fifo_index_serves_allocation_and_serial_queries() {
     }
 }
 
-// domain「批次」账外缺口：每个物料至多一行，qty <= 0；item_id 延迟引用物料。
+// domain「批次」账外缺口：每个物料至多一行，qty <= 0，不低于库存状态上限的相反数（domain「数量」，存储值 −10^12，可取）；
+// item_id 延迟引用物料。
 #[test]
 fn inventory_unallocated_is_checked() {
     let (_dir, mut conn) = master_db();
-    assert_sqlite_error(
-        insert(&conn, "inventory_unallocated", &unallocated_row(ITEM, 1)),
-        ffi::SQLITE_CONSTRAINT_CHECK,
-    );
+    for qty in [1, -1_000_000_000_001] {
+        assert_sqlite_error(
+            insert(&conn, "inventory_unallocated", &unallocated_row(ITEM, qty)),
+            ffi::SQLITE_CONSTRAINT_CHECK,
+        );
+    }
     insert(&conn, "inventory_unallocated", &unallocated_row(ITEM, -2)).unwrap();
     assert_sqlite_error(
         insert(&conn, "inventory_unallocated", &unallocated_row(ITEM, -3)),
         ffi::SQLITE_CONSTRAINT_PRIMARYKEY,
     );
     insert(&conn, "inventory_unallocated", &unallocated_row(ITEM2, 0)).unwrap();
+    conn.execute(
+        "UPDATE inventory_unallocated SET qty = -1000000000000 WHERE item_id = ?1",
+        [ITEM2],
+    )
+    .unwrap();
 
     let tx = immediate(&mut conn).unwrap();
     insert(&tx, "inventory_unallocated", &unallocated_row(ITEM3, -1)).unwrap();
@@ -2321,6 +2439,7 @@ fn inventory_movement_absorption_and_lot_rules_are_checked() {
 }
 
 // domain「盘点」盘点投影：每次盘点的每个物料至多一行；counted_qty 非负，book_qty 可以为负（含账外缺口）；
+// 两者都是净账面，绝对值不超过库存状态上限（domain「数量」，存储值 10^12，两端可取）；
 // event_seq 立即引用账本，item_id 延迟引用物料。
 #[test]
 fn inventory_counts_are_checked() {
@@ -2330,15 +2449,36 @@ fn inventory_counts_are_checked() {
         insert(&conn, "inventory_counts", &count_row(1, ITEM)),
         ffi::SQLITE_CONSTRAINT_PRIMARYKEY,
     );
-    insert(&conn, "inventory_counts", &count_row(2, ITEM)).unwrap();
-    assert_sqlite_error(
-        insert(
-            &conn,
-            "inventory_counts",
-            &with(count_row(1, ITEM2), "counted_qty", "-1"),
+    insert(
+        &conn,
+        "inventory_counts",
+        &with(
+            with(count_row(2, ITEM), "book_qty", "-1000000000000"),
+            "counted_qty",
+            "1000000000000",
         ),
-        ffi::SQLITE_CONSTRAINT_CHECK,
-    );
+    )
+    .unwrap();
+    for (column, value) in [
+        ("counted_qty", "-1"),
+        ("counted_qty", "1000000000001"),
+        ("book_qty", "1000000000001"),
+        ("book_qty", "-1000000000001"),
+    ] {
+        assert_sqlite_error(
+            insert(
+                &conn,
+                "inventory_counts",
+                &with(count_row(1, ITEM2), column, value),
+            ),
+            ffi::SQLITE_CONSTRAINT_CHECK,
+        );
+    }
+    conn.execute(
+        "UPDATE inventory_counts SET book_qty = 1000000000000 WHERE event_seq = 2",
+        [],
+    )
+    .unwrap();
     insert(
         &conn,
         "inventory_counts",
@@ -2457,12 +2597,23 @@ fn tables_005_are_strict() {
         (
             "recipe_versions",
             recipe_version_row(RECIPE, 1),
-            &["version", "output_qty_per_batch"],
+            &[
+                "version",
+                "output_qty_per_batch",
+                "output_input_qty",
+                "output_input_base_qty_per_unit",
+            ],
         ),
         (
             "recipe_lines",
             recipe_line_row(RECIPE, 1, 0, ITEM),
-            &["version", "line_no", "qty_per_batch"],
+            &[
+                "version",
+                "line_no",
+                "qty_per_batch",
+                "input_qty",
+                "input_base_qty_per_unit",
+            ],
         ),
         (
             "suppliers",

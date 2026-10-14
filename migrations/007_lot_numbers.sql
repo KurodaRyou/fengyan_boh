@@ -1,7 +1,7 @@
 -- 007_lot_numbers.sql
 -- 批次以批次号 lot_id（<类型>-<编码>-<YYYYMMDD>-<流水号>）为主键，拆出批次日期与流水号，FIFO 按（批次日期, 流水号）；
 -- 余量可以为负；盘点不新建批次，origin 只留 RECEIPT / PRODUCTION。见 docs/domain.md「批次」「投影表」。
--- 合并到 main 后禁止修改，变更请新增下一个编号的文件。
+-- 上线之后禁止修改，变更请新增下一个编号的文件；上线之前直接修改本文件（见 AGENTS.md「开发阶段与上线」）。
 --
 -- UUID 批次标识换算不出批次号（GOODS_RECEIVED@1 的 payload 中没有类型和编码），账本中有 @1 收货时拒绝迁移；
 -- 物料编码是批次号的一段，items 中有不合规的 code 时同样拒绝。批次只由收货建立，所以通过检查时
@@ -28,6 +28,7 @@ DROP TABLE inventory_movements;
 DROP TABLE inventory_lots;
 
 -- 批次：每条收货行、每次生产产出一行；余量为 0 的批次保留，余量可以为负。
+-- remaining_qty 是千分之一基本单位，绝对值不超过库存状态上限 L（存储值 10^12，见 docs/domain.md「数量」）。
 -- lot_date 是批次日期（'YYYY-MM-DD'），lot_serial 是流水号，两者都从 lot_id 拆出，写入后不变。
 -- source_event_seq、source_line_no 是建批次的事件和原 payload 下标，只用于追溯。
 CREATE TABLE inventory_lots (
@@ -39,7 +40,7 @@ CREATE TABLE inventory_lots (
     origin              TEXT NOT NULL CHECK (origin IN ('RECEIPT', 'PRODUCTION')),
     source_event_seq    INTEGER NOT NULL REFERENCES store_events(seq),  -- 建批次的事件
     source_line_no      INTEGER NOT NULL CHECK (source_line_no >= 0),    -- 原 payload 下标；生产 output 为 0
-    remaining_qty       INTEGER NOT NULL,
+    remaining_qty       INTEGER NOT NULL CHECK (remaining_qty BETWEEN -1000000000000 AND 1000000000000),
     expires_at          INTEGER,                                         -- NULL：payload 中省略
     manufacturer_lot_no TEXT CHECK (manufacturer_lot_no IS NULL OR manufacturer_lot_no <> ''), -- NULL：payload 中省略
     UNIQUE (source_event_seq, source_line_no),
@@ -53,7 +54,7 @@ CREATE TABLE inventory_lots (
 -- FIFO 与流水号分配都按 (item_id, lot_date, lot_serial) 查找；同一物料、同一日期内流水号唯一。
 CREATE UNIQUE INDEX idx_inventory_lots_fifo ON inventory_lots(item_id, lot_date, lot_serial);
 
--- 库存流水：与 005 相同，lot_id 引用重建后的 inventory_lots。
+-- 库存流水：与 005 相同，lot_id 引用重建后的 inventory_lots。nominal_qty、qty_delta 是千分之一基本单位。
 CREATE TABLE inventory_movements (
     event_seq            INTEGER NOT NULL REFERENCES store_events(seq),
     movement_no          INTEGER NOT NULL CHECK (movement_no >= 0),
