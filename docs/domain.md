@@ -491,7 +491,7 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
   - 快照中同时保存换算后的基本单位数量（`output_qty_per_batch`、`qty_per_batch`，都大于 0）和 `input`。生产按基本单位数量计算。
   - 写入线程按当前换算核对产出物料和各行物料的单位（`UNKNOWN_UNIT`、`UNIT_CONVERSION_CHANGED`，见「单位」）：行的 `details` 带 `line`（`lines` 下标），产出的不带。已保存的版本不受之后修改换算系数的影响。
 - **追加版本**：新版本号是当前最大版本 + 1，写一条 `MASTER_DATA_CHANGED`，`revision` + 1。权限、`base_revision`、配方不存在和成功的 `data` 同「修改」。
-  - 每批产出和 `lines`（含行顺序和 `input`）都与最新版本相同时，不新增版本、不写事件，`revision` 不变；命令照常成功并写入 `processed_commands`，响应为当前配方。只与最新版本比较：从 A 改为 B 再改回 A，仍新增版本；同一数量换一种单位录入（`25` kg 改为 `25000` g）也新增版本。
+  - 每批产出和 `lines`（含行顺序和 `input`）都与最新版本相同时，不新增版本、不写事件，`revision` 不变；命令照常成功并写入 `processed_commands`，响应为当前配方。只与最新版本比较：从 A 改为 B 再改回 A，仍新增版本；同一数量换一种单位录入（`2.5` kg 改为 `2500` g）也新增版本。
 - `lines` 非空，每项是物料和 `input`，同一版本内 `item_id` 不重复，按提交顺序保存。
 - `output_item_id` 和每个 `lines[].item_id` 引用 `ITEM`（规则见「引用」）。不限制物料的 `category`，不检查产出物料是否出现在自己的 `lines` 中。
 
@@ -676,6 +676,10 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 | 收货日期 | 10-08 02:00 收货（营业日 10-07），`produced_on` 10-08 | 照常受理；`produced_on` 10-09 时 `400 INVALID_LOT_DATES`，`reason` `PRODUCED_IN_FUTURE` | `spec_receiving.rs` |
 | 单位换算 | 离线录入「2 袋，每袋 25000 g」；提交前换算改为 20000 | `409 UNIT_CONVERSION_CHANGED`，不入账 | `spec_receiving.rs`、`spec_waste.rs` |
 | 幂等 | 同一命令发送 2 次，`sent_at` 不同 | 第二次原样返回首次响应（含 warnings），`seq` 不增加 | 各接口的 `spec_*.rs` |
+| 单位换算与舍入 | 物料基本单位 g，单位 oz 系数 `28.349523125`；收货 `1.25` oz | `qty` **`35.437`**（35.43690390625 四舍五入，中点远离 0）；换算结果为 0 时 `400 VALIDATION_FAILED` | `spec_receiving.rs`、`spec_waste.rs`、`spec_recipes.rs` |
+| 录入上限与库存状态上限 | 面粉账面 `999990000` g；一次收货两行各 `5` kg，再收货 `0.001` g | 前者之后账面 `1000000000`，照常受理；后者 `409 STOCK_LIMIT_EXCEEDED`，`details` `{line 0, item_id}`，不入账 | `spec_receiving.rs`、`spec_waste.rs` |
+| 新批次余量越界 | 面粉批次 A −1000000000 g、B 0，净账面 −1000000000 g；收货 `1.001` 个 `max`（系数 `1000000000`） | 净账面只到 `1000000`，但新批次余量超过上限：`409 STOCK_LIMIT_EXCEEDED`，`details` `{line 0, item_id}`，不带 `lot_id`，不入账；改为 `1` 个 `max` 时新批次恰好为上限，照常受理 | `spec_waste.rs` |
+| 小数字符串 | 数量 `"5.500"`；同一 `command_id` 再以 `"5.5"` 重发 | payload 与响应中为 **`"5.5"`**；重发返回首次响应；数量写成 JSON 数字时 `400 VALIDATION_FAILED` | `spec_receiving.rs` |
 
 ### 待实现
 
@@ -726,14 +730,6 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 | 补录时间边界 | 未触发锁账限制；补录 `occurred_at` 等于 `recorded_at`；另一次晚 1 ms | 前者照常受理；后者 `400 INVALID_OCCURRED_AT` |
 | 补录旧日期收货的批次号 | 面粉在 09-10、09-11 已有批次，09-09 没有批次；09-12 经补录入口补一张 `occurred_at` 为 09-09 的收货，未被锁账限制拒绝 | 批次号为 `…-20260909-001`；FIFO 排在 09-10、09-11 的批次之前 |
 | 盘点不接受补录 | 盘点请求体带 `occurred_at` | `400 VALIDATION_FAILED`；不入账 |
-| 小数系数换算 | 物料基本单位 g，单位 oz 系数 `28.349523125`、lb 系数 `453.59237`；收货一行 `1.25` oz，一行 `16` oz，一行 `1` lb | `qty` 依次为 **`35.437`**、**`453.592`**、**`453.592`** |
-| 换算中点 | 单位系数 `0.5`；报损 `0.001` 个该单位 | `qty` **`0.001`**（`0.0005` 远离 0 舍入） |
-| 换算结果为 0 | 单位 mg 系数 `0.001`；收货 `0.4` mg | `400 VALIDATION_FAILED`；不入账 |
-| 录入上限 | 收货 `10000` g；另一次收货 `9999.999` kg | 前者 `400 VALIDATION_FAILED`，在幂等检查之前；后者照常受理，`qty` **`9999999`** |
-| 收货累计越界 | 面粉账面 `999990000` g；一次收货两行各 `5` kg | 第二行之后账面 `1000000000`，照常受理；再收货 `0.001` g：`409 STOCK_LIMIT_EXCEEDED`，`details` `{line 0, item_id}`；不入账 |
-| 报损越界 | 批次 A 余量 `−999999999` g（之前确认过的报损）；报损指定 A `2` g，带确认 | `409 STOCK_LIMIT_EXCEEDED`，`details` 带 `lot_id` A；整条不入账 |
-| 金额上限 | 收货一行 `line_cost_cents` `100000000` | `400 VALIDATION_FAILED`；`99999999` 照常受理 |
-| 小数字符串 | 数量 `"5.500"`；同一 `command_id` 再以 `"5.5"` 重发 | 照常受理，payload 与响应中为 **`"5.5"`**；重发返回首次响应；数量写成 JSON 数字 `5.5` 时 `400 VALIDATION_FAILED` |
 | 闭店重盘 | 成品账面 100；先盘为 80，再盘为 90；销售 0 | 调整净和 **−10**；未解释损耗 **10** |
 | 销售示例 | 生产 100、报损 8、闭店实数 5（调整 −87）、销售 84 | 未解释损耗 **3** |
 | 重新导入少了商品 | 10-08 第一次导入可颂 10、吐司 5；用新的 `command_id` 再次导入，只有可颂 12 | `SALES_DAY` version **2**；10-08 的 `daily_sales` 只剩可颂 **12**，吐司当日的行删除 |

@@ -90,9 +90,7 @@ CREATE TABLE waste_reasons (
     revision INTEGER NOT NULL CHECK (revision >= 1)
 ) STRICT;
 
--- 批次：每条收货行、每次生产产出、每个盘盈一行；余量为 0 的批次保留。
--- FIFO 按（盘盈优先、source_event_seq、source_line_no）升序，见 docs/domain.md「批次」。
--- source_event_seq、source_line_no 是建批次的事件和原 payload 下标，之后的调整不改变它们。
+-- 批次的初始结构。007 删除并重建本表；现行结构以 007 为准，批次与 FIFO 规则见 docs/domain.md「批次」。
 CREATE TABLE inventory_lots (
     lot_id           TEXT PRIMARY KEY
                      CHECK (length(lot_id) = 36 AND lot_id = lower(lot_id) AND substr(lot_id, 15, 1) = '7'),

@@ -17,7 +17,7 @@ const MIGRATION_003_FNV1A_64: u64 = 0x68f1_2381_a56a_04c3;
 const MIGRATION_004: &str = include_str!("../../../migrations/004_store_events_recorded_at.sql");
 const MIGRATION_004_FNV1A_64: u64 = 0x401b_6d6e_ba06_70d2;
 const MIGRATION_005: &str = include_str!("../../../migrations/005_master_data_inventory.sql");
-const MIGRATION_005_FNV1A_64: u64 = 0xbfbb_8e16_140f_14d9;
+const MIGRATION_005_FNV1A_64: u64 = 0xb642_3766_4392_aac3;
 const MIGRATION_006: &str =
     include_str!("../../../migrations/006_inventory_lots_manufacturer_lot_no.sql");
 const MIGRATION_006_FNV1A_64: u64 = 0x3773_286d_a4b7_9106;

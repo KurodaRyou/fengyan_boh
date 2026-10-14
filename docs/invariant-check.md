@@ -14,7 +14,8 @@
 | 2 | `INVENTORY_UNALLOCATED` | `{ "item_id" }` | `inventory_unallocated` 的全部物料，加上有 `lot_id IS NULL` 流水的物料 | 该物料的账外缺口；没有行时为 0 | 该物料 `lot_id IS NULL` 的流水的 `qty_delta` 之和，没有流水时为 0 |
 | 3 | `INVENTORY_ON_HAND` | `{ "item_id" }` | 视图 `inventory_on_hand` 的全部行 | 视图中的 `qty` | 该物料批次 `remaining_qty` 之和加账外缺口（没有行时为 0） |
 
-- `subject` 的字段、`actual` 与 `expected` 都是 JSON 字符串或整数，取值见上表。第 1 项的 `item_id` 取该批次在 `inventory_lots` 中的 `item_id`。
+- `subject` 的字段是 JSON 字符串，取值见上表。第 1 项的 `item_id` 取该批次在 `inventory_lots` 中的 `item_id`。
+- `actual` 与 `expected` 是基本单位的数量，按 [domain.md](domain.md)「数量」写成小数字符串（存储值 `7000` 写作 `"7"`）。
 - 对象范围不按物料是否停用过滤。
 - 汇总只用 `qty_delta`，不用 `nominal_qty`：被吸收的行 `qty_delta = 0`，不改变账面。
 - 批次余量为负是合法状态。物料有 `lot_id IS NULL` 的流水、合计为 0、没有账外缺口行，也是合法状态。
@@ -52,8 +53,8 @@
       {
         "check": "INVENTORY_LOT_REMAINING",
         "subject": { "item_id": "…", "lot_id": "RAW-FLOUR-20261006-001" },
-        "actual": 7,
-        "expected": 0
+        "actual": "7",
+        "expected": "0"
       }
     ],
     "samples_truncated": false
@@ -105,6 +106,7 @@
 - 锁定测试经 `boh_app::test_node` 进行（[interfaces.md](interfaces.md)「带后台任务的测试节点」）；`test_router` 不启动后台任务，`invariant_check` 的两个字段一直为 `null`。
 - 制造异常：节点启动前经 `boh_storage::testing::open_writer` 修改投影表；节点运行中经 `TestNode::writer` 的唯一写连接修改，不另开写连接。不关闭外键，不替换冻结的视图定义。
 - 覆盖：
-  - 检查项：一致的账本（零库存、负批次余量、账外缺口的组合）、批次余量与流水不一致、没有流水的批次、停用物料、账外缺口与流水不一致（两边都有值、缺行、多余行、流水合计为正）、账外缺口缺行且流水合计为 0 合法、各检查项的汇总超出 `i64`。
+  - 检查项：一致的账本（零库存、负批次余量、账外缺口的组合）、批次余量与流水不一致、没有流水的批次、停用物料、账外缺口与流水不一致（两边都有值、缺行、多余行、流水合计为正）、账外缺口缺行且流水合计为 0 合法、流水汇总超出 `i64`（第 1、2 项）。
+    - 批次余量和账外缺口受库存状态上限的表约束限制，第 3 项的汇总在测试中造不出溢出；规则照常适用。
   - 报告：样本排序与截断、样本满后仍完整计数、首次失败、失败保留旧报告且不发布半份报告、修复后恢复与时钟回拨后的结果覆盖、与其他降级原因的叠加、检查不修改数据库、读取 `/health` 不触发。
   - 触发与关闭：启动检查、闭店在非空库存上检查、闭店先备份后检查且阻挡之后排队的备份、备份失败仍检查、`finished_at` 取结束时刻、关闭等待正在执行的检查和已接受的闭店流程。
