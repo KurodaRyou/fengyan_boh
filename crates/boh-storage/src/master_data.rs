@@ -75,7 +75,7 @@ fn item(tx: &Transaction<'_>, event: &Event, snapshot: &ItemSnapshot) -> Result<
             params![
                 event.aggregate_id.to_string(),
                 unit.unit_code,
-                unit.base_qty_per_unit
+                unit.base_qty_per_unit.nano()
             ],
         )
         .map_err(|error| StorageError::sqlite("插入物料单位", error))?;
@@ -102,14 +102,18 @@ fn recipe(
     for version in &snapshot.versions {
         let inserted = tx
             .execute(
-                "INSERT INTO recipe_versions (recipe_id, version, output_qty_per_batch)
-             SELECT ?1, ?2, ?3 WHERE NOT EXISTS (
+                "INSERT INTO recipe_versions (recipe_id, version, output_qty_per_batch,
+                 output_input_qty, output_input_unit_code, output_input_base_qty_per_unit)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6 WHERE NOT EXISTS (
                  SELECT 1 FROM recipe_versions WHERE recipe_id = ?1 AND version = ?2
              )",
                 params![
                     event.aggregate_id.to_string(),
                     version.version,
-                    version.output_qty_per_batch
+                    version.output_qty_per_batch.milli(),
+                    version.output_input.qty.milli(),
+                    version.output_input.unit_code,
+                    version.output_input.base_qty_per_unit.nano()
                 ],
             )
             .map_err(|error| StorageError::sqlite("插入配方版本", error))?;
@@ -118,8 +122,22 @@ fn recipe(
         }
         for (index, line) in version.lines.iter().enumerate() {
             let line_no = i64::try_from(index).map_err(|_| invalid())?;
-            tx.execute("INSERT INTO recipe_lines (recipe_id, version, line_no, item_id, qty_per_batch) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![event.aggregate_id.to_string(), version.version, line_no, line.item_id.to_string(), line.qty_per_batch]).map_err(|error| StorageError::sqlite("插入配方明细", error))?;
+            tx.execute(
+                "INSERT INTO recipe_lines (recipe_id, version, line_no, item_id, qty_per_batch,
+                 input_qty, input_unit_code, input_base_qty_per_unit)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    event.aggregate_id.to_string(),
+                    version.version,
+                    line_no,
+                    line.item_id.to_string(),
+                    line.qty_per_batch.milli(),
+                    line.input.qty.milli(),
+                    line.input.unit_code,
+                    line.input.base_qty_per_unit.nano()
+                ],
+            )
+            .map_err(|error| StorageError::sqlite("插入配方明细", error))?;
         }
     }
     Ok(())
@@ -178,7 +196,7 @@ mod tests {
 
     #[test]
     fn item_decoder_rejects_coerced_types_nulls_duplicates_and_unknown_fields() {
-        let good = r#"{"entity":"ITEM","source":"LOCAL","snapshot":{"code":"FLOUR","name":"Flour","base_unit":"g","category":"RAW","default_shelf_life_ms":1000,"units":[{"unit_code":"bag","base_qty_per_unit":25000}],"active":true}}"#;
+        let good = r#"{"entity":"ITEM","source":"LOCAL","snapshot":{"code":"FLOUR","name":"Flour","base_unit":"g","category":"RAW","default_shelf_life_ms":1000,"units":[{"unit_code":"bag","base_qty_per_unit":"25000"}],"active":true}}"#;
         assert_strict_payload(
             payload,
             good,
@@ -191,8 +209,8 @@ mod tests {
             good.replace("\"g\"", r#"{"g":null}"#),
             good.replace("\"RAW\"", r#"{"RAW":null}"#),
             good.replace("\"RAW\"", "\"UNKNOWN\""),
-            good.replace(r#"{"unit_code":"bag","base_qty_per_unit":25000}"#, r#"["bag",25000]"#),
-            good.replace(r#"{"code":"FLOUR","name":"Flour","base_unit":"g","category":"RAW","default_shelf_life_ms":1000,"units":[{"unit_code":"bag","base_qty_per_unit":25000}],"active":true}"#, r#"["FLOUR","Flour","g","RAW",1000,[{"unit_code":"bag","base_qty_per_unit":25000}],true]"#),
+            good.replace(r#"{"unit_code":"bag","base_qty_per_unit":"25000"}"#, r#"["bag","25000"]"#),
+            good.replace(r#"{"code":"FLOUR","name":"Flour","base_unit":"g","category":"RAW","default_shelf_life_ms":1000,"units":[{"unit_code":"bag","base_qty_per_unit":"25000"}],"active":true}"#, r#"["FLOUR","Flour","g","RAW",1000,[{"unit_code":"bag","base_qty_per_unit":"25000"}],true]"#),
             good.replace(r#""units":["#, r#""units":[null,"#),
             good.replace("25000", "0"),
             good.replace("1000", "0"),
@@ -204,17 +222,17 @@ mod tests {
 
     #[test]
     fn recipe_decoder_rejects_coerced_types_nulls_duplicates_and_unknown_fields() {
-        let good = r#"{"entity":"RECIPE","source":"LOCAL","snapshot":{"code":"BREAD","name":"Bread","output_item_id":"01890a5d-ac96-774b-bcce-b302099a8301","versions":[{"version":1,"output_qty_per_batch":10,"lines":[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8302","qty_per_batch":100}]}],"active":true}}"#;
+        let good = r#"{"entity":"RECIPE","source":"LOCAL","snapshot":{"code":"BREAD","name":"Bread","output_item_id":"01890a5d-ac96-774b-bcce-b302099a8301","versions":[{"version":1,"output_qty_per_batch":"10","output_input":{"qty":"10","unit_code":"g","base_qty_per_unit":"1"},"lines":[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8302","qty_per_batch":"100","input":{"qty":"100","unit_code":"g","base_qty_per_unit":"1"}}]}],"active":true}}"#;
         assert_strict_payload(payload, good, &[], "解析主数据事件 payload");
         for json in [
             good.replace("\"LOCAL\"", r#"{"LOCAL":null}"#),
-            good.replace(r#"{"item_id":"01890a5d-ac96-774b-bcce-b302099a8302","qty_per_batch":100}"#, r#"["01890a5d-ac96-774b-bcce-b302099a8302",100]"#),
-            good.replace(r#"{"version":1,"output_qty_per_batch":10,"lines":[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8302","qty_per_batch":100}]}"#, r#"[1,10,[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8302","qty_per_batch":100}]]"#),
-            good.replace(r#"{"code":"BREAD","name":"Bread","output_item_id":"01890a5d-ac96-774b-bcce-b302099a8301","versions":[{"version":1,"output_qty_per_batch":10,"lines":[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8302","qty_per_batch":100}]}],"active":true}"#, r#"["BREAD","Bread","01890a5d-ac96-774b-bcce-b302099a8301",[{"version":1,"output_qty_per_batch":10,"lines":[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8302","qty_per_batch":100}]}],true]"#),
+            good.replace(r#"{"item_id":"01890a5d-ac96-774b-bcce-b302099a8302","qty_per_batch":"100","input":{"qty":"100","unit_code":"g","base_qty_per_unit":"1"}}"#, r#"["01890a5d-ac96-774b-bcce-b302099a8302","100",{"qty":"100","unit_code":"g","base_qty_per_unit":"1"}]"#),
+            good.replace(r#"{"version":1,"output_qty_per_batch":"10","output_input":{"qty":"10","unit_code":"g","base_qty_per_unit":"1"},"lines":[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8302","qty_per_batch":"100","input":{"qty":"100","unit_code":"g","base_qty_per_unit":"1"}}]}"#, r#"[1,"10",{"qty":"10","unit_code":"g","base_qty_per_unit":"1"},[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8302","qty_per_batch":"100","input":{"qty":"100","unit_code":"g","base_qty_per_unit":"1"}}]]"#),
+            good.replace(r#"{"code":"BREAD","name":"Bread","output_item_id":"01890a5d-ac96-774b-bcce-b302099a8301","versions":[{"version":1,"output_qty_per_batch":"10","output_input":{"qty":"10","unit_code":"g","base_qty_per_unit":"1"},"lines":[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8302","qty_per_batch":"100","input":{"qty":"100","unit_code":"g","base_qty_per_unit":"1"}}]}],"active":true}"#, r#"["BREAD","Bread","01890a5d-ac96-774b-bcce-b302099a8301",[{"version":1,"output_qty_per_batch":"10","output_input":{"qty":"10","unit_code":"g","base_qty_per_unit":"1"},"lines":[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8302","qty_per_batch":"100","input":{"qty":"100","unit_code":"g","base_qty_per_unit":"1"}}]}],true]"#),
             good.replace(r#""versions":["#, r#""versions":[true,"#),
             good.replace(r#""lines":["#, r#""lines":[null,"#),
             good.replace(r#""version":1"#, r#""version":2"#),
-            good.replace(r#""qty_per_batch":100"#, r#""qty_per_batch":0"#),
+            good.replace(r#""qty_per_batch":"100","input":{"qty":"100","unit_code":"g","base_qty_per_unit":"1"}"#, r#""qty_per_batch":"0","input":{"qty":"0","unit_code":"g","base_qty_per_unit":"1"}"#),
         ] {
             assert!(payload(&json).is_err(), "{json}");
         }
@@ -280,7 +298,7 @@ mod tests {
             };
             for (entity, snapshot) in [
                 ("ITEM", r#"{"code":"FLOUR","name":"Flour","base_unit":"g","category":"RAW","units":[],"active":true}"#),
-                ("RECIPE", r#"{"code":"BREAD","name":"Bread","output_item_id":"01890a5d-ac96-774b-bcce-b302099a8301","versions":[{"version":1,"output_qty_per_batch":1,"lines":[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8301","qty_per_batch":1}]}],"active":true}"#),
+                ("RECIPE", r#"{"code":"BREAD","name":"Bread","output_item_id":"01890a5d-ac96-774b-bcce-b302099a8301","versions":[{"version":1,"output_qty_per_batch":"1","output_input":{"qty":"1","unit_code":"g","base_qty_per_unit":"1"},"lines":[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8301","qty_per_batch":"1","input":{"qty":"1","unit_code":"g","base_qty_per_unit":"1"}}]}],"active":true}"#),
                 ("SUPPLIER", r#"{"code":"S1","name":"Supplier","active":true}"#),
                 ("WASTE_REASON", r#"{"code":"EXPIRED","name":"Expired","active":true}"#),
             ] {
@@ -334,10 +352,10 @@ mod tests {
                     payload: String::new(),
                 };
                 let v1 = format!(
-                    r#"{{"version":1,"output_qty_per_batch":10,"lines":[{{"item_id":"{item_id}","qty_per_batch":100}}]}}"#
+                    r#"{{"version":1,"output_qty_per_batch":"35.437","output_input":{{"qty":"1.25","unit_code":"oz","base_qty_per_unit":"28.349523125"}},"lines":[{{"item_id":"{item_id}","qty_per_batch":"0.001","input":{{"qty":"0.5","unit_code":"mg","base_qty_per_unit":"0.001"}}}}]}}"#
                 );
                 let v2 = format!(
-                    r#"{{"version":2,"output_qty_per_batch":20,"lines":[{{"item_id":"{item_id}","qty_per_batch":200}}]}}"#
+                    r#"{{"version":2,"output_qty_per_batch":"70.874","output_input":{{"qty":"2.5","unit_code":"oz","base_qty_per_unit":"28.349523125"}},"lines":[{{"item_id":"{item_id}","qty_per_batch":"0.002","input":{{"qty":"1.5","unit_code":"mg","base_qty_per_unit":"0.001"}}}}]}}"#
                 );
                 let snapshot = |name: &str, versions: &str| {
                     format!(
@@ -373,7 +391,31 @@ mod tests {
                 let rows: Vec<(i64, i64, i64, i64)> = statement
                     .query_map([recipe_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).map_err(|error| StorageError::sqlite("查询配方版本", error))?
                     .collect::<Result<_, _>>().map_err(|error| StorageError::sqlite("读取配方版本", error))?;
-                assert_eq!(rows, [(1, 10, 0, 100), (2, 20, 0, 200)]);
+                assert_eq!(rows, [(1, 35_437, 0, 1), (2, 70_874, 0, 2)]);
+                // The historical input units do not exist in current item_units.
+                // Projection must persist the event's values without looking them up.
+                for (table, columns, expected) in [
+                    (
+                        "recipe_versions",
+                        "output_input_qty, output_input_unit_code, output_input_base_qty_per_unit",
+                        [(1250, "oz".to_owned(), 28_349_523_125), (2500, "oz".to_owned(), 28_349_523_125)],
+                    ),
+                    (
+                        "recipe_lines",
+                        "input_qty, input_unit_code, input_base_qty_per_unit",
+                        [(500, "mg".to_owned(), 1_000_000), (1500, "mg".to_owned(), 1_000_000)],
+                    ),
+                ] {
+                    let mut statement = tx.prepare(&format!(
+                        "SELECT {columns} FROM {table} WHERE recipe_id = ?1 ORDER BY version"
+                    )).map_err(|error| StorageError::sqlite("准备查询配方录入快照", error))?;
+                    let inputs: Vec<(i64, String, i64)> = statement
+                        .query_map([recipe_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                        .map_err(|error| StorageError::sqlite("查询配方录入快照", error))?
+                        .collect::<Result<_, _>>()
+                        .map_err(|error| StorageError::sqlite("读取配方录入快照", error))?;
+                    assert_eq!(inputs, expected);
+                }
                 let metadata: (String, i64) = tx.query_row(
                     "SELECT name, revision FROM recipes WHERE id = ?1",
                     [recipe_id],

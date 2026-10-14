@@ -67,6 +67,7 @@ pub mod equipment;
 pub mod inventory;
 pub mod lot;
 pub mod master_data;
+pub mod quantity;
 pub mod receiving;
 pub mod temperature;
 pub mod time;
@@ -78,6 +79,8 @@ pub enum DomainError {
     InvalidId(String),
     #[error("invalid value for {0}")]
     InvalidField(&'static str),
+    #[error("stock limit exceeded")]
+    StockLimitExceeded { lot_id: Option<lot::LotId> },
 }
 
 /// UTC Unix 毫秒时间戳。

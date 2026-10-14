@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::inventory::{Allocation, AllocationSource};
 use crate::lot::LotId;
+use crate::quantity::Quantity;
 use crate::receiving::ReceiptInput;
 use crate::{AggregateId, CommandId, DomainError, EventId, UnixMillis};
 
@@ -108,11 +109,11 @@ pub enum WasteEffect {
 pub struct WasteLine {
     pub item_id: AggregateId,
     pub lot_id: Option<LotId>,
-    pub qty: i64,
+    pub qty: Quantity,
     pub input: ReceiptInput,
     pub reason_code: String,
-    pub item_book_qty: i64,
-    pub lot_book_qty: Option<i64>,
+    pub item_book_qty: Quantity,
+    pub lot_book_qty: Option<Quantity>,
     pub effect: WasteEffect,
 }
 object_serde!(WasteLine);
@@ -130,9 +131,9 @@ impl WasteLine {
             if alloc.is_empty() {
                 return Err(DomainError::InvalidField("alloc"));
             }
-            let mut total = 0_i64;
+            let mut total = Quantity::ZERO;
             for (index, part) in alloc.iter().enumerate() {
-                if part.qty <= 0
+                if part.qty <= Quantity::ZERO
                     || (part.source == AllocationSource::Shortfall) != part.lot_id.is_none()
                 {
                     return Err(DomainError::InvalidField("alloc"));
@@ -171,16 +172,16 @@ struct WireWasteLine {
         deserialize_with = "crate::present"
     )]
     lot_id: Option<LotId>,
-    qty: i64,
+    qty: Quantity,
     input: ReceiptInput,
     reason_code: String,
-    item_book_qty: i64,
+    item_book_qty: Quantity,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "crate::present"
     )]
-    lot_book_qty: Option<i64>,
+    lot_book_qty: Option<Quantity>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -307,18 +308,18 @@ mod tests {
         let item = "01890a5d-ac96-774b-bcce-b302099a8501";
         let command = "01890a5d-ac96-774b-bcce-b302099a8502";
         let lot = "RAW-FLOUR-20261006-001";
-        let input = json!({ "qty": 1, "unit_code": "g", "base_qty_per_unit": 1 });
-        let alloc = json!([{ "lot_id": lot, "qty": 1, "source": "SPECIFIED" }]);
+        let input = json!({ "qty": "1", "unit_code": "g", "base_qty_per_unit": "1" });
+        let alloc = json!([{ "lot_id": lot, "qty": "1", "source": "SPECIFIED" }]);
         let line = json!({
-            "item_id": item, "lot_id": lot, "qty": 1, "input": input,
-            "reason_code": "EXPIRED", "item_book_qty": 3, "lot_book_qty": 3, "alloc": alloc,
+            "item_id": item, "lot_id": lot, "qty": "1", "input": input,
+            "reason_code": "EXPIRED", "item_book_qty": "3", "lot_book_qty": "3", "alloc": alloc,
         });
         assert!(serde_json::from_value::<WasteLogged>(json!({ "lines": [line.clone()] })).is_ok());
-        let positional_line = json!([item, lot, 1, input, "EXPIRED", 3, 3, alloc]);
+        let positional_line = json!([item, lot, "1", input, "EXPIRED", "3", "3", alloc]);
         let mut positional_input = line.clone();
-        positional_input["input"] = json!([1, "g", 1]);
+        positional_input["input"] = json!(["1", "g", "1"]);
         let mut positional_alloc = line.clone();
-        positional_alloc["alloc"] = json!([[lot, 1, "SPECIFIED"]]);
+        positional_alloc["alloc"] = json!([[lot, "1", "SPECIFIED"]]);
         for payload in [
             json!([[line]]),
             json!({ "lines": [positional_line] }),
@@ -333,7 +334,7 @@ mod tests {
         let request_line =
             json!({ "item_id": item, "lot_id": lot, "input": input, "reason_code": "EXPIRED" });
         let mut request_array_input = request_line.clone();
-        request_array_input["input"] = json!([1, "g", 1]);
+        request_array_input["input"] = json!(["1", "g", "1"]);
         for lines in [
             json!([[item, lot, input, "EXPIRED"]]),
             json!([request_array_input]),
@@ -354,45 +355,42 @@ mod tests {
 
     #[test]
     fn payload_rejects_nulls_coerced_types_duplicates_and_invalid_allocations() {
-        let good = r#"{"lines":[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8501","qty":1,"input":{"qty":1,"unit_code":"g","base_qty_per_unit":1},"reason_code":"EXPIRED","item_book_qty":3,"alloc":[{"lot_id":"RAW-FLOUR-20261006-001","qty":1,"source":"FIFO"}]}]}"#;
+        let good = r#"{"lines":[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8501","qty":"1","input":{"qty":"1","unit_code":"g","base_qty_per_unit":"1"},"reason_code":"EXPIRED","item_book_qty":"3","alloc":[{"lot_id":"RAW-FLOUR-20261006-001","qty":"1","source":"FIFO"}]}]}"#;
         assert!(serde_json::from_str::<WasteLogged>(good).is_ok());
         for json in [
-            good.replace("\"qty\":1", "\"qty\":true"),
-            good.replace("\"qty\":1", "\"qty\":1.0"),
-            good.replace("\"qty\":1", "\"qty\":null"),
-            good.replace("\"qty\":1", "\"qty\":0"),
-            good.replace("\"qty\":1", "\"qty\":-1"),
-            good.replace("\"item_book_qty\":3", "\"item_book_qty\":null"),
+            good.replace(r#""qty":"1""#, r#""qty":1"#),
+            good.replace(r#""qty":"1""#, r#""qty":true"#),
+            good.replace(r#""qty":"1""#, r#""qty":1.0"#),
+            good.replace(r#""qty":"1""#, r#""qty":null"#),
+            good.replace(r#""qty":"1""#, r#""qty":"0""#),
+            good.replace(r#""qty":"1""#, r#""qty":"-1""#),
+            good.replace(r#""item_book_qty":"3""#, r#""item_book_qty":null"#),
             good.replace(
-                "\"item_book_qty\":3",
-                "\"item_book_qty\":3,\"item_book_qty\":3",
+                r#""item_book_qty":"3""#,
+                r#""item_book_qty":"3","item_book_qty":"3""#,
             ),
-            good.replace("\"input\":", "\"lot_id\":null,\"input\":"),
-            good.replace("\"input\":", "\"lot_book_qty\":null,\"input\":"),
-            good.replace("\"alloc\":[", "\"absorbed_by_event_id\":null,\"alloc\":["),
-            good.replace("\"alloc\":[", "\"alloc\":[null,"),
-            good.replace("\"alloc\":[", "\"extra\":true,\"alloc\":["),
-            good.replace("\"lot_id\":\"RAW-FLOUR-20261006-001\"", "\"lot_id\":null"),
-            good.replace("\"source\":\"FIFO\"", "\"source\":\"SHORTFALL\""),
-            good.replace("\"source\":\"FIFO\"", "\"source\":\"SPECIFIED\""),
-            good.replace("\"source\":\"FIFO\"", "\"source\":\"NEW_LOT\""),
-            good.replace("\"source\":\"FIFO\"", "\"source\":\"FIFO\",\"extra\":1"),
+            good.replace(r#""input":"#, r#""lot_id":null,"input":"#),
+            good.replace(r#""input":"#, r#""lot_book_qty":null,"input":"#),
+            good.replace(r#""alloc":["#, r#""absorbed_by_event_id":null,"alloc":["#),
+            good.replace(r#""alloc":["#, r#""alloc":[null,"#),
+            good.replace(r#""alloc":["#, r#""extra":true,"alloc":["#),
+            good.replace(r#""lot_id":"RAW-FLOUR-20261006-001""#, r#""lot_id":null"#),
+            good.replace(r#""source":"FIFO""#, r#""source":"SHORTFALL""#),
+            good.replace(r#""source":"FIFO""#, r#""source":"SPECIFIED""#),
+            good.replace(r#""source":"FIFO""#, r#""source":"NEW_LOT""#),
+            good.replace(r#""source":"FIFO""#, r#""source":"FIFO","extra":1"#),
+            good.replace(r#""source":"FIFO""#, r#""source":"FIFO","source":"FIFO""#),
+            good.replace(r#""qty":"1","source""#, r#""qty":"2","source""#),
             good.replace(
-                "\"source\":\"FIFO\"",
-                "\"source\":\"FIFO\",\"source\":\"FIFO\"",
+                r#""qty":"1","source""#,
+                r#""qty":"9223372036854775.807","source""#,
             ),
-            good.replace("\"qty\":1,\"source\"", "\"qty\":2,\"source\""),
-            good.replace(
-                "\"qty\":1,\"source\"",
-                "\"qty\":9223372036854775807,\"source\"",
-            ),
-            good.replace("\"base_qty_per_unit\":1", "\"base_qty_per_unit\":2"),
-            good.replace(
-                "\"reason_code\":\"EXPIRED\"",
-                "\"reason_code\":\" EXPIRED\"",
-            ),
-            good.replace("\"lines\":[", "\"unknown\":1,\"lines\":["),
+            good.replace(r#""base_qty_per_unit":"1""#, r#""base_qty_per_unit":"2""#),
+            good.replace(r#""base_qty_per_unit":"1""#, r#""base_qty_per_unit":1"#),
+            good.replace(r#""reason_code":"EXPIRED""#, r#""reason_code":" EXPIRED""#),
+            good.replace(r#""lines":["#, r#""unknown":1,"lines":["#),
         ] {
+            assert_ne!(json, good);
             assert!(
                 serde_json::from_str::<WasteLogged>(&json).is_err(),
                 "{json}"

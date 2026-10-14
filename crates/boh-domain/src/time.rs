@@ -3,7 +3,8 @@
 use std::fmt;
 
 use jiff::Timestamp;
-use jiff::civil::{Date, Time};
+pub use jiff::civil::Date;
+use jiff::civil::Time;
 use jiff::tz::{TimeZone, TimeZoneDatabase};
 
 use crate::UnixMillis;
@@ -93,12 +94,6 @@ pub struct BusinessDayCutoff(Time);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BusinessDate(Date);
-
-impl BusinessDate {
-    pub fn date(&self) -> Date {
-        self.0
-    }
-}
 
 impl fmt::Display for BusinessDate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -211,13 +206,13 @@ pub fn business_date(
 }
 
 /// Calendar date at the store, independent of the business-day cutoff.
-pub fn local_date(at: UnixMillis, timezone: &StoreTimeZone) -> Result<BusinessDate, TimeError> {
+pub fn local_date(at: UnixMillis, timezone: &StoreTimeZone) -> Result<Date, TimeError> {
     let timestamp = Timestamp::from_millisecond(at.0).map_err(|_| TimeError::OutOfRange)?;
     let date = timezone.0.to_datetime(timestamp).date();
     if !(0..=9999).contains(&date.year()) {
         return Err(TimeError::OutOfRange);
     }
-    Ok(BusinessDate(date))
+    Ok(date)
 }
 
 /// The last millisecond of a local calendar date, using the next local midnight.
@@ -238,6 +233,24 @@ pub fn end_of_local_date(date: Date, timezone: &StoreTimeZone) -> Result<UnixMil
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calendar_date_remains_a_civil_date_with_nonnegative_four_digit_years() {
+        let timezone = parse_timezone("UTC").unwrap();
+        for (timestamp, expected) in [
+            ("0000-01-01T00:00:00Z", "0000-01-01"),
+            ("9999-12-30T00:00:00Z", "9999-12-30"),
+        ] {
+            let at: Timestamp = timestamp.parse().unwrap();
+            let date: Date = local_date(UnixMillis(at.as_millisecond()), &timezone).unwrap();
+            assert_eq!(date.to_string(), expected);
+        }
+        let before_zero: Timestamp = "-000001-12-31T23:59:59Z".parse().unwrap();
+        assert_eq!(
+            local_date(UnixMillis(before_zero.as_millisecond()), &timezone),
+            Err(TimeError::OutOfRange)
+        );
+    }
 
     #[test]
     fn expiry_uses_local_midnight_across_short_and_long_dst_days() {

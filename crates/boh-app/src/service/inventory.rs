@@ -9,7 +9,8 @@ use boh_domain::inventory::{
 };
 use boh_domain::lot::LotId;
 use boh_domain::master_data::ItemCategory;
-use boh_domain::time::{BusinessDate, business_date};
+use boh_domain::quantity::Quantity;
+use boh_domain::time::{Date, business_date};
 use boh_domain::{AggregateId, DomainError, UnixMillis};
 use boh_storage::StorageError;
 use boh_storage::rusqlite::{Connection, OptionalExtension, Row, params};
@@ -40,8 +41,8 @@ pub async fn list(state: AppState, query: InventoryQuery) -> Result<Inventory, A
                 .query_map([&item_id], |row| {
                     Ok(InventoryItem {
                         item_id: parse_id(row, 0, AggregateId::parse)?,
-                        on_hand_qty: row.get(1)?,
-                        unallocated_qty: row.get(2)?,
+                        on_hand_qty: Quantity::from_milli(row.get(1)?),
+                        unallocated_qty: Quantity::from_milli(row.get(2)?),
                         lots: Vec::new(),
                     })
                 })
@@ -124,7 +125,7 @@ fn read_lot(row: &Row<'_>) -> boh_storage::rusqlite::Result<Lot> {
         details: LotDetails {
             lot_id: parse_id(row, 0, LotId::parse)?,
             origin: row.get(2)?,
-            remaining_qty: row.get(3)?,
+            remaining_qty: Quantity::from_milli(row.get(3)?),
             source_occurred_at: UnixMillis(row.get(4)?),
             expires_at: row.get::<_, Option<i64>>(5)?.map(UnixMillis),
             manufacturer_lot_no: row.get(6)?,
@@ -142,12 +143,13 @@ impl WorkingSet {
     pub(super) fn get(
         &mut self,
         conn: &Connection,
+        index: usize,
         item_id: AggregateId,
     ) -> Result<&mut ItemBalance, ApiError> {
         use std::collections::btree_map::Entry;
         Ok(match self.balances.entry(item_id) {
             Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => entry.insert(load_balance(conn, item_id)?),
+            Entry::Vacant(entry) => entry.insert(load_balance(conn, index, item_id)?),
         })
     }
 }
@@ -155,14 +157,49 @@ impl WorkingSet {
 pub(super) fn allocate(
     balance: &mut ItemBalance,
     specified: Option<usize>,
-    qty: i64,
+    qty: Quantity,
+    index: usize,
+    item_id: AggregateId,
 ) -> Result<Vec<Allocation>, ApiError> {
     balance
         .allocate(specified, qty)
-        .map_err(|_| ApiError::validation())
+        .map_err(|error| stock_error(error, index, item_id))
 }
 
-fn load_balance(conn: &Connection, item_id: AggregateId) -> Result<ItemBalance, ApiError> {
+pub(super) fn receive(
+    balance: &mut ItemBalance,
+    lot_id: LotId,
+    qty: Quantity,
+    index: usize,
+    item_id: AggregateId,
+) -> Result<(), ApiError> {
+    balance
+        .receive(lot_id, qty)
+        .map_err(|error| stock_error(error, index, item_id))
+}
+
+fn stock_error(error: DomainError, index: usize, item_id: AggregateId) -> ApiError {
+    if let DomainError::StockLimitExceeded { lot_id } = error {
+        let mut details = json!({ "line": index, "item_id": item_id });
+        if let Some(lot_id) = lot_id {
+            details["lot_id"] = json!(lot_id);
+        }
+        ApiError::new(
+            StatusCode::CONFLICT,
+            "STOCK_LIMIT_EXCEEDED",
+            "inventory state exceeds the stock limit",
+        )
+        .with_details(details)
+    } else {
+        ApiError::from(StorageError::from(error))
+    }
+}
+
+fn load_balance(
+    conn: &Connection,
+    index: usize,
+    item_id: AggregateId,
+) -> Result<ItemBalance, ApiError> {
     let mut statement = conn.prepare(
         "SELECT lot_id, remaining_qty FROM inventory_lots WHERE item_id = ?1 ORDER BY lot_date, lot_serial",
     ).map_err(|error| StorageError::sqlite("准备查询库存批次", error))?;
@@ -177,33 +214,33 @@ fn load_balance(conn: &Connection, item_id: AggregateId) -> Result<ItemBalance, 
             })?;
             Ok(LotBalance {
                 lot_id,
-                remaining: row.get(1)?,
+                remaining: Quantity::from_milli(row.get(1)?),
             })
         })
         .map_err(|error| StorageError::sqlite("查询库存批次", error))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| StorageError::sqlite("读取库存批次", error))?;
-    let unallocated: i64 = conn
+    let unallocated = conn
         .query_row(
             "SELECT qty FROM inventory_unallocated WHERE item_id = ?1",
             [item_id.to_string()],
-            |row| row.get(0),
+            |row| Ok(Quantity::from_milli(row.get(0)?)),
         )
         .optional()
         .map_err(|error| StorageError::sqlite("查询库存账外缺口", error))?
-        .unwrap_or(0);
-    ItemBalance::new(lots, unallocated).map_err(|_| ApiError::validation())
+        .unwrap_or(Quantity::ZERO);
+    ItemBalance::new(lots, unallocated).map_err(|error| stock_error(error, index, item_id))
 }
 
 /// One command's serials for its single, calibrated lot date.
 pub(super) struct LotNumbers {
-    lot_date: BusinessDate,
+    lot_date: Date,
     calendar_date: String,
     last_serials: BTreeMap<AggregateId, i64>,
 }
 
 impl LotNumbers {
-    pub(super) fn new(lot_date: BusinessDate) -> Self {
+    pub(super) fn new(lot_date: Date) -> Self {
         let calendar_date = lot_date.to_string();
         Self {
             lot_date,
@@ -246,7 +283,7 @@ impl LotNumbers {
             )
         })?;
         self.last_serials.insert(item_id, serial);
-        LotId::from_parts(category, code, self.lot_date.date(), serial)
+        LotId::from_parts(category, code, self.lot_date, serial)
             .map_err(|error| ApiError::from(StorageError::from(error)))
     }
 }

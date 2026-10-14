@@ -3,7 +3,13 @@
 use serde::{Deserialize, Serialize};
 
 use crate::equipment::MasterDataSource;
+use crate::quantity::{Quantity, UnitFactor};
+use crate::receiving::ReceiptInput;
 use crate::{AggregateId, CommandId, DomainError};
+
+#[cfg(test)]
+#[path = "master_data_tests.rs"]
+mod tests;
 
 fn text(value: &str, field: &'static str) -> Result<(), DomainError> {
     if value.is_empty() || value.trim() != value {
@@ -84,7 +90,7 @@ impl ItemCategory {
 #[serde(remote = "Self", deny_unknown_fields)]
 pub struct ItemUnit {
     pub unit_code: String,
-    pub base_qty_per_unit: i64,
+    pub base_qty_per_unit: UnitFactor,
 }
 object_serde!(ItemUnit);
 
@@ -101,7 +107,7 @@ fn item_fields(
     let mut previous: Option<&str> = None;
     for unit in units {
         text(&unit.unit_code, "unit_code")?;
-        positive(unit.base_qty_per_unit, "base_qty_per_unit")?;
+        unit.base_qty_per_unit.validate()?;
         if base_unit.is_some_and(|base| base.as_str() == unit.unit_code)
             || previous.is_some_and(|last| last >= unit.unit_code.as_str())
         {
@@ -217,30 +223,56 @@ impl UpdateItem {
 #[serde(remote = "Self", deny_unknown_fields)]
 pub struct RecipeLine {
     pub item_id: AggregateId,
-    pub qty_per_batch: i64,
+    pub qty_per_batch: Quantity,
+    pub input: ReceiptInput,
 }
 object_serde!(RecipeLine);
 
-fn recipe_lines(output: i64, lines: &[RecipeLine]) -> Result<(), DomainError> {
-    positive(output, "output_qty_per_batch")?;
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
+pub struct RecipeInputLine {
+    pub item_id: AggregateId,
+    pub input: ReceiptInput,
+}
+object_serde!(RecipeInputLine);
+
+fn recipe_version(
+    version: i64,
+    output: &ReceiptInput,
+    lines: &[RecipeInputLine],
+) -> Result<RecipeVersion, DomainError> {
+    positive(version, "version")?;
+    let output_qty_per_batch = output.base_qty()?;
     if lines.is_empty() {
         return Err(DomainError::InvalidField("lines"));
     }
     let mut ids = std::collections::BTreeMap::new();
+    let mut converted = Vec::with_capacity(lines.len());
     for line in lines {
-        positive(line.qty_per_batch, "qty_per_batch")?;
+        let qty_per_batch = line.input.base_qty()?;
         if ids.insert(line.item_id, ()).is_some() {
             return Err(DomainError::InvalidField("lines"));
         }
+        converted.push(RecipeLine {
+            item_id: line.item_id,
+            qty_per_batch,
+            input: line.input.clone(),
+        });
     }
-    Ok(())
+    Ok(RecipeVersion {
+        version,
+        output_qty_per_batch,
+        output_input: output.clone(),
+        lines: converted,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(remote = "Self", deny_unknown_fields)]
 pub struct RecipeVersion {
     pub version: i64,
-    pub output_qty_per_batch: i64,
+    pub output_qty_per_batch: Quantity,
+    pub output_input: ReceiptInput,
     pub lines: Vec<RecipeLine>,
 }
 object_serde!(RecipeVersion);
@@ -271,7 +303,21 @@ impl RecipeSnapshot {
             if version.version != expected {
                 return Err(DomainError::InvalidField("versions"));
             }
-            recipe_lines(version.output_qty_per_batch, &version.lines)?;
+            if version.output_qty_per_batch != version.output_input.base_qty()? {
+                return Err(DomainError::InvalidField("output_qty_per_batch"));
+            }
+            if version.lines.is_empty() {
+                return Err(DomainError::InvalidField("lines"));
+            }
+            let mut ids = std::collections::BTreeMap::new();
+            for line in &version.lines {
+                if line.qty_per_batch != line.input.base_qty()? {
+                    return Err(DomainError::InvalidField("qty_per_batch"));
+                }
+                if ids.insert(line.item_id, ()).is_some() {
+                    return Err(DomainError::InvalidField("lines"));
+                }
+            }
         }
         Ok(())
     }
@@ -285,28 +331,24 @@ pub struct CreateRecipe {
     pub name: String,
     pub output_item_id: AggregateId,
     pub active: bool,
-    pub output_qty_per_batch: i64,
-    pub lines: Vec<RecipeLine>,
+    pub output_input: ReceiptInput,
+    pub lines: Vec<RecipeInputLine>,
 }
 
 impl CreateRecipe {
     pub fn validate(&self) -> Result<(), DomainError> {
+        self.snapshot().map(|_| ())
+    }
+    pub fn snapshot(&self) -> Result<RecipeSnapshot, DomainError> {
         text(&self.code, "code")?;
         text(&self.name, "name")?;
-        recipe_lines(self.output_qty_per_batch, &self.lines)
-    }
-    pub fn snapshot(&self) -> RecipeSnapshot {
-        RecipeSnapshot {
+        Ok(RecipeSnapshot {
             code: self.code.clone(),
             name: self.name.clone(),
             output_item_id: self.output_item_id,
             active: self.active,
-            versions: vec![RecipeVersion {
-                version: 1,
-                output_qty_per_batch: self.output_qty_per_batch,
-                lines: self.lines.clone(),
-            }],
-        }
+            versions: vec![recipe_version(1, &self.output_input, &self.lines)?],
+        })
     }
 }
 
@@ -331,14 +373,18 @@ impl UpdateRecipe {
 pub struct AddRecipeVersion {
     pub command_id: CommandId,
     pub base_revision: i64,
-    pub output_qty_per_batch: i64,
-    pub lines: Vec<RecipeLine>,
+    pub output_input: ReceiptInput,
+    pub lines: Vec<RecipeInputLine>,
 }
 
 impl AddRecipeVersion {
     pub fn validate(&self) -> Result<(), DomainError> {
         positive(self.base_revision, "base_revision")?;
-        recipe_lines(self.output_qty_per_batch, &self.lines)
+        self.version(1).map(|_| ())
+    }
+
+    pub fn version(&self, number: i64) -> Result<RecipeVersion, DomainError> {
+        recipe_version(number, &self.output_input, &self.lines)
     }
 }
 

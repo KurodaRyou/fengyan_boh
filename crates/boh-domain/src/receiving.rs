@@ -4,6 +4,7 @@ use jiff::civil::{Date, date as civil_date};
 use serde::{Deserialize, Serialize};
 
 use crate::lot::LotId;
+use crate::quantity::{Quantity, UnitFactor, convert_unit};
 use crate::{AggregateId, CommandId, DomainError, UnixMillis};
 
 const LAST_EXPIRES_ON: Date = civil_date(9998, 12, 31);
@@ -11,26 +12,28 @@ const LAST_EXPIRES_ON: Date = civil_date(9998, 12, 31);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(remote = "Self", deny_unknown_fields)]
 pub struct ReceiptInput {
-    pub qty: i64,
+    pub qty: Quantity,
     pub unit_code: String,
-    pub base_qty_per_unit: i64,
+    pub base_qty_per_unit: UnitFactor,
 }
 object_serde!(ReceiptInput);
 
 impl ReceiptInput {
-    pub fn base_qty(&self) -> Result<i64, DomainError> {
-        if self.qty <= 0 {
+    pub fn base_qty(&self) -> Result<Quantity, DomainError> {
+        if !(1..=9_999_999).contains(&self.qty.milli()) {
             return Err(DomainError::InvalidField("input.qty"));
         }
-        if self.base_qty_per_unit <= 0 {
-            return Err(DomainError::InvalidField("input.base_qty_per_unit"));
-        }
+        self.base_qty_per_unit
+            .validate()
+            .map_err(|_| DomainError::InvalidField("input.base_qty_per_unit"))?;
         if self.unit_code.is_empty() || self.unit_code.trim() != self.unit_code {
             return Err(DomainError::InvalidField("input.unit_code"));
         }
-        self.qty
-            .checked_mul(self.base_qty_per_unit)
-            .ok_or(DomainError::InvalidField("input.qty"))
+        let qty = convert_unit(self.qty, self.base_qty_per_unit)?;
+        if qty == Quantity::ZERO {
+            return Err(DomainError::InvalidField("input.qty"));
+        }
+        Ok(qty)
     }
 }
 
@@ -90,7 +93,7 @@ impl CreateReceipt {
 #[serde(remote = "Self", deny_unknown_fields)]
 pub struct ReceivedLine {
     pub item_id: AggregateId,
-    pub qty: i64,
+    pub qty: Quantity,
     pub input: ReceiptInput,
     pub lot_id: LotId,
     #[serde(
@@ -164,7 +167,7 @@ fn validate_line(
     line_cost_cents: i64,
 ) -> Result<(), DomainError> {
     input.base_qty()?;
-    if line_cost_cents < 0 {
+    if !(0..=99_999_999).contains(&line_cost_cents) {
         return Err(DomainError::InvalidField("line_cost_cents"));
     }
     if let Some(lot_no) = manufacturer_lot_no
@@ -181,4 +184,65 @@ fn validate_line(
         return Err(DomainError::InvalidField("produced_on"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ReceiptInput, ReceiptLine};
+    use serde_json::json;
+
+    fn input(qty: &str, factor: &str) -> ReceiptInput {
+        serde_json::from_value(json!({
+            "qty": qty, "unit_code": "unit", "base_qty_per_unit": factor
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn input_limits_apply_before_conversion_and_positive_values_cannot_round_to_zero() {
+        assert_eq!(
+            input("9999.999", "1000000000")
+                .base_qty()
+                .unwrap()
+                .to_string(),
+            "9999999000000"
+        );
+        assert_eq!(
+            input("0.5", "0.001").base_qty().unwrap().to_string(),
+            "0.001"
+        );
+        for (qty, factor) in [
+            ("0", "1"),
+            ("-0.001", "1"),
+            ("10000", "0.001"),
+            ("0.4", "0.001"),
+            ("1", "0"),
+            ("1", "-1"),
+            ("1", "1000000000.000000001"),
+        ] {
+            assert!(input(qty, factor).base_qty().is_err(), "{qty} × {factor}");
+        }
+        for code in ["", " g", "g ", "\u{2003}g"] {
+            let mut value = input("1", "1");
+            value.unit_code = code.to_owned();
+            assert!(value.base_qty().is_err(), "{code}");
+        }
+    }
+
+    #[test]
+    fn receipt_cost_limits_are_inclusive_integer_cents() {
+        let mut line: ReceiptLine = serde_json::from_value(json!({
+            "item_id": "01890a5d-ac96-774b-bcce-b302099a8501",
+            "input": {"qty": "1", "unit_code": "g", "base_qty_per_unit": "1"},
+            "produced_on": "2026-10-01", "expires_on": "2026-10-02", "line_cost_cents": 0
+        }))
+        .unwrap();
+        assert!(line.validate().is_ok());
+        line.line_cost_cents = 99_999_999;
+        assert!(line.validate().is_ok());
+        for cents in [-1, 100_000_000, i64::MAX] {
+            line.line_cost_cents = cents;
+            assert!(line.validate().is_err());
+        }
+    }
 }

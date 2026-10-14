@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::lot::LotId;
+use crate::quantity::Quantity;
 use crate::{AggregateId, DomainError, UnixMillis};
 
 #[cfg(test)]
@@ -19,7 +20,7 @@ pub struct InventoryQuery {
 pub struct LotDetails {
     pub lot_id: LotId,
     pub origin: String,
-    pub remaining_qty: i64,
+    pub remaining_qty: Quantity,
     pub source_occurred_at: UnixMillis,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<UnixMillis>,
@@ -37,8 +38,8 @@ pub struct Lot {
 #[derive(Debug, Serialize)]
 pub struct InventoryItem {
     pub item_id: AggregateId,
-    pub on_hand_qty: i64,
-    pub unallocated_qty: i64,
+    pub on_hand_qty: Quantity,
+    pub unallocated_qty: Quantity,
     pub lots: Vec<LotDetails>,
 }
 
@@ -76,7 +77,7 @@ pub struct Allocation {
         deserialize_with = "crate::present"
     )]
     pub lot_id: Option<LotId>,
-    pub qty: i64,
+    pub qty: Quantity,
     pub source: AllocationSource,
 }
 object_serde!(Allocation);
@@ -85,28 +86,47 @@ object_serde!(Allocation);
 #[derive(Debug)]
 pub struct LotBalance {
     pub lot_id: LotId,
-    pub remaining: i64,
+    pub remaining: Quantity,
 }
 
 /// Mutable state for one item within one command. Failed allocations leave it unchanged.
 #[derive(Debug)]
 pub struct ItemBalance {
     lots: Vec<LotBalance>,
-    unallocated: i64,
-    book: i64,
+    unallocated: Quantity,
+    book: Quantity,
+}
+
+const STOCK_LIMIT_MILLI: i128 = 1_000_000_000_000;
+
+fn stock_quantity(value: i128, lot_id: Option<&LotId>) -> Result<Quantity, DomainError> {
+    let exceeded = || DomainError::StockLimitExceeded {
+        lot_id: lot_id.cloned(),
+    };
+    if !(-STOCK_LIMIT_MILLI..=STOCK_LIMIT_MILLI).contains(&value) {
+        return Err(exceeded());
+    }
+    i64::try_from(value)
+        .map(Quantity::from_milli)
+        .map_err(|_| exceeded())
 }
 
 impl ItemBalance {
-    pub fn new(lots: Vec<LotBalance>, unallocated: i64) -> Result<Self, DomainError> {
-        // Intermediate sums may exceed i64 even when the final book fits.
+    pub fn new(lots: Vec<LotBalance>, unallocated: Quantity) -> Result<Self, DomainError> {
+        // Check existing lots first so a lot violation retains its identity.
+        for lot in &lots {
+            stock_quantity(i128::from(lot.remaining.milli()), Some(&lot.lot_id))?;
+        }
+        stock_quantity(i128::from(unallocated.milli()), None)?;
+        // Intermediate sums may exceed the stock limit or i64 before cancellation.
         let total = lots
             .iter()
-            .try_fold(i128::from(unallocated), |total, lot| {
+            .try_fold(i128::from(unallocated.milli()), |total, lot| {
                 total
-                    .checked_add(i128::from(lot.remaining))
-                    .ok_or(DomainError::InvalidField("qty"))
+                    .checked_add(i128::from(lot.remaining.milli()))
+                    .ok_or(DomainError::StockLimitExceeded { lot_id: None })
             })?;
-        let book = i64::try_from(total).map_err(|_| DomainError::InvalidField("qty"))?;
+        let book = stock_quantity(total, None)?;
         Ok(Self {
             lots,
             unallocated,
@@ -118,46 +138,75 @@ impl ItemBalance {
         &self.lots
     }
 
-    pub fn book(&self) -> i64 {
+    pub fn book(&self) -> Quantity {
         self.book
+    }
+
+    /// Add a newly created lot and retain FIFO order for subsequent lines.
+    pub fn receive(&mut self, lot_id: LotId, qty: Quantity) -> Result<(), DomainError> {
+        if qty <= Quantity::ZERO {
+            return Err(DomainError::InvalidField("qty"));
+        }
+        stock_quantity(i128::from(qty.milli()), None)?;
+        let book = i128::from(self.book.milli())
+            .checked_add(i128::from(qty.milli()))
+            .ok_or(DomainError::StockLimitExceeded { lot_id: None })?;
+        let book = stock_quantity(book, None)?;
+        let index = self.lots.partition_point(|lot| {
+            (lot.lot_id.date(), lot.lot_id.serial()) <= (lot_id.date(), lot_id.serial())
+        });
+        self.lots.insert(
+            index,
+            LotBalance {
+                lot_id,
+                remaining: qty,
+            },
+        );
+        self.book = book;
+        Ok(())
     }
 
     /// `specified` is the index of a previously validated lot in `lots()`.
     pub fn allocate(
         &mut self,
         specified: Option<usize>,
-        qty: i64,
+        qty: Quantity,
     ) -> Result<Vec<Allocation>, DomainError> {
-        // Check the net book after every line, including the final one.
-        let book = self
-            .book
-            .checked_sub(qty)
-            .ok_or(DomainError::InvalidField("qty"))?;
+        if qty <= Quantity::ZERO {
+            return Err(DomainError::InvalidField("qty"));
+        }
         if let Some(index) = specified {
             let lot = self
                 .lots
-                .get_mut(index)
+                .get(index)
                 .ok_or(DomainError::InvalidField("lot_id"))?;
-            let remaining = lot
-                .remaining
-                .checked_sub(qty)
-                .ok_or(DomainError::InvalidField("qty"))?;
-            lot.remaining = remaining;
+            let remaining = i128::from(lot.remaining.milli())
+                .checked_sub(i128::from(qty.milli()))
+                .ok_or_else(|| DomainError::StockLimitExceeded {
+                    lot_id: Some(lot.lot_id.clone()),
+                })?;
+            let remaining = stock_quantity(remaining, Some(&lot.lot_id))?;
+            let book = self.book_after_deduction(qty)?;
+            let lot_id = lot.lot_id.clone();
+            self.lots[index].remaining = remaining;
             self.book = book;
             return Ok(vec![Allocation {
-                lot_id: Some(lot.lot_id.clone()),
+                lot_id: Some(lot_id),
                 qty,
                 source: AllocationSource::Specified,
             }]);
         }
+        // FIFO only reduces positive lots toward zero, so only the net book and
+        // unallocated shortfall can cross a limit in this branch.
+        let book = self.book_after_deduction(qty)?;
         let mut remaining = qty;
         let mut alloc = Vec::new();
         let mut updates = Vec::new();
         for lot in &mut self.lots {
-            if remaining == 0 {
+            if remaining == Quantity::ZERO {
                 break;
             }
-            if lot.remaining <= 0 {
+            if lot.remaining <= Quantity::ZERO {
                 continue;
             }
             let qty = remaining.min(lot.remaining);
@@ -176,11 +225,11 @@ impl ItemBalance {
             updates.push((lot, lot_remaining));
         }
         let mut unallocated = self.unallocated;
-        if remaining > 0 {
-            unallocated = self
-                .unallocated
-                .checked_sub(remaining)
-                .ok_or(DomainError::InvalidField("qty"))?;
+        if remaining > Quantity::ZERO {
+            let total = i128::from(self.unallocated.milli())
+                .checked_sub(i128::from(remaining.milli()))
+                .ok_or(DomainError::StockLimitExceeded { lot_id: None })?;
+            unallocated = stock_quantity(total, None)?;
             alloc.push(Allocation {
                 lot_id: None,
                 qty: remaining,
@@ -193,6 +242,13 @@ impl ItemBalance {
         self.unallocated = unallocated;
         self.book = book;
         Ok(alloc)
+    }
+
+    fn book_after_deduction(&self, qty: Quantity) -> Result<Quantity, DomainError> {
+        let total = i128::from(self.book.milli())
+            .checked_sub(i128::from(qty.milli()))
+            .ok_or(DomainError::StockLimitExceeded { lot_id: None })?;
+        stock_quantity(total, None)
     }
 }
 
