@@ -222,7 +222,7 @@ mod tests {
         assert_string_enum::<equipment::MasterDataSource>(&["LOCAL", "HQ_PACKAGE"]);
         assert_string_enum::<master_data::BaseUnit>(&["g", "ml", "pcs"]);
         assert_string_enum::<master_data::ItemCategory>(&["RAW", "SEMI", "FINISHED"]);
-        assert_string_enum::<waste::AllocationSource>(&["SPECIFIED", "FIFO", "SHORTFALL"]);
+        assert_string_enum::<inventory::AllocationSource>(&["SPECIFIED", "FIFO", "SHORTFALL"]);
     }
 
     #[test]

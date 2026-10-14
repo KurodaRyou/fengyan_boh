@@ -1,13 +1,11 @@
 //! Submission and precheck share the same sequential, in-memory calculation.
 
-use std::collections::BTreeMap;
-
 use axum::http::StatusCode;
+use boh_domain::inventory::Allocation;
 use boh_domain::lot::LotId;
 use boh_domain::time::{CaptureTimes, business_date, calibrate};
 use boh_domain::waste::{
-    Allocation, AllocationSource, LogWaste, PrecheckWaste, WasteEffect, WasteLine, WasteLogged,
-    WasteRecord, WasteRequestLine,
+    LogWaste, PrecheckWaste, WasteEffect, WasteLine, WasteLogged, WasteRecord, WasteRequestLine,
 };
 use boh_domain::{AggregateId, EventId};
 use boh_storage::StorageError;
@@ -173,32 +171,16 @@ struct PrecheckedLine {
     alloc: Vec<Allocation>,
 }
 
-struct LotBalance {
-    lot_id: LotId,
-    remaining: i64,
-}
-
-struct ItemBalance {
-    lots: Vec<LotBalance>,
-    unallocated: i64,
-    book: i64,
-}
-
 fn calculate(
     conn: &Connection,
     requests: &[WasteRequestLine],
 ) -> Result<Vec<CalculatedLine>, ApiError> {
-    let mut balances = BTreeMap::new();
+    let mut balances = super::inventory::WorkingSet::default();
     let mut result = Vec::with_capacity(requests.len());
     for (index, line) in requests.iter().enumerate() {
         validate_references(conn, index, line)?;
-        if let std::collections::btree_map::Entry::Vacant(entry) = balances.entry(line.item_id) {
-            entry.insert(load_balance(conn, line.item_id)?);
-        }
-        let balance = balances
-            .get_mut(&line.item_id)
-            .ok_or_else(|| ApiError::internal_message("waste balance missing"))?;
-        if balance.lots.is_empty() {
+        let balance = balances.get(conn, line.item_id)?;
+        if balance.lots().is_empty() {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
                 "ITEM_HAS_NO_LOTS",
@@ -212,29 +194,24 @@ fn calculate(
             .as_ref()
             .map(|lot_id| {
                 balance
-                    .lots
+                    .lots()
                     .iter()
                     .position(|lot| &lot.lot_id == lot_id)
                     .ok_or_else(|| ApiError::internal_message("validated waste lot missing"))
             })
             .transpose()?;
-        let lot_book_qty = lot_index.map(|index| balance.lots[index].remaining);
+        let lot_book_qty = lot_index.map(|index| balance.lots()[index].remaining);
         let book = LineBook {
             line: index,
             item_id: line.item_id,
             lot_id: line.lot_id.clone(),
             qty,
-            item_book_qty: balance.book,
+            item_book_qty: balance.book(),
             lot_book_qty,
         };
-        let needs_confirmation = qty > balance.book || lot_book_qty.is_some_and(|book| qty > book);
-        // Check the net book after EVERY line, including the final line. SQL's
-        // SUM and addition can overflow or become REAL even if each component fits.
-        balance.book = balance
-            .book
-            .checked_sub(qty)
-            .ok_or_else(ApiError::validation)?;
-        let alloc = allocate(balance, lot_index, qty)?;
+        let needs_confirmation =
+            qty > balance.book() || lot_book_qty.is_some_and(|book| qty > book);
+        let alloc = super::inventory::allocate(balance, lot_index, qty)?;
         let logged = WasteLine {
             item_id: line.item_id,
             lot_id: line.lot_id.clone(),
@@ -253,105 +230,6 @@ fn calculate(
         });
     }
     Ok(result)
-}
-
-fn allocate(
-    balance: &mut ItemBalance,
-    specified: Option<usize>,
-    qty: i64,
-) -> Result<Vec<Allocation>, ApiError> {
-    if let Some(index) = specified {
-        let lot = &mut balance.lots[index];
-        lot.remaining = lot
-            .remaining
-            .checked_sub(qty)
-            .ok_or_else(ApiError::validation)?;
-        return Ok(vec![Allocation {
-            lot_id: Some(lot.lot_id.clone()),
-            qty,
-            source: AllocationSource::Specified,
-        }]);
-    }
-    let mut remaining = qty;
-    let mut alloc = Vec::new();
-    for lot in &mut balance.lots {
-        if remaining == 0 {
-            break;
-        }
-        if lot.remaining <= 0 {
-            continue;
-        }
-        let qty = remaining.min(lot.remaining);
-        lot.remaining = lot
-            .remaining
-            .checked_sub(qty)
-            .ok_or_else(ApiError::validation)?;
-        remaining = remaining
-            .checked_sub(qty)
-            .ok_or_else(ApiError::validation)?;
-        alloc.push(Allocation {
-            lot_id: Some(lot.lot_id.clone()),
-            qty,
-            source: AllocationSource::Fifo,
-        });
-    }
-    if remaining > 0 {
-        balance.unallocated = balance
-            .unallocated
-            .checked_sub(remaining)
-            .ok_or_else(ApiError::validation)?;
-        alloc.push(Allocation {
-            lot_id: None,
-            qty: remaining,
-            source: AllocationSource::Shortfall,
-        });
-    }
-    Ok(alloc)
-}
-
-fn load_balance(conn: &Connection, item_id: AggregateId) -> Result<ItemBalance, ApiError> {
-    let mut statement = conn.prepare(
-        "SELECT lot_id, remaining_qty FROM inventory_lots WHERE item_id = ?1 ORDER BY lot_date, lot_serial",
-    ).map_err(|error| StorageError::sqlite("准备查询报损批次", error))?;
-    let lots: Vec<LotBalance> = statement
-        .query_map([item_id.to_string()], |row| {
-            let lot_id = LotId::parse(&row.get::<_, String>(0)?).map_err(|error| {
-                boh_storage::rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    boh_storage::rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })?;
-            Ok(LotBalance {
-                lot_id,
-                remaining: row.get(1)?,
-            })
-        })
-        .map_err(|error| StorageError::sqlite("查询报损批次", error))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| StorageError::sqlite("读取报损批次", error))?;
-    let unallocated: i64 = conn
-        .query_row(
-            "SELECT qty FROM inventory_unallocated WHERE item_id = ?1",
-            [item_id.to_string()],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| StorageError::sqlite("查询报损账外缺口", error))?
-        .unwrap_or(0);
-    let total = lots
-        .iter()
-        .try_fold(i128::from(unallocated), |total, lot| {
-            total
-                .checked_add(i128::from(lot.remaining))
-                .ok_or_else(ApiError::validation)
-        })?;
-    let book = i64::try_from(total).map_err(|_| ApiError::validation())?;
-    Ok(ItemBalance {
-        lots,
-        unallocated,
-        book,
-    })
 }
 
 fn validate_references(

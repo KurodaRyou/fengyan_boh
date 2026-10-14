@@ -1,9 +1,7 @@
 //! Waste projection: consume persisted effects without making allocation decisions.
 
-use boh_domain::lot::LotId;
 use boh_domain::waste::{WasteEffect, WasteLogged};
-use boh_domain::{AggregateId, EventId};
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::Transaction;
 
 use crate::StorageError;
 use crate::ledger::Event;
@@ -13,132 +11,16 @@ pub(crate) fn apply(tx: &Transaction<'_>, event: &Event) -> Result<(), StorageEr
         return Err(invalid("unsupported waste aggregate version"));
     }
     let payload = payload(&event.payload)?;
-    let seq: i64 = tx
-        .query_row(
-            "SELECT seq FROM store_events WHERE id = ?1",
-            [event.id.to_string()],
-            |row| row.get(0),
-        )
-        .map_err(|error| StorageError::sqlite("查询报损事件序号", error))?;
-    let mut movement_no = 0_i64;
+    let mut movements = crate::inventory::Movements::new(tx, event)?;
     for line in payload.lines {
         match line.effect {
             WasteEffect::Absorbed(id) => {
-                insert_movement(
-                    tx,
-                    event,
-                    Movement {
-                        seq,
-                        number: movement_no,
-                        item_id: line.item_id,
-                        lot_id: None,
-                        source: "ABSORBED",
-                        qty: line.qty,
-                        absorber: Some(id),
-                    },
-                )?;
-                movement_no = next_movement(movement_no)?;
+                movements.absorbed(tx, "WASTE", line.item_id, line.qty, id)?
             }
-            WasteEffect::Alloc(alloc) => {
-                for part in alloc {
-                    if let Some(lot_id) = &part.lot_id {
-                        let current: i64 = tx
-                            .query_row(
-                                "SELECT remaining_qty FROM inventory_lots WHERE lot_id = ?1",
-                                [lot_id.to_string()],
-                                |row| row.get(0),
-                            )
-                            .map_err(|error| StorageError::sqlite("查询报损批次余量", error))?;
-                        let remaining = current
-                            .checked_sub(part.qty)
-                            .ok_or_else(|| invalid("waste lot quantity overflow"))?;
-                        tx.execute(
-                            "UPDATE inventory_lots SET remaining_qty = ?2 WHERE lot_id = ?1",
-                            params![lot_id.to_string(), remaining],
-                        )
-                        .map_err(|error| StorageError::sqlite("扣减报损批次余量", error))?;
-                    } else {
-                        let current: Option<i64> = tx
-                            .query_row(
-                                "SELECT qty FROM inventory_unallocated WHERE item_id = ?1",
-                                [line.item_id.to_string()],
-                                |row| row.get(0),
-                            )
-                            .optional()
-                            .map_err(|error| StorageError::sqlite("查询报损账外缺口", error))?;
-                        let remaining = current
-                            .unwrap_or(0)
-                            .checked_sub(part.qty)
-                            .ok_or_else(|| invalid("waste unallocated quantity overflow"))?;
-                        match current {
-                            Some(_) => {
-                                tx.execute(
-                                    "UPDATE inventory_unallocated SET qty = ?2 WHERE item_id = ?1",
-                                    params![line.item_id.to_string(), remaining],
-                                )
-                                .map_err(|error| StorageError::sqlite("扣减报损账外缺口", error))?;
-                            }
-                            None => {
-                                tx.execute("INSERT INTO inventory_unallocated (item_id, qty) VALUES (?1, ?2)", params![line.item_id.to_string(), remaining])
-                                    .map_err(|error| StorageError::sqlite("插入报损账外缺口", error))?;
-                            }
-                        }
-                    }
-                    insert_movement(
-                        tx,
-                        event,
-                        Movement {
-                            seq,
-                            number: movement_no,
-                            item_id: line.item_id,
-                            lot_id: part.lot_id.as_ref(),
-                            source: part.source.as_str(),
-                            qty: part.qty,
-                            absorber: None,
-                        },
-                    )?;
-                    movement_no = next_movement(movement_no)?;
-                }
-            }
+            WasteEffect::Alloc(alloc) => movements.deduct(tx, "WASTE", line.item_id, &alloc)?,
         }
     }
     Ok(())
-}
-
-struct Movement<'a> {
-    seq: i64,
-    number: i64,
-    item_id: AggregateId,
-    lot_id: Option<&'a LotId>,
-    source: &'static str,
-    qty: i64,
-    absorber: Option<EventId>,
-}
-
-fn insert_movement(
-    tx: &Transaction<'_>,
-    event: &Event,
-    row: Movement<'_>,
-) -> Result<(), StorageError> {
-    let nominal = row
-        .qty
-        .checked_neg()
-        .ok_or_else(|| invalid("waste movement quantity overflow"))?;
-    tx.execute(
-        "INSERT INTO inventory_movements (event_seq, movement_no, item_id, lot_id, kind, alloc_source,
-             nominal_qty, qty_delta, absorbed_by_event_id, physical_at, business_date)
-         VALUES (?1, ?2, ?3, ?4, 'WASTE', ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![row.seq, row.number, row.item_id.to_string(), row.lot_id.map(ToString::to_string), row.source,
-            nominal, if row.absorber.is_some() { 0 } else { nominal }, row.absorber.map(|id| id.to_string()),
-            event.occurred_at.0, event.business_date],
-    ).map_err(|error| StorageError::sqlite("插入报损库存流水", error))?;
-    Ok(())
-}
-
-fn next_movement(number: i64) -> Result<i64, StorageError> {
-    number
-        .checked_add(1)
-        .ok_or_else(|| invalid("waste movement number overflow"))
 }
 
 fn invalid(message: &str) -> StorageError {

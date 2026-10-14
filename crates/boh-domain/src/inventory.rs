@@ -1,9 +1,13 @@
-//! Inventory query parameters and response rows.
+//! Inventory queries and pure command-local stock rules.
 
 use serde::{Deserialize, Serialize};
 
 use crate::lot::LotId;
-use crate::{AggregateId, UnixMillis};
+use crate::{AggregateId, DomainError, UnixMillis};
+
+#[cfg(test)]
+#[path = "inventory_tests.rs"]
+mod tests;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,4 +46,146 @@ pub struct InventoryItem {
 pub struct Inventory {
     pub business_date: String,
     pub items: Vec<InventoryItem>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AllocationSource {
+    Specified,
+    Fifo,
+    Shortfall,
+}
+string_enum_serde!(AllocationSource);
+
+impl AllocationSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Specified => "SPECIFIED",
+            Self::Fifo => "FIFO",
+            Self::Shortfall => "SHORTFALL",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
+pub struct Allocation {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::present"
+    )]
+    pub lot_id: Option<LotId>,
+    pub qty: i64,
+    pub source: AllocationSource,
+}
+object_serde!(Allocation);
+
+/// A lot balance supplied in FIFO order by the decision-reading layer.
+#[derive(Debug)]
+pub struct LotBalance {
+    pub lot_id: LotId,
+    pub remaining: i64,
+}
+
+/// Mutable state for one item within one command. Discard it if allocation fails.
+#[derive(Debug)]
+pub struct ItemBalance {
+    lots: Vec<LotBalance>,
+    unallocated: i64,
+    book: i64,
+}
+
+impl ItemBalance {
+    pub fn new(lots: Vec<LotBalance>, unallocated: i64) -> Result<Self, DomainError> {
+        // Intermediate sums may exceed i64 even when the final book fits.
+        let total = lots
+            .iter()
+            .try_fold(i128::from(unallocated), |total, lot| {
+                total
+                    .checked_add(i128::from(lot.remaining))
+                    .ok_or(DomainError::InvalidField("qty"))
+            })?;
+        let book = i64::try_from(total).map_err(|_| DomainError::InvalidField("qty"))?;
+        Ok(Self {
+            lots,
+            unallocated,
+            book,
+        })
+    }
+
+    pub fn lots(&self) -> &[LotBalance] {
+        &self.lots
+    }
+
+    pub fn book(&self) -> i64 {
+        self.book
+    }
+
+    /// `specified` is the index of a previously validated lot in `lots()`.
+    pub fn allocate(
+        &mut self,
+        specified: Option<usize>,
+        qty: i64,
+    ) -> Result<Vec<Allocation>, DomainError> {
+        // Check the net book after every line, including the final one.
+        self.book = self
+            .book
+            .checked_sub(qty)
+            .ok_or(DomainError::InvalidField("qty"))?;
+        if let Some(index) = specified {
+            let lot = &mut self.lots[index];
+            lot.remaining = lot
+                .remaining
+                .checked_sub(qty)
+                .ok_or(DomainError::InvalidField("qty"))?;
+            return Ok(vec![Allocation {
+                lot_id: Some(lot.lot_id.clone()),
+                qty,
+                source: AllocationSource::Specified,
+            }]);
+        }
+        let mut remaining = qty;
+        let mut alloc = Vec::new();
+        for lot in &mut self.lots {
+            if remaining == 0 {
+                break;
+            }
+            if lot.remaining <= 0 {
+                continue;
+            }
+            let qty = remaining.min(lot.remaining);
+            lot.remaining = lot
+                .remaining
+                .checked_sub(qty)
+                .ok_or(DomainError::InvalidField("qty"))?;
+            remaining = remaining
+                .checked_sub(qty)
+                .ok_or(DomainError::InvalidField("qty"))?;
+            alloc.push(Allocation {
+                lot_id: Some(lot.lot_id.clone()),
+                qty,
+                source: AllocationSource::Fifo,
+            });
+        }
+        if remaining > 0 {
+            self.unallocated = self
+                .unallocated
+                .checked_sub(remaining)
+                .ok_or(DomainError::InvalidField("qty"))?;
+            alloc.push(Allocation {
+                lot_id: None,
+                qty: remaining,
+                source: AllocationSource::Shortfall,
+            });
+        }
+        Ok(alloc)
+    }
+}
+
+/// Increment the existing maximum serial for one item and one lot date.
+pub fn next_lot_serial(last: i64) -> Result<i64, DomainError> {
+    last.checked_add(1)
+        .filter(|serial| *serial <= 999)
+        .ok_or(DomainError::InvalidField("lot_serial"))
 }
