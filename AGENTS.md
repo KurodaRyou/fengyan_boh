@@ -217,6 +217,14 @@ scripts/        CI 扫描脚本。
 
 ## 不可违反的规则
 
+### 开发阶段与上线
+- **上线**指第一家门店节点开始记录真实业务。当前状态：**尚未上线**。上线时由人在这里写明日期。
+- 上线之前没有业务数据。任何结构变动都直接修改，不升版本号，不做新旧兼容：
+  - 事件 payload 直接改结构，不升 `schema_version`，不写 upcast；
+  - 迁移直接改已有文件，不新增编号；
+  - golden 样本、schema 测试的校验和、锁定测试及其他测试随之修改（锁定路径照常经 `spec:` / `docs:` 提交，预期值由人确认）。开发库和测试数据直接重建。
+- 上线之后，「迁移」「只追加」中禁止修改迁移文件和事件 payload 结构的规则生效。
+
 ### SQLite
 - 每个连接打开时都设置（见 `boh-storage/src/connection.rs`；备份校验连接例外，见下）：
   `journal_mode = WAL`、`busy_timeout = 5000`、`synchronous = FULL`、`foreign_keys = ON`、`recursive_triggers = ON`。
@@ -252,7 +260,7 @@ scripts/        CI 扫描脚本。
 - 结果只放在进程内存中，经 `/health` 报告；不写数据库，不自动修复。发现违规或检查失败都不拒绝启动、不阻止写入和备份、不让进程退出或重启。
 
 ### 迁移
-- 迁移文件一旦发布（合并到主干）**禁止修改**，只能新增下一个编号的文件。schema 测试对每个迁移文件做内容校验和。
+- 上线之后，迁移文件**禁止修改**，只能新增下一个编号的文件（上线之前见「开发阶段与上线」）。schema 测试对每个迁移文件做内容校验和。
 - 每个迁移在一个事务中执行并设置 `user_version`。数据库版本高于程序支持的版本时**拒绝启动**。
 - 先写迁移和 schema 测试（`crates/boh-storage/tests/schema.rs`），测试通过、schema 锁定后再写业务实现。
 
@@ -284,7 +292,7 @@ scripts/        CI 扫描脚本。
     - golden 锁定的类型同时约束写入端和重放端；upcast 在类型上进行。
 - 主数据也走事件流（`MASTER_DATA_CHANGED`），主数据表是投影。
   例外：员工凭据、设备注册、会话等认证状态表不进事件流、不同步、不参与重建。
-- 事件 payload 结构一旦发布不得修改：改结构只能升 `schema_version`，再写 upcast。
+- 上线之后，事件 payload 结构不得修改：改结构只能升 `schema_version`，再写 upcast（上线之前见「开发阶段与上线」）。
   - 例外：`GOODS_RECEIVED@1` 缺少生成批次号所需的信息，不能 upcast，也不推测；账本中有 `@1` 收货时，迁移 007 报错、节点拒绝启动（见 `docs/domain.md`「收货接口」）。
 
 ### 幂等
@@ -458,7 +466,7 @@ ARM 门店机改用 `aarch64-unknown-linux-musl`。部署文件见 `deploy/`。
   修改预期值、删除用例、加 `#[ignore]`、用 `cfg` / feature 排除、在 `Cargo.toml` 中设置 `test = false` / `autotests = false`、改 CI 让测试不运行。
 - 以上两条由 Claude review 逐个提交核对，Codex 不报。
   - Codex review 看到的是整个 PR 压成的一个提交（作者为 Codex，提交信息取 PR 标题），分不出改动属于哪个提交，报出的都是误报。
-- 修改已合入 `main` 的迁移文件。
+- 上线之后修改已合入 `main` 的迁移文件。
 
 **P1**
 - 违反「不可违反的规则」任一条，例如：另开写连接、绕过 `Ledger::append` 写 `store_events`、闭包内做网络 I/O 或 sleep、
@@ -467,4 +475,4 @@ ARM 门店机改用 `aarch64-unknown-linux-musl`。部署文件见 `deploy/`。
 - 写命令缺少幂等处理，或缺少重复提交同一 `command_id` 的测试。
 - 认证接口、PIN 或令牌可经明文 HTTP 访问或传输。
 
-`spec:` / `docs:` 提交是设计变更：检查内容是否自洽、是否与 `docs/domain.md`、`docs/auth.md` 一致；其中修改已合入的迁移仍按 P0 处理。
+`spec:` / `docs:` 提交是设计变更：检查内容是否自洽、是否与 `docs/domain.md`、`docs/auth.md` 一致；其中上线之后修改已合入的迁移仍按 P0 处理。
