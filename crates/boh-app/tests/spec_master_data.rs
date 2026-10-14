@@ -63,15 +63,15 @@ const ITEM: Entity = Entity {
         let fields = json!({
             "name": "高筋面粉", "base_unit": "g", "category": "RAW",
             "default_shelf_life_ms": 15_552_000_000_i64,
-            "units": [{ "unit_code": "bag", "base_qty_per_unit": 25000 }],
+            "units": [{ "unit_code": "bag", "base_qty_per_unit": "25000" }],
             "active": true,
         });
         (fields.clone(), fields)
     },
     updated: |_| {
         let units = json!([
-            { "unit_code": "bag", "base_qty_per_unit": 20000 },
-            { "unit_code": "box", "base_qty_per_unit": 1000 },
+            { "unit_code": "bag", "base_qty_per_unit": "20000" },
+            { "unit_code": "box", "base_qty_per_unit": "1000" },
         ]);
         (
             json!({ "name": "高筋面粉 T65", "category": "SEMI", "units": units, "active": false }),
@@ -84,7 +84,7 @@ const ITEM: Entity = Entity {
     unchanged: |_| {
         json!({
             "name": "高筋面粉", "category": "RAW", "default_shelf_life_ms": 15_552_000_000_i64,
-            "units": [{ "unit_code": "bag", "base_qty_per_unit": 25000 }],
+            "units": [{ "unit_code": "bag", "base_qty_per_unit": "25000" }],
             "active": true,
         })
     },
@@ -102,8 +102,11 @@ const RECIPE: Entity = Entity {
         (
             json!({
                 "name": "吐司", "output_item_id": refs.toast, "active": true,
-                "output_qty_per_batch": 12,
-                "lines": [{ "item_id": refs.flour, "qty_per_batch": 3000 }],
+                "output_input": { "qty": "12", "unit_code": "g", "base_qty_per_unit": "1" },
+                "lines": [{
+                    "item_id": refs.flour,
+                    "input": { "qty": "3000", "unit_code": "g", "base_qty_per_unit": "1" },
+                }],
             }),
             recipe_snapshot(refs, "吐司", true),
         )
@@ -163,8 +166,12 @@ fn recipe_snapshot(refs: &Refs, name: &str, active: bool) -> Value {
     json!({
         "name": name, "output_item_id": refs.toast,
         "versions": [{
-            "version": 1, "output_qty_per_batch": 12,
-            "lines": [{ "item_id": refs.flour, "qty_per_batch": 3000 }],
+            "version": 1, "output_qty_per_batch": "12",
+            "output_input": { "qty": "12", "unit_code": "g", "base_qty_per_unit": "1" },
+            "lines": [{
+                "item_id": refs.flour, "qty_per_batch": "3000",
+                "input": { "qty": "3000", "unit_code": "g", "base_qty_per_unit": "1" },
+            }],
         }],
         "active": active,
     })

@@ -288,6 +288,90 @@ pub fn non_canonical_uuids(id: &str) -> [String; 4] {
     ]
 }
 
+/// domain.md「数量」小数字符串的公共非法写法：不是字符串、正号、指数、空白、前导零、缺整数或小数部分、负零、
+/// 非 ASCII 数字、分隔符、非数字文本。对数量和换算系数都非法。
+fn invalid_decimal_texts() -> Vec<(&'static str, Value)> {
+    vec![
+        ("JSON integer", Value::from(5)),
+        ("JSON fraction", serde_json::json!(5.5)),
+        ("null", Value::Null),
+        ("bool", Value::Bool(true)),
+        ("array", Value::Array(vec![Value::from("5")])),
+        ("object", Value::Object(Map::new())),
+        ("empty", Value::from("")),
+        ("plus sign", Value::from("+5")),
+        ("exponent", Value::from("5e3")),
+        ("upper exponent", Value::from("5E3")),
+        ("leading space", Value::from(" 5")),
+        ("trailing space", Value::from("5 ")),
+        ("trailing newline", Value::from("5\n")),
+        ("leading zero", Value::from("05")),
+        ("leading zeros in fraction form", Value::from("00.5")),
+        ("missing integer part", Value::from(".5")),
+        ("missing fraction digits", Value::from("5.")),
+        ("negative zero", Value::from("-0")),
+        ("negative zero fraction", Value::from("-0.0")),
+        ("double dot", Value::from("5..5")),
+        ("comma separator", Value::from("1,000")),
+        ("underscore separator", Value::from("1_000")),
+        ("decimal comma", Value::from("5,5")),
+        ("fullwidth digit", Value::from("５")),
+        ("arabic-indic digit", Value::from("٥")),
+        ("hex", Value::from("0x10")),
+        ("nan", Value::from("NaN")),
+        ("infinity", Value::from("Infinity")),
+        ("minus only", Value::from("-")),
+        ("dot only", Value::from(".")),
+        ("unit suffix", Value::from("5g")),
+    ]
+}
+
+/// 录入数量 `input.qty`（domain.md「单位」取值）不接受的写法：公共非法写法，加上 0、负数、超过 3 位小数、超过录入上限 9999.999、
+/// 远超 i64 的整数。
+pub fn invalid_input_qty_texts() -> Vec<(&'static str, Value)> {
+    let mut cases = invalid_decimal_texts();
+    cases.extend([
+        ("zero", Value::from("0")),
+        ("zero with fraction", Value::from("0.000")),
+        ("negative", Value::from("-1")),
+        ("negative fraction", Value::from("-0.5")),
+        ("four decimals", Value::from("1.0001")),
+        ("four decimals with trailing zero", Value::from("1.5000")),
+        ("above entry limit", Value::from("10000")),
+        ("above entry limit with fraction", Value::from("9999.9991")),
+        (
+            "above entry limit by trailing zeros",
+            Value::from("10000.000"),
+        ),
+        ("beyond i64", Value::from("99999999999999999999999")),
+    ]);
+    cases
+}
+
+/// 换算系数 `base_qty_per_unit`（domain.md「单位」）不接受的写法：公共非法写法，加上 0、负数、超过 9 位小数、超过上限 10^9、
+/// 远超 i64 的整数。
+pub fn invalid_factor_texts() -> Vec<(&'static str, Value)> {
+    let mut cases = invalid_decimal_texts();
+    cases.extend([
+        ("zero", Value::from("0")),
+        ("zero with fraction", Value::from("0.000000000")),
+        ("negative", Value::from("-1")),
+        ("ten decimals", Value::from("1.0000000001")),
+        ("ten decimals below one", Value::from("0.0000000001")),
+        (
+            "ten decimals by trailing zero",
+            Value::from("28.3495231250"),
+        ),
+        ("above limit", Value::from("1000000001")),
+        (
+            "above limit by a fraction",
+            Value::from("1000000000.000000001"),
+        ),
+        ("beyond i64", Value::from("99999999999999999999999")),
+    ]);
+    cases
+}
+
 /// 执行查询，按列取出全部行。
 pub fn rows(conn: &Connection, sql: &str) -> rusqlite::Result<Vec<Vec<SqlValue>>> {
     let mut statement = conn.prepare(sql)?;

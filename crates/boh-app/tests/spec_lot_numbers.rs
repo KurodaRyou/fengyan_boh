@@ -59,7 +59,7 @@ fn cmd(n: u16) -> String {
 fn line(item_id: &str, qty: i64, expires_on: &str) -> Value {
     json!({
         "item_id": item_id,
-        "input": { "qty": qty, "unit_code": "g", "base_qty_per_unit": 1 },
+        "input": { "qty": qty.to_string(), "unit_code": "g", "base_qty_per_unit": "1" },
         "produced_on": "2026-09-01", "expires_on": expires_on, "line_cost_cents": 100,
     })
 }
@@ -655,7 +655,7 @@ async fn expiry_warning_ignores_lots_without_positive_remaining() {
                 "command_id": cmd(n), "captured_at": NOW + SKEW, "sent_at": NOW + SKEW,
                 "lines": [{
                     "item_id": flour, "lot_id": lot_id,
-                    "input": { "qty": qty, "unit_code": "g", "base_qty_per_unit": 1 },
+                    "input": { "qty": qty.to_string(), "unit_code": "g", "base_qty_per_unit": "1" },
                     "reason_code": "EXPIRED", "confirm_shortage": true,
                 }],
             }),
