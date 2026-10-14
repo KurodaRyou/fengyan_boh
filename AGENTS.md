@@ -111,7 +111,7 @@
 
 ### 路线图
 
-已完成：write path 与基础设施；设备主数据（walking skeleton）；温度记录；备份与 `/health`；其余主数据（物料、配方、供应商、报损原因）与库存投影；收货与批次号；库存明细与批次查询；报损；不变量自检。迁移到 007。
+已完成：write path 与基础设施；设备主数据（walking skeleton）；温度记录；备份与 `/health`；其余主数据（物料、配方、供应商、报损原因）与库存投影；收货与批次号；库存明细与批次查询；报损；不变量自检；库存规则归属。迁移到 007。
 
 当前实现边界：
 - `init` 写入 `store_meta` 和预置报损原因；第一个店长随认证切片加入。
@@ -121,8 +121,7 @@
 - `MASTER_DATA_CHANGED` 只有 `source = LOCAL` 的写入口。
 
 待做，按顺序：
-1. 库存规则归属（把报损、收货中多个命令共用的库存规则按模块归属提取出来，行为不变）→ 定点小数（数量支持 3 位小数、录入上限、库存状态上限）→ 盘点（含盘点吸收：已有的报损一并实现吸收判定）→ 局域网 HTTPS → 员工认证（`EMPLOYEE` 投影、写接口、golden 样本与第一个店长）。
-   - 库存规则归属排在定点小数和盘点之前：两者都要改动库存规则，先收归到共享模块，减少各命令中的重复修改。
+1. 定点小数（数量支持 3 位小数、小数换算系数、录入上限、库存状态上限）→ 盘点（含盘点吸收：已有的报损一并实现吸收判定）→ 局域网 HTTPS → 员工认证（`EMPLOYEE` 投影、写接口、golden 样本与第一个店长）。
 2. 扩展：生产 → 纠错（冲销、数量更正）→ 补录入口 → 销售导入。每一步配对应的验收用例。
 
 ---
@@ -312,7 +311,11 @@ scripts/        CI 扫描脚本。
 
 ### 数值
 - **禁止浮点数参与业务计算**（clippy `float_arithmetic = deny`）。
-- 金额：`i64`，单位“分”。重量 / 体积 / 数量：`i64`，单位为该物料的最小单位（克、毫升、个）。
+- 金额：`i64`，单位“分”。
+- 数量（重量 / 体积 / 个数）：基本单位（克、毫升、个）的定点小数，最多 3 位小数，存千分之一基本单位的 `i64`。
+- 换算系数：最多 9 位小数，存十亿分之一基本单位的 `i64`。
+- 数量和换算系数在事件 payload 与 HTTP 中写成小数字符串，格式、上限与舍入见 `docs/domain.md`「数量」「单位」。
+- 只在 `docs/domain.md` 规定的位置舍入（单位换算）；定点乘法的中间值用 `i128`，舍入后再转回 `i64`。
 - `[profile.release] overflow-checks = true`；业务计算一律用 `checked_*`。
 
 ### Rust
@@ -382,6 +385,7 @@ scripts/        CI 扫描脚本。
 - 警告不改变 `success`。警告码见 `docs/domain.md`：`STOCK_SHORTFALL`、`ABSORBED_BY_COUNT`、`EXPIRES_BEFORE_OLDER_STOCK`、`CAPTURE_TIME_ADJUSTED`。
 - 错误对象包含 `code`、`message`、`details`；`details` 总是存在，没有明细时为 `{}`。
 - HTTP 状态码要和语义一致：校验失败 400、不存在 404、幂等冲突与业务冲突 409、内部错误 500。`code` 是稳定的大写蛇形字符串，客户端按 `code` 判断，不按 `message`。
+- 数量和换算系数一律用小数字符串，不用 JSON 数字；金额用 JSON 整数（分）。见 `docs/domain.md`「数量」。
 - 通用错误码：结构或取值错误 `400 VALIDATION_FAILED`；引用的实体不存在 `404 REFERENCE_NOT_FOUND`。
 - 其他通用错误码：未匹配的路由 `404 ROUTE_NOT_FOUND`；方法不允许 `405 METHOD_NOT_ALLOWED`；内部错误 `500 INTERNAL_ERROR`；缺少或无效的身份 `401 UNAUTHENTICATED`；角色不够 `403 FORBIDDEN`。
 - 身份与权限通过后，请求体不是合法 JSON、缺少 `Content-Type: application/json`、字段缺失、未知字段、类型或取值不对，以及路径参数无法解析，一律 `400 VALIDATION_FAILED`。
