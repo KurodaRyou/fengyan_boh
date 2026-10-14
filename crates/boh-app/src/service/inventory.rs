@@ -9,7 +9,7 @@ use boh_domain::inventory::{
 };
 use boh_domain::lot::LotId;
 use boh_domain::master_data::ItemCategory;
-use boh_domain::time::business_date;
+use boh_domain::time::{BusinessDate, business_date};
 use boh_domain::{AggregateId, DomainError, UnixMillis};
 use boh_storage::StorageError;
 use boh_storage::rusqlite::{Connection, OptionalExtension, Row, params};
@@ -165,7 +165,7 @@ pub(super) fn allocate(
 fn load_balance(conn: &Connection, item_id: AggregateId) -> Result<ItemBalance, ApiError> {
     let mut statement = conn.prepare(
         "SELECT lot_id, remaining_qty FROM inventory_lots WHERE item_id = ?1 ORDER BY lot_date, lot_serial",
-    ).map_err(|error| StorageError::sqlite("准备查询报损批次", error))?;
+    ).map_err(|error| StorageError::sqlite("准备查询库存批次", error))?;
     let lots: Vec<LotBalance> = statement
         .query_map([item_id.to_string()], |row| {
             let lot_id = LotId::parse(&row.get::<_, String>(0)?).map_err(|error| {
@@ -180,9 +180,9 @@ fn load_balance(conn: &Connection, item_id: AggregateId) -> Result<ItemBalance, 
                 remaining: row.get(1)?,
             })
         })
-        .map_err(|error| StorageError::sqlite("查询报损批次", error))?
+        .map_err(|error| StorageError::sqlite("查询库存批次", error))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| StorageError::sqlite("读取报损批次", error))?;
+        .map_err(|error| StorageError::sqlite("读取库存批次", error))?;
     let unallocated: i64 = conn
         .query_row(
             "SELECT qty FROM inventory_unallocated WHERE item_id = ?1",
@@ -190,23 +190,30 @@ fn load_balance(conn: &Connection, item_id: AggregateId) -> Result<ItemBalance, 
             |row| row.get(0),
         )
         .optional()
-        .map_err(|error| StorageError::sqlite("查询报损账外缺口", error))?
+        .map_err(|error| StorageError::sqlite("查询库存账外缺口", error))?
         .unwrap_or(0);
     ItemBalance::new(lots, unallocated).map_err(|_| ApiError::validation())
 }
 
 /// One command's serials for its single, calibrated lot date.
-pub(super) struct LotNumbers<'a> {
-    calendar_date: &'a str,
+pub(super) struct LotNumbers {
+    lot_date: BusinessDate,
+    calendar_date: String,
     last_serials: BTreeMap<AggregateId, i64>,
 }
 
-impl<'a> LotNumbers<'a> {
-    pub(super) fn new(calendar_date: &'a str) -> Self {
+impl LotNumbers {
+    pub(super) fn new(lot_date: BusinessDate) -> Self {
+        let calendar_date = lot_date.to_string();
         Self {
+            lot_date,
             calendar_date,
             last_serials: BTreeMap::new(),
         }
+    }
+
+    pub(super) fn calendar_date(&self) -> &str {
+        &self.calendar_date
     }
 
     pub(super) fn allocate(
@@ -239,12 +246,7 @@ impl<'a> LotNumbers<'a> {
             )
         })?;
         self.last_serials.insert(item_id, serial);
-        // The caller supplies the canonical date from local_date(occurred_at).
-        let lot_date = self
-            .calendar_date
-            .parse()
-            .map_err(|error| StorageError::external("解析批次日期", error))?;
-        LotId::from_parts(category, code, lot_date, serial)
+        LotId::from_parts(category, code, self.lot_date.date(), serial)
             .map_err(|error| ApiError::from(StorageError::from(error)))
     }
 }

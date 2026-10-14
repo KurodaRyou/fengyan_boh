@@ -11,13 +11,12 @@ pub(crate) fn apply(tx: &Transaction<'_>, event: &Event) -> Result<(), StorageEr
         return Err(invalid("unsupported waste aggregate version"));
     }
     let payload = payload(&event.payload)?;
-    let mut movements = crate::inventory::Movements::new(tx, event)?;
+    let mut movements =
+        crate::inventory::Movements::new(tx, event, crate::inventory::MovementKind::Waste)?;
     for line in payload.lines {
         match line.effect {
-            WasteEffect::Absorbed(id) => {
-                movements.absorbed(tx, "WASTE", line.item_id, line.qty, id)?
-            }
-            WasteEffect::Alloc(alloc) => movements.deduct(tx, "WASTE", line.item_id, &alloc)?,
+            WasteEffect::Absorbed(id) => movements.absorbed(line.item_id, line.qty, id)?,
+            WasteEffect::Alloc(alloc) => movements.deduct(line.item_id, &alloc)?,
         }
     }
     Ok(())

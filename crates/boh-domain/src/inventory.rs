@@ -88,7 +88,7 @@ pub struct LotBalance {
     pub remaining: i64,
 }
 
-/// Mutable state for one item within one command. Discard it if allocation fails.
+/// Mutable state for one item within one command. Failed allocations leave it unchanged.
 #[derive(Debug)]
 pub struct ItemBalance {
     lots: Vec<LotBalance>,
@@ -129,16 +129,21 @@ impl ItemBalance {
         qty: i64,
     ) -> Result<Vec<Allocation>, DomainError> {
         // Check the net book after every line, including the final one.
-        self.book = self
+        let book = self
             .book
             .checked_sub(qty)
             .ok_or(DomainError::InvalidField("qty"))?;
         if let Some(index) = specified {
-            let lot = &mut self.lots[index];
-            lot.remaining = lot
+            let lot = self
+                .lots
+                .get_mut(index)
+                .ok_or(DomainError::InvalidField("lot_id"))?;
+            let remaining = lot
                 .remaining
                 .checked_sub(qty)
                 .ok_or(DomainError::InvalidField("qty"))?;
+            lot.remaining = remaining;
+            self.book = book;
             return Ok(vec![Allocation {
                 lot_id: Some(lot.lot_id.clone()),
                 qty,
@@ -147,6 +152,7 @@ impl ItemBalance {
         }
         let mut remaining = qty;
         let mut alloc = Vec::new();
+        let mut updates = Vec::new();
         for lot in &mut self.lots {
             if remaining == 0 {
                 break;
@@ -155,7 +161,7 @@ impl ItemBalance {
                 continue;
             }
             let qty = remaining.min(lot.remaining);
-            lot.remaining = lot
+            let lot_remaining = lot
                 .remaining
                 .checked_sub(qty)
                 .ok_or(DomainError::InvalidField("qty"))?;
@@ -167,9 +173,11 @@ impl ItemBalance {
                 qty,
                 source: AllocationSource::Fifo,
             });
+            updates.push((lot, lot_remaining));
         }
+        let mut unallocated = self.unallocated;
         if remaining > 0 {
-            self.unallocated = self
+            unallocated = self
                 .unallocated
                 .checked_sub(remaining)
                 .ok_or(DomainError::InvalidField("qty"))?;
@@ -179,6 +187,11 @@ impl ItemBalance {
                 source: AllocationSource::Shortfall,
             });
         }
+        for (lot, remaining) in updates {
+            lot.remaining = remaining;
+        }
+        self.unallocated = unallocated;
+        self.book = book;
         Ok(alloc)
     }
 }

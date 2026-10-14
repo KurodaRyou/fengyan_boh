@@ -94,6 +94,12 @@ pub struct BusinessDayCutoff(Time);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BusinessDate(Date);
 
+impl BusinessDate {
+    pub fn date(&self) -> Date {
+        self.0
+    }
+}
+
 impl fmt::Display for BusinessDate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)

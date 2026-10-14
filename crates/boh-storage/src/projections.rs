@@ -117,23 +117,20 @@ fn apply_receipt(tx: &Transaction<'_>, event: &Event) -> Result<(), StorageError
         ));
     }
     let payload = receipt_payload(&event.payload)?;
-    let mut movements = crate::inventory::Movements::new(tx, event)?;
+    let mut movements =
+        crate::inventory::Movements::new(tx, event, crate::inventory::MovementKind::Receipt)?;
     for (index, line) in payload.lines.into_iter().enumerate() {
         let index = i64::try_from(index)
             .map_err(|_| StorageError::InvalidEvent("receipt line number overflow".into()))?;
-        movements.new_lot(
-            tx,
-            "RECEIPT",
-            crate::inventory::NewLot {
-                lot_id: &line.lot_id,
-                item_id: line.item_id,
-                source_line_no: index,
-                origin: "RECEIPT",
-                qty: line.qty,
-                expires_at: Some(line.expires_at),
-                manufacturer_lot_no: line.manufacturer_lot_no.as_deref(),
-            },
-        )?;
+        movements.new_lot(crate::inventory::NewLot {
+            lot_id: &line.lot_id,
+            item_id: line.item_id,
+            source_line_no: index,
+            origin: crate::inventory::LotOrigin::Receipt,
+            qty: line.qty,
+            expires_at: Some(line.expires_at),
+            manufacturer_lot_no: line.manufacturer_lot_no.as_deref(),
+        })?;
     }
     Ok(())
 }

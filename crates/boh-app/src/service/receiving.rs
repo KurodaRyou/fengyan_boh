@@ -49,8 +49,7 @@ pub async fn create(
                         &state.timezone,
                         state.business_day_cutoff,
                     )?;
-                    let calendar_date =
-                        local_date(calibrated.occurred_at, &state.timezone)?.to_string();
+                    let calendar_date = local_date(calibrated.occurred_at, &state.timezone)?;
                     let supplier_exists: bool = tx
                         .query_row(
                             "SELECT EXISTS(SELECT 1 FROM suppliers WHERE id = ?1)",
@@ -72,16 +71,16 @@ pub async fn create(
                         });
                     }
                     let mut earlier_expiries: BTreeMap<AggregateId, UnixMillis> = BTreeMap::new();
-                    let mut lot_numbers = super::inventory::LotNumbers::new(&calendar_date);
+                    let mut lot_numbers = super::inventory::LotNumbers::new(calendar_date);
                     let mut lines = Vec::with_capacity(command.lines.len());
                     for (index, line) in command.lines.into_iter().enumerate() {
                         let (code, category) =
                             super::item_units::validate_item(tx, index, line.item_id, &line.input)?;
                         // Both strings are canonical YYYY-MM-DD dates, so their
                         // ordering equals calendar ordering, including year 0000.
-                        let reason = if line.produced_on > calendar_date {
+                        let reason = if line.produced_on.as_str() > lot_numbers.calendar_date() {
                             Some("PRODUCED_IN_FUTURE")
-                        } else if line.expires_on < calendar_date {
+                        } else if line.expires_on.as_str() < lot_numbers.calendar_date() {
                             Some("EXPIRED_ON_RECEIPT")
                         } else {
                             None
@@ -112,7 +111,7 @@ pub async fn create(
                                 params![
                                     line.item_id.to_string(),
                                     expires_at.0,
-                                    calendar_date,
+                                    lot_numbers.calendar_date(),
                                     serial
                                 ],
                                 |row| row.get(0),

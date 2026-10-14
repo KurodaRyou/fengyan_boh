@@ -94,3 +94,94 @@ fn lot_serial_reaches_999_without_wrapping_or_reuse() {
     assert!(next_lot_serial(999).is_err());
     assert!(next_lot_serial(i64::MAX).is_err());
 }
+
+#[test]
+fn allocation_returns_domain_error_for_out_of_bounds_lot() {
+    let mut balance = ItemBalance::new(vec![lot(1, 5)], 0).unwrap();
+    assert!(matches!(
+        balance.allocate(Some(1), 1),
+        Err(crate::DomainError::InvalidField(_))
+    ));
+}
+
+#[test]
+fn failed_allocations_preserve_all_balances_and_subsequent_results() {
+    fn snapshot(balance: &ItemBalance) -> (i64, Vec<(LotId, i64)>, i64) {
+        (
+            balance.book(),
+            balance
+                .lots()
+                .iter()
+                .map(|lot| (lot.lot_id.clone(), lot.remaining))
+                .collect(),
+            balance.unallocated,
+        )
+    }
+
+    let cases = [
+        (
+            "net overflow",
+            ItemBalance::new(vec![lot(1, 2)], i64::MIN).unwrap(),
+            None,
+            3,
+            None,
+        ),
+        (
+            "specified overflow",
+            ItemBalance::new(vec![lot(1, i64::MIN), lot(2, 3)], 0).unwrap(),
+            Some(0),
+            1,
+            Some(1),
+        ),
+        (
+            "FIFO overflow",
+            ItemBalance::new(vec![lot(1, i64::MAX), lot(2, -i64::MAX)], 0).unwrap(),
+            None,
+            -1,
+            None,
+        ),
+        // Deliberately inconsistent cached book to reach the defensive check
+        // after FIFO has already consumed a lot.
+        (
+            "shortfall overflow",
+            ItemBalance {
+                lots: vec![lot(1, 5)],
+                unallocated: i64::MIN,
+                book: 10,
+            },
+            None,
+            6,
+            None,
+        ),
+        (
+            "invalid lot index",
+            ItemBalance::new(vec![lot(1, 5)], -1).unwrap(),
+            Some(1),
+            1,
+            None,
+        ),
+    ];
+    for (name, mut balance, specified, qty, next_specified) in cases {
+        let before = snapshot(&balance);
+        let mut control = ItemBalance {
+            lots: balance
+                .lots()
+                .iter()
+                .map(|lot| LotBalance {
+                    lot_id: lot.lot_id.clone(),
+                    remaining: lot.remaining,
+                })
+                .collect(),
+            unallocated: balance.unallocated,
+            book: balance.book(),
+        };
+        assert!(balance.allocate(specified, qty).is_err(), "{name}");
+        assert_eq!(snapshot(&balance), before, "{name}");
+        assert_eq!(
+            balance.allocate(next_specified, 1).unwrap(),
+            control.allocate(next_specified, 1).unwrap(),
+            "{name}"
+        );
+        assert_eq!(snapshot(&balance), snapshot(&control), "{name}");
+    }
+}
