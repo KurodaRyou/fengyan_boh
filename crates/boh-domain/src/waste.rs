@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::inventory::{Allocation, AllocationSource};
 use crate::lot::LotId;
 use crate::receiving::ReceiptInput;
 use crate::{AggregateId, CommandId, DomainError, EventId, UnixMillis};
@@ -95,39 +96,6 @@ impl PrecheckWaste {
         Ok(())
     }
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(remote = "Self", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum AllocationSource {
-    Specified,
-    Fifo,
-    Shortfall,
-}
-string_enum_serde!(AllocationSource);
-
-impl AllocationSource {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Specified => "SPECIFIED",
-            Self::Fifo => "FIFO",
-            Self::Shortfall => "SHORTFALL",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(remote = "Self", deny_unknown_fields)]
-pub struct Allocation {
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "crate::present"
-    )]
-    pub lot_id: Option<LotId>,
-    pub qty: i64,
-    pub source: AllocationSource,
-}
-object_serde!(Allocation);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WasteEffect {

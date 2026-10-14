@@ -3,7 +3,6 @@
 use std::collections::BTreeMap;
 
 use axum::http::StatusCode;
-use boh_domain::lot::LotId;
 use boh_domain::receiving::{CreateReceipt, GoodsReceived, Receipt, ReceivedLine};
 use boh_domain::time::{CaptureTimes, business_date, calibrate, end_of_local_date, local_date};
 use boh_domain::{AggregateId, EventId, UnixMillis};
@@ -50,11 +49,7 @@ pub async fn create(
                         &state.timezone,
                         state.business_day_cutoff,
                     )?;
-                    let calendar_date =
-                        local_date(calibrated.occurred_at, &state.timezone)?.to_string();
-                    let lot_date = calendar_date
-                        .parse()
-                        .map_err(|error| StorageError::external("解析批次日期", error))?;
+                    let calendar_date = local_date(calibrated.occurred_at, &state.timezone)?;
                     let supplier_exists: bool = tx
                         .query_row(
                             "SELECT EXISTS(SELECT 1 FROM suppliers WHERE id = ?1)",
@@ -76,15 +71,16 @@ pub async fn create(
                         });
                     }
                     let mut earlier_expiries: BTreeMap<AggregateId, UnixMillis> = BTreeMap::new();
-                    let mut last_serials: BTreeMap<AggregateId, i64> = BTreeMap::new();
+                    let mut lot_numbers = super::inventory::LotNumbers::new(calendar_date);
                     let mut lines = Vec::with_capacity(command.lines.len());
                     for (index, line) in command.lines.into_iter().enumerate() {
-                        let (code, category) = super::item_units::validate_item(tx, index, line.item_id, &line.input)?;
+                        let (code, category) =
+                            super::item_units::validate_item(tx, index, line.item_id, &line.input)?;
                         // Both strings are canonical YYYY-MM-DD dates, so their
                         // ordering equals calendar ordering, including year 0000.
-                        let reason = if line.produced_on > calendar_date {
+                        let reason = if line.produced_on.as_str() > lot_numbers.calendar_date() {
                             Some("PRODUCED_IN_FUTURE")
-                        } else if line.expires_on < calendar_date {
+                        } else if line.expires_on.as_str() < lot_numbers.calendar_date() {
                             Some("EXPIRED_ON_RECEIPT")
                         } else {
                             None
@@ -104,33 +100,9 @@ pub async fn create(
                             .parse()
                             .map_err(|_| ApiError::validation())?;
                         let expires_at = end_of_local_date(expires_on, &state.timezone)?;
-                        let last_serial = match last_serials.get(&line.item_id) {
-                            Some(serial) => *serial,
-                            None => tx
-                                .query_row(
-                                    "SELECT coalesce(max(lot_serial), 0) FROM inventory_lots
-                                     WHERE item_id = ?1 AND lot_date = ?2",
-                                    params![line.item_id.to_string(), calendar_date],
-                                    |row| row.get::<_, i64>(0),
-                                )
-                                .map_err(|error| StorageError::sqlite("查询批次流水号", error))?,
-                        };
-                        let serial = last_serial
-                            .checked_add(1)
-                            .filter(|serial| *serial <= 999)
-                            .ok_or_else(|| {
-                                ApiError::new(
-                                    StatusCode::CONFLICT,
-                                    "LOT_SERIAL_EXHAUSTED",
-                                    "lot serials exhausted for this item and date",
-                                )
-                                .with_details(json!({
-                                    "line": index, "item_id": line.item_id, "lot_date": calendar_date
-                                }))
-                            })?;
-                        last_serials.insert(line.item_id, serial);
-                        let lot_id = LotId::from_parts(category, &code, lot_date, serial)
-                            .map_err(StorageError::from)?;
+                        let lot_id =
+                            lot_numbers.allocate(tx, index, line.item_id, category, &code)?;
+                        let serial = lot_id.serial();
                         let older_expires_later: bool = tx
                             .query_row(
                                 "SELECT EXISTS(SELECT 1 FROM inventory_lots
@@ -139,7 +111,7 @@ pub async fn create(
                                 params![
                                     line.item_id.to_string(),
                                     expires_at.0,
-                                    calendar_date,
+                                    lot_numbers.calendar_date(),
                                     serial
                                 ],
                                 |row| row.get(0),

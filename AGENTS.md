@@ -180,9 +180,9 @@
 
 ```
 crates/
-  boh-domain/   纯类型与校验不变量、相对校准与营业日纯函数。只允许依赖 serde / uuid / thiserror / jiff。禁止数据库、HTTP、系统 I/O（包括读系统时钟）。
-  boh-storage/  SQLite：连接初始化、迁移、写入线程、读连接池、ledger（唯一写事件入口）、projections、备份、时钟模块（可注入）、原生 SQL。
-  boh-app/      http（路由、响应信封）、service（命令编排）、sync（同步 worker，待实现）。
+  boh-domain/   纯类型与校验不变量、库存规则纯函数（见「库存规则归属」）、相对校准与营业日纯函数。只允许依赖 serde / uuid / thiserror / jiff。禁止数据库、HTTP、系统 I/O（包括读系统时钟）。
+  boh-storage/  SQLite：连接初始化、迁移、写入线程、读连接池、ledger（唯一写事件入口）、projections（含各事件共用的库存投影写入）、备份、时钟模块（可注入）、原生 SQL。
+  boh-app/      http（路由、响应信封）、service（命令编排，含各命令共用的库存决策读取）、sync（同步 worker，待实现）。
   boh-server/   main：加载配置、启动、信号处理、优雅关闭；子命令 init、rebuild-projections；认证切片加子命令 enroll-code、unlock-device、reset-unlock-code、revoke-device、reset-pin。
 migrations/     编号 SQL 文件，001_xxx.sql、002_xxx.sql……
 deploy/         systemd unit、示例配置。
@@ -190,6 +190,29 @@ scripts/        CI 扫描脚本。
 ```
 
 保持扁平：不要 trait 抽象工厂、不要 Repository 接口层、不要 DDD 聚合根类层次。函数 + 结构体 + 原生 SQL。
+
+### 库存规则归属
+
+库存规则的业务语义只写在 [docs/domain.md](docs/domain.md)（「批次」「盘点」「盘点吸收」「纠错」「投影表」）；本节只规定代码放在哪里、谁调用谁。
+
+- domain.md 中由多个命令或事件共同引用的库存规则只有一份实现，放在下表的三层中；新切片调用它们，不在自己的 service 或事件投影函数中另写一份。
+  - 只共享语义相同的部分。只属于一个命令的规则留在该命令的 service 中，例如报损的不足确认与 `ITEM_HAS_NO_LOTS`、收货的批次日期校验与 `EXPIRES_BEFORE_OLDER_STOCK`；不为复用把不同命令合并成通用的库存命令。
+
+| 层 | 模块 | 负责 | 不做 |
+|---|---|---|---|
+| 纯规则 | `boh_domain::inventory` | `alloc` 的类型；一个物料在一条命令内的账面工作状态（按 FIFO 顺序的批次余量、账外缺口、净账面）；按指定批次、FIFO、账外缺口分配并更新工作状态；批次流水号的递增与上限 | 读数据库或时钟；返回 `ApiError`、HTTP 状态码或错误码 |
+| 决策读取 | `boh_app::service::inventory` | 在命令所在的事务内读取纯规则需要的库存投影，按物料缓存成命令级工作集，使同一命令后面的行看到前面各行的结果；为建批次的行分配批次号；把纯规则的错误转换成 domain.md 规定的错误码 | 写任何表、追加事件；替各命令决定拒绝、确认或警告 |
+| 投影写入 | `boh_storage::inventory` | 按事件中已记录的决策建批次、按 `alloc` 增减批次余量和账外缺口、按「投影表」的展开顺序写 `inventory_movements` 并编号 | 分配，判定不足或吸收；读取主数据、`inventory_counts` 或其他事件 |
+
+- 调用方向：各命令的 service → `service::inventory` → `boh_domain::inventory`。`service::inventory` 不调用具体命令的 service；`boh_domain::inventory` 返回 `boh-domain` 的错误类型。
+- `boh_domain::inventory`、`service::inventory` 同时放库存明细与批次查询的类型和处理函数。
+- 同一命令的预检和正式提交走同一条计算路径。
+- 投影写入的调用限制：
+  - `boh_storage::inventory` 的函数是 `pub(crate)`，只由 `projections::apply` 分派到的事件投影函数调用。在线写入经 `Ledger::append`、重建经 `rebuild-projections` 进入，两条路径执行同一段代码。
+  - 参数只取自事件本身（payload、`store_events` 的列和该事件的 `seq`）；只读取要更新的投影行的当前值。
+  - 数量越界或要更新的批次不存在时报错，不钳制、不跳过。
+  - service 只读库存投影表，不写；库存投影表只经事件投影函数写入。
+- 之后加入的共享库存规则（如盘点吸收判定、库存状态上限）按同一分层放置：纯计算在 `boh_domain::inventory`，需要读投影的部分在 `service::inventory`，投影写入在 `boh_storage::inventory`。
 
 ---
 

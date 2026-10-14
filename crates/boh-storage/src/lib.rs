@@ -2,6 +2,7 @@
 
 mod connection;
 mod error;
+mod inventory;
 pub mod ledger;
 mod master_data;
 mod migrate;

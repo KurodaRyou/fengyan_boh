@@ -117,50 +117,20 @@ fn apply_receipt(tx: &Transaction<'_>, event: &Event) -> Result<(), StorageError
         ));
     }
     let payload = receipt_payload(&event.payload)?;
-    // seq comes from the stored event in both the online and replay paths.
-    let seq: i64 = tx
-        .query_row(
-            "SELECT seq FROM store_events WHERE id = ?1",
-            [event.id.to_string()],
-            |row| row.get(0),
-        )
-        .map_err(|error| StorageError::sqlite("查询事件账本", error))?;
+    let mut movements =
+        crate::inventory::Movements::new(tx, event, crate::inventory::MovementKind::Receipt)?;
     for (index, line) in payload.lines.into_iter().enumerate() {
         let index = i64::try_from(index)
             .map_err(|_| StorageError::InvalidEvent("receipt line number overflow".into()))?;
-        tx.execute(
-            "INSERT INTO inventory_lots (lot_id, item_id, lot_date, lot_serial, origin, source_event_seq,
-                 source_line_no, remaining_qty, expires_at, manufacturer_lot_no)
-             VALUES (?1, ?2, ?3, ?4, 'RECEIPT', ?5, ?6, ?7, ?8, ?9)",
-            params![
-                line.lot_id.to_string(),
-                line.item_id.to_string(),
-                line.lot_id.date().to_string(),
-                line.lot_id.serial(),
-                seq,
-                index,
-                line.qty,
-                line.expires_at.0,
-                line.manufacturer_lot_no
-            ],
-        )
-        .map_err(|error| StorageError::sqlite("插入库存批次", error))?;
-        tx.execute(
-            "INSERT INTO inventory_movements (event_seq, movement_no, item_id, lot_id,
-                 kind, alloc_source, nominal_qty, qty_delta, absorbed_by_event_id,
-                 physical_at, business_date)
-             VALUES (?1, ?2, ?3, ?4, 'RECEIPT', 'NEW_LOT', ?5, ?5, NULL, ?6, ?7)",
-            params![
-                seq,
-                index,
-                line.item_id.to_string(),
-                line.lot_id.to_string(),
-                line.qty,
-                event.occurred_at.0,
-                event.business_date
-            ],
-        )
-        .map_err(|error| StorageError::sqlite("插入库存流水", error))?;
+        movements.new_lot(crate::inventory::NewLot {
+            lot_id: &line.lot_id,
+            item_id: line.item_id,
+            source_line_no: index,
+            origin: crate::inventory::LotOrigin::Receipt,
+            qty: line.qty,
+            expires_at: Some(line.expires_at),
+            manufacturer_lot_no: line.manufacturer_lot_no.as_deref(),
+        })?;
     }
     Ok(())
 }

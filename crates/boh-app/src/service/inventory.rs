@@ -1,14 +1,18 @@
-//! Inventory and lot lookups each use a single reader transaction.
+//! Inventory queries and command-local decision reads. This module never writes projections.
 
 use std::collections::BTreeMap;
 
 use axum::http::StatusCode;
-use boh_domain::inventory::{Inventory, InventoryItem, InventoryQuery, Lot, LotDetails};
+use boh_domain::inventory::{
+    Allocation, Inventory, InventoryItem, InventoryQuery, ItemBalance, Lot, LotBalance, LotDetails,
+    next_lot_serial,
+};
 use boh_domain::lot::LotId;
-use boh_domain::time::business_date;
+use boh_domain::master_data::ItemCategory;
+use boh_domain::time::{BusinessDate, business_date};
 use boh_domain::{AggregateId, DomainError, UnixMillis};
 use boh_storage::StorageError;
-use boh_storage::rusqlite::{OptionalExtension, Row, params};
+use boh_storage::rusqlite::{Connection, OptionalExtension, Row, params};
 use serde_json::json;
 
 use crate::AppState;
@@ -126,4 +130,123 @@ fn read_lot(row: &Row<'_>) -> boh_storage::rusqlite::Result<Lot> {
             manufacturer_lot_no: row.get(6)?,
         },
     })
+}
+
+/// Load lazily, after the caller has validated the current line's references.
+#[derive(Default)]
+pub(super) struct WorkingSet {
+    balances: BTreeMap<AggregateId, ItemBalance>,
+}
+
+impl WorkingSet {
+    pub(super) fn get(
+        &mut self,
+        conn: &Connection,
+        item_id: AggregateId,
+    ) -> Result<&mut ItemBalance, ApiError> {
+        use std::collections::btree_map::Entry;
+        Ok(match self.balances.entry(item_id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(load_balance(conn, item_id)?),
+        })
+    }
+}
+
+pub(super) fn allocate(
+    balance: &mut ItemBalance,
+    specified: Option<usize>,
+    qty: i64,
+) -> Result<Vec<Allocation>, ApiError> {
+    balance
+        .allocate(specified, qty)
+        .map_err(|_| ApiError::validation())
+}
+
+fn load_balance(conn: &Connection, item_id: AggregateId) -> Result<ItemBalance, ApiError> {
+    let mut statement = conn.prepare(
+        "SELECT lot_id, remaining_qty FROM inventory_lots WHERE item_id = ?1 ORDER BY lot_date, lot_serial",
+    ).map_err(|error| StorageError::sqlite("准备查询库存批次", error))?;
+    let lots: Vec<LotBalance> = statement
+        .query_map([item_id.to_string()], |row| {
+            let lot_id = LotId::parse(&row.get::<_, String>(0)?).map_err(|error| {
+                boh_storage::rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    boh_storage::rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            Ok(LotBalance {
+                lot_id,
+                remaining: row.get(1)?,
+            })
+        })
+        .map_err(|error| StorageError::sqlite("查询库存批次", error))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| StorageError::sqlite("读取库存批次", error))?;
+    let unallocated: i64 = conn
+        .query_row(
+            "SELECT qty FROM inventory_unallocated WHERE item_id = ?1",
+            [item_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| StorageError::sqlite("查询库存账外缺口", error))?
+        .unwrap_or(0);
+    ItemBalance::new(lots, unallocated).map_err(|_| ApiError::validation())
+}
+
+/// One command's serials for its single, calibrated lot date.
+pub(super) struct LotNumbers {
+    lot_date: BusinessDate,
+    calendar_date: String,
+    last_serials: BTreeMap<AggregateId, i64>,
+}
+
+impl LotNumbers {
+    pub(super) fn new(lot_date: BusinessDate) -> Self {
+        let calendar_date = lot_date.to_string();
+        Self {
+            lot_date,
+            calendar_date,
+            last_serials: BTreeMap::new(),
+        }
+    }
+
+    pub(super) fn calendar_date(&self) -> &str {
+        &self.calendar_date
+    }
+
+    pub(super) fn allocate(
+        &mut self,
+        conn: &Connection,
+        index: usize,
+        item_id: AggregateId,
+        category: ItemCategory,
+        code: &str,
+    ) -> Result<LotId, ApiError> {
+        let last_serial = match self.last_serials.get(&item_id) {
+            Some(serial) => *serial,
+            None => conn
+                .query_row(
+                    "SELECT coalesce(max(lot_serial), 0) FROM inventory_lots
+                 WHERE item_id = ?1 AND lot_date = ?2",
+                    params![item_id.to_string(), self.calendar_date],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|error| StorageError::sqlite("查询批次流水号", error))?,
+        };
+        let serial = next_lot_serial(last_serial).map_err(|_| {
+            ApiError::new(
+                StatusCode::CONFLICT,
+                "LOT_SERIAL_EXHAUSTED",
+                "lot serials exhausted for this item and date",
+            )
+            .with_details(
+                json!({ "line": index, "item_id": item_id, "lot_date": self.calendar_date }),
+            )
+        })?;
+        self.last_serials.insert(item_id, serial);
+        LotId::from_parts(category, code, self.lot_date.date(), serial)
+            .map_err(|error| ApiError::from(StorageError::from(error)))
+    }
 }

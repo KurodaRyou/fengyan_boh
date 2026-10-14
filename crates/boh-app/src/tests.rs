@@ -24,6 +24,9 @@ mod diagnostics;
 #[path = "strict_json_tests.rs"]
 mod strict_json;
 
+#[path = "stock_rules_tests.rs"]
+mod stock_rules;
+
 struct Node {
     _dir: tempfile::TempDir,
     storage: Storage,
