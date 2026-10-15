@@ -287,7 +287,7 @@ Run、Task、Dispatch、消息都持久化在 Orca 中；协调者会话不是�
 
 ```bash
 # 锁定路径（与 .github/CODEOWNERS 一致；CODEOWNERS 变化时以它为准）
-LOCKED=(AGENTS.md CLAUDE.md docs migrations crates/boh-storage/tests/schema.rs \
+LOCKED=(AGENTS.md CLAUDE.md docs workflows .agents migrations crates/boh-storage/tests/schema.rs \
   ':(glob)crates/*/tests/spec_*.rs' ':(glob)crates/*/tests/spec_support/**' ':(glob)crates/*/tests/golden/**' \
   .github scripts .cargo ':(glob)**/Cargo.toml' Cargo.lock ':(glob)**/clippy.toml' ':(glob)**/.clippy.toml' \
   ':(glob)**/rustfmt.toml' ':(glob)**/.rustfmt.toml' rust-toolchain rust-toolchain.toml ':(glob)**/build.rs')

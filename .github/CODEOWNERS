@@ -6,6 +6,10 @@
 /CLAUDE.md @KurodaRyou
 /docs/ @KurodaRyou
 
+# 可选的 Orca 编排工作流及其 skill 入口
+/workflows/ @KurodaRyou
+/.agents/ @KurodaRyou
+
 # 迁移与 schema 测试
 /migrations/ @KurodaRyou
 /crates/boh-storage/tests/schema.rs @KurodaRyou
