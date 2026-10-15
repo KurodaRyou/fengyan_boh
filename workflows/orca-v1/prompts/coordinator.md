@@ -17,11 +17,12 @@
 ## 你不做
 - 不 review 本切片（review 只由 review worker 做），不用自己的检查代替 review 或测试 agent 的审查。
 - 不确认预期值、不合入、不代人在 agent 的信任提示里选择。
-- 不用 Claude Code 的 Agent / 子 agent 工具承担 worker 角色；worker 只经 `orca orchestration worker-start` 启动。
+- 不用 Claude Code 的 Agent / 子 agent 工具承担 worker 角色；worker 只经 Orca 启动（`worker-start`，测试 agent 按 WORKFLOW.md §7.1）。
 - 不让实现 agent 读取或引用 `workdocs/`：它需要的内容抄进它的 Task spec。
 
 ## 执行规则
-1. prompt 写好后**立即**用 `task-create` + `worker-start` 派发。只把 prompt 展示给用户不算派发；Task 是 `ready` 也不代表有 worker 在做，必须 `worker-start`。
+1. prompt 写好后**立即**派发：实现和 review 用 `task-create` + `worker-start`；测试 agent 例外，按 WORKFLOW.md §7.1 用 `terminal create` + `dispatch --return-preamble` + `terminal send "/boost …"`（`worker-start` 会让 `/boost` 失效）。
+   只把 prompt 展示给用户不算派发；Task 是 `ready` 也不代表有 worker 在做，必须完成上面的派发步骤。
 2. 派发后进入 `check --wait` 循环（WORKFLOW.md §7.3）。worker 做完当前 Task 后按 Orca 协议发 `worker_done` 并停下，下一阶段由你推进。
 3. 收到 `worker_done` 后，先核对 Task / Dispatch 与 `STATE.md` 一致，再按 WORKFLOW.md §5 的证据核对产物（文件、提交、命令输出），然后决定下一步。不能只凭「完成了」的文字推进。
 4. 有已授权、可执行的下一个 Task 时，立刻继续，不要停下来写一段阶段总结等用户说「继续」。普通实现返修自动交回原实现终端，复审自动交回原 review 终端。
