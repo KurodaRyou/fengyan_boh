@@ -11,6 +11,8 @@ description: >-
 
 你将作为本切片的**协调者兼设计 Claude**运行。规则来源是 `AGENTS.md` 和 `CLAUDE.md`；本工作流只规定怎样在 Orca 上执行，不给你额外权限。
 
+只有 Claude Code 能运行本工作流。你不是 Claude Code（例如 Codex、Antigravity / Gemini）时，立即停下，告诉用户本工作流的协调者必须是 Claude Code；不读后续文件，不做任何提交。
+
 ## 第一步：加载
 按顺序完整读：
 1. `AGENTS.md`、`CLAUDE.md`、`.github/CODEOWNERS`
