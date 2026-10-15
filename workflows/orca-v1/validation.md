@@ -77,3 +77,9 @@ WORKFLOW.md §10 的锁定路径命令已在真实历史上试过：`spec:` 提�
 - 新目录的 agent 信任提示需要人处理，黑盒副本每次都是新目录。
 - 测试 agent 走 `dispatch --return-preamble` + `terminal send` 的低层通道，Orca 不托管其终端，需协调者手动关闭。
 - Orca 启动的 Claude worker 带 `--dangerously-skip-permissions`：实现 agent 和测试 agent 的写入边界只靠规则和 review 约束，没有沙箱。
+
+## 6. PR #28 返修验证（2026-10-14）
+
+- 分页：直接取 WORKFLOW.md §8.7 的三个命令，仅把 endpoint 换成本地假 API，用假 token 执行真实 `gh api --paginate --slurp` 和 `jq`。
+  每类集合跨三页：第一页普通用户和伪装 Codex 名称，后两页各一条真实 bot 身份记录；三个集合均只返回后两页的记录（共 9 次请求）。
+  空集合返回 `[]`；第二页 HTTP 500 时整段命令非零退出，停止后续读取。验证的是翻页、汇总、身份筛选与失败传播，不是对真实 GitHub 的轮询演练。
