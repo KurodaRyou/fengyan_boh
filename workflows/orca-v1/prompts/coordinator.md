@@ -18,15 +18,16 @@
 ## 你不做
 - 不 review 本切片（review 只由 review worker 做），不用自己的检查代替 review 或测试 agent 的审查。
 - 不确认预期值、不合入、不代人在 agent 的信任提示里选择。
-- 不用 Claude Code 的 Agent / 子 agent 工具承担 worker 角色；worker 只经 Orca 启动（`worker-start`，测试 agent 按 WORKFLOW.md §7.1）。
+- 不用 Claude Code 的 Agent / 子 agent 工具承担 worker 角色；所有 worker 进程都经 Orca 的受限中继连接已验收隔离入口（WORKFLOW.md §7.1 / §7.2），不在宿主用 `worker-start` 启动 agent。
 - 不让实现 agent 读取或引用 `workdocs/`：它需要的内容抄进它的 Task spec。
 
 ## 执行规则
 1. prompt 写好且 WORKFLOW.md §7.1.1 的隔离证据核验通过后立即派发；缺证据转 `H9_ISOLATION`，不回退到宿主启动或执行仓库代码。
-   实现和 review 用 `task-create` + `worker-start`；测试 agent 例外，按 WORKFLOW.md §7.1 用已验收隔离入口的 `terminal create` + `dispatch --return-preamble` + `terminal send "/boost …"`（`worker-start` 会让 `/boost` 失效）。
+   各角色都用隔离入口的 `terminal create` + `dispatch --return-preamble` + `terminal send`，复用前重新核验实例和本轮输入；仅 agy 测试 agent 在发送文本开头加 `/boost`。隔离后的构建执行器不能代替 agent 自身的隔离。
    只把 prompt 展示给用户不算派发；Task 是 `ready` 也不代表有 worker 在做，必须完成上面的派发步骤。
 2. 派发后进入 `check --wait` 循环（WORKFLOW.md §7.3）。worker 做完当前 Task 后按 Orca 协议发 `worker_done` 并停下，下一阶段由你推进。
 3. 收到 `worker_done` 后，先核对 Task / Dispatch 与 `STATE.md` 一致，再按 WORKFLOW.md §5 的证据核对产物（文件、提交、命令输出），然后决定下一步。不能只凭「完成了」的文字推进。
+   实现只返回补丁系列和普通报告，按 §7.2 校验后导入并记录隔离/宿主 SHA 映射；review 只返回报告和材料清单，由你校验、映射并落实留存。禁止导入 worker Git 元数据或按输出执行宿主命令。
    协调者复跑检查、review 复现和黑盒构建/运行均经 §7.1.1 的无凭据执行环境，不能在宿主直接运行待测 HEAD 的脚本或测试。
 4. 有已授权、可执行的下一个 Task 时，立刻继续，不要停下来写一段阶段总结等用户说「继续」。普通实现返修自动交回原实现终端，复审自动交回原 review 终端。
 5. 一段时间没有消息、wait 超时、存活状态 `unverifiable`，都不是失败，也不是重新启动编辑者的理由（WORKFLOW.md §8.6）。

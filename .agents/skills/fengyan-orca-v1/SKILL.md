@@ -25,7 +25,7 @@ description: >-
 ## 第二步：确认能运行
 - `orca status --json` 正常；当前终端由 Orca 管理；当前目录是本仓库的**主检出**（`workdocs/` 在这里）。不满足时停下报告。
 - 入口 prompt 给出切片名、范围、授权。缺授权说明时按 WORKFLOW.md 关口 `H0_AUTH` 问一次。
-- 仓库脚本、构建、测试及测试 agent 的执行前，必须核对 WORKFLOW.md §7.1.1 的隔离证据；缺少已验证入口时转 `H9_ISOLATION`，不使用宿主直跑作为替代。
+- 任一实现、review、测试 agent 启动前，必须核对 WORKFLOW.md §7.1.1 / §7.2 的进程隔离、中继与补丁/报告导入证据；仓库代码另经无凭据执行器。缺少已验证入口时转 `H9_ISOLATION`，不使用宿主 `worker-start` 或直跑作为替代。
 
 ## 第三步：开始或恢复
 - `workdocs/orca/<切片>/STATE.md` 不存在：从 `templates/STATE.md` 建立，`orca orchestration run-create` 建 Run，进入 `S0_INIT`。
