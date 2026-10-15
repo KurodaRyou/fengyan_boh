@@ -76,10 +76,19 @@ WORKFLOW.md §10 的锁定路径命令已在真实历史上试过：`spec:` 提�
 - Orca 不会因 GitHub 事件唤醒协调者；CI 和 Codex review 靠协调者在自己的回合里轮询。
 - 新目录的 agent 信任提示需要人处理，黑盒副本每次都是新目录。
 - 测试 agent 走 `dispatch --return-preamble` + `terminal send` 的低层通道，Orca 不托管其终端，需协调者手动关闭。
-- Orca 启动的 Claude worker 带 `--dangerously-skip-permissions`：实现 agent 和测试 agent 的写入边界只靠规则和 review 约束，没有沙箱。
+- 上述旧演练没有沙箱，不能作为安全启动证明。现行 WORKFLOW.md §7.1.1 禁止宿主直跑测试 agent 和待测代码；未通过隔离验收时阻塞，不沿用旧启动方式。
 
 ## 6. PR #28 返修验证（2026-10-14）
 
 - 分页：直接取 WORKFLOW.md §8.7 的三个命令，仅把 endpoint 换成本地假 API，用假 token 执行真实 `gh api --paginate --slurp` 和 `jq`。
   每类集合跨三页：第一页普通用户和伪装 Codex 名称，后两页各一条真实 bot 身份记录；三个集合均只返回后两页的记录（共 9 次请求）。
   空集合返回 `[]`；第二页 HTTP 500 时整段命令非零退出，停止后续读取。验证的是翻页、汇总、身份筛选与失败传播，不是对真实 GitHub 的轮询演练。
+- 隔离探针：使用本机已有 Alpine 镜像 `sha256:ab3fe4defd29ba6231229a4d41440ac8bde8218e85870e53876277faa24b35c4`，不拉取镜像。
+  `docker run --rm --pull=never --read-only --network=none --user=65534:65534 --cap-drop=ALL --security-opt=no-new-privileges --pids-limit=64 --memory=64m`，
+  只读挂载临时输入，单独挂载可写 `blindtest/`，临时 HOME 放在 tmpfs；输出挂载点先在只读输入里建好。
+  允许输出写入成功；输入写入、读取宿主假凭据和 Git hook 哨兵、修改主检出哨兵均失败；符号链接与路径穿越不能绕过。
+  宿主父进程的假 token/SSH agent/AWS 环境变量未进入容器，Docker/Orca socket 不存在，非 root、no-new-privileges 和无路由检查通过。全程不访问真实凭据。
+- 静态核对：首次派发、S7 协调者复跑、S8 黑盒/复现、失败重试、换 Codex 和恢复都引用同一个隔离前置条件；缺证据进入 `H9_ISOLATION`，不得降级为宿主执行。
+- 仓库检查：在 `b006497` 的临时导出副本上应用本次 Markdown 改动，`cargo fmt --all`、`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`（431 passed、0 failed、0 ignored）和 `scripts/ci-scan.sh` 均通过。
+- **未验证、不能据此启用**：真实 agy/Codex agent、模型专用认证与受限出口、无凭据构建执行器、Orca 受限中继、报告导入防链接/越界和完整自动派发尚未联调。
+  容器探针只证明这组容器参数下的文件/环境边界；不是 §7.1.1 的入口验收。当前没有已验证入口，相关阶段必须阻塞，不能用本段记录解除 `H9_ISOLATION`。

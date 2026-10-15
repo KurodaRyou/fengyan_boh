@@ -28,6 +28,8 @@
   - Claude Code 的项目记忆按目录区分，在别的路径启动的 Claude 读不到本项目的记忆。
 - 同一时刻只有一个角色改主检出的工作区：设计、实现、返修依次进行；review 只读；黑盒在副本里。
 - 协调者运行在 Orca 管理的终端中（`orca status --json` 正常，`run-create` 返回 `coordinator_handle`）。
+- 任何仓库脚本、构建、测试和被测进程都按 §7.1.1 在隔离环境中执行，包括协调者复跑检查和 review 中的复现；宿主只做 Git 核对、导出、哈希和受限中继。
+  首次派发、重试、换 agent 或恢复都必须核对隔离证据；缺少已验证入口时进入 `H9_ISOLATION`，不得回退到宿主执行。
 
 ## 3. 两套状态
 
@@ -82,7 +84,7 @@ review 结论及对应 HEAD；黑盒副本的来源提交与报告位置；已�
 ### S0_INIT
 - 输入：用户的入口 prompt（切片名、范围、授权）。负责：协调者。
 - 证据：`orca status` 正常；主检出在切片分支上，`git status` 只有已知的未跟踪文件；`STATE.md` 已建；Run 已建或已绑定（§9）；
-  工具检查已记入 `STATE.md`：`claude`、实现 agent、测试 agent（`command -v agy`，且 `agy -p "/model"` 显示的当前模型是 Gemini 模型；不满足时 §8.4）。
+  工具检查已记入 `STATE.md`：`claude`、实现 agent；测试 agent 的工具与 Gemini 模型在 §7.1.1 的隔离入口内核对，不满足时 §8.4。
 - 下一位：设计 Claude（`S1_DESIGN`）；从中途恢复时按 `STATE.md` 跳到对应阶段。
 - 等人：`human:H0_AUTH`。入口 prompt 没写授权范围时，问一次推送、开 PR、发 PR 评论（含 `@codex review` 和不采纳理由）是否授权，记入 `STATE.md`，之后复用。
 - 失败：Orca 不可用或主检出有未知改动 → `blocked`，报告，不动这些改动。
@@ -101,7 +103,7 @@ review 结论及对应 HEAD；黑盒副本的来源提交与报告位置；已�
   人决定补的缺口在 `S4_ADOPT` 和审查采纳项一起写。
 
 ### S3_SPEC_REVIEW（第 4.2 步）
-- 负责：测试 agent，在 `../fengyan-blindtest-<切片>-spec[-r<n>]/` 中。
+- 负责：测试 agent，审查对象来自 `../fengyan-blindtest-<切片>-spec[-r<n>]/`，按 §7.1 导入隔离环境。
 - 证据：`worker_done`（`outcome succeeded`）且 Task / Dispatch 与 `STATE.md` 记录一致；副本中 `blindtest/` 下有报告，报告先列场景清单再逐条对照锁定测试。
 - 下一位：设计 Claude（`S4_ADOPT`），自动。
 - 失败：`outcome failed` 或报告缺场景清单 → 读报告和 `worker-read` 判断：环境问题按 §8.2 重试；审查方法不符合 AGENTS.md → 同一终端返修一次，说明缺什么。
@@ -129,14 +131,14 @@ review 结论及对应 HEAD；黑盒副本的来源提交与报告位置；已�
 - 负责：实现 agent，Task spec 用 `prompts/implement.md`。
 - 证据（协调者自己核对，不信文字）：`worker_done` 的 Task / Dispatch 与记录一致；交付说明文件存在；
   HEAD 前进且新增提交都不以 `spec:` / `docs:` 开头；`git diff <基准> HEAD -- <锁定路径>`（§10）为空；
-  在当前 HEAD 上 `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`、`scripts/ci-scan.sh` 全部通过；工作区干净。
+  协调者导出当前 HEAD，经 §7.1.1 的无凭据执行环境复跑 `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`、`scripts/ci-scan.sh`，全部通过且结果绑定该 SHA；主检出工作区干净。
 - 下一位：review Claude（`S8_REVIEW`），自动。
 - 失败：检查不通过或工作区不干净 → 同一实现终端返修（`S9_REWORK`），spec 里写明失败的命令和输出摘要，不进 review。
   实现 agent 在交付说明里提出锁定测试或规则有问题 → `S10_SPEC_CHANGE` 的判断，由设计 Claude 处理。
 
 ### S8_REVIEW（第 6 步）
 review 在同一个 review Claude 终端里分成几个 Task 依次执行（`prompts/review.md`）：
-1. **分诊**：按实际改动判断是否需要进程级黑盒验收（AGENTS.md「测试分工」五项）；需要时按 CLAUDE.md 导出副本、写 `blindtest/SOURCE.md` 和测试 agent prompt。
+1. **分诊**：按实际改动判断是否需要进程级黑盒验收（AGENTS.md「测试分工」五项）；需要时按 CLAUDE.md 导出副本、写 `blindtest/SOURCE.md` 和测试 agent prompt；构建和运行只能经 §7.1.1，分诊不在宿主试跑代码。
    证据：`review-r<k>.md` 写有 `blackbox: required|not-required|reuse(<SOURCE 提交>)` 和理由。
 2. **正文**：清单核对（逐个提交核对锁定路径）→ `/code-review`。协调者在分诊完成后**同时**派发正文和测试 agent（需要时），二者并行。
 3. **黑盒核对**（需要时）：测试 agent `worker_done` 后，在同一 review 终端派发，核对报告、登记延后项、留存到 `workdocs/blindtest/`、副本移到废纸篓。
@@ -196,6 +198,7 @@ review 在同一个 review Claude 终端里分成几个 Task 依次执行（`pro
 | `H6_MERGE` | 可合入 | 人自己合入 | — |
 | `H7_TRUST` | worker 被 agent 的目录信任提示挡住（§8.3） | 人在该终端里自己选择信任或拒绝 | 协调者代按按键 |
 | `H8_TEST_AGENT` | 测试 agent 不可用（§8.4） | 是否换用 Codex 及范围，或等待 | 协调者自行换用 |
+| `H9_ISOLATION` | 隔离入口、探针或中继未通过 §7.1.1 | 提供通过验收的隔离环境及证据 | 确认风险、目录信任提示、仅换 cwd、关闭权限提示 |
 
 到达关口时：先写 `STATE.md`（`wait: human:<关口>` 和要问的内容），再用一条消息只问这一件事，然后结束本轮。
 人回复后，协调者先按 §9 核对状态再继续。
@@ -203,14 +206,35 @@ review 在同一个 review Claude 终端里分成几个 Task 依次执行（`pro
 ## 7. 派发方法
 
 ### 7.1 测试 agent 的副本（第 4.2 步和第 6 步）
-副本内容与命名按 CLAUDE.md。测试 agent 是 Antigravity CLI，要以 boost 模式运行：发给它的第一行必须以 `/boost ` 开头。
+副本内容与命名按 CLAUDE.md；宿主副本仅作导入和报告留存，测试 agent 与其构建、被测进程均不得在宿主启动。
+
+#### 7.1.1 隔离入口与验收
+
+隔离入口必须由人预置在被测仓库之外，使用独立 OS 身份、容器或虚拟机强制边界；入口及其配置不能来自待测 HEAD。
+仅在以下证据都成立时才允许执行；没有已验证入口时记录 `wait: human:H9_ISOLATION` 并停在本阶段，不启动 worker，也不采信其报告。
+
+- 测试 agent 只能读本次导入的副本和所需工具，可写范围仅为独立临时 HOME 与副本中的 `blindtest/`；构建缓存和运行时数据也放在其中。
+  不挂载主检出、Git 元数据、宿主 HOME 或其上级目录、SSH/GitHub/云凭据、SSH agent、Docker/Orca socket；不继承宿主环境变量或其他 Run 的状态。
+- 模型连接只用专用最小凭据和受限出口。构建、测试、被测程序另在**无凭据、无外网**的执行环境中运行，不能读 agent 的认证信息；进程验收所需的本地环回通信可用。
+  实现阶段的格式化使用独立可写源码副本，只导回非锁定源码改动；提交后重新导出新 HEAD 验证，不能把格式化前的 SHA 记成格式化后的证据。
+- Orca 控制通道留在宿主。中继仅接受绑定到当前 Task / Dispatch 的 `ask`、heartbeat、`worker_done` 与 `blindtest/` 内普通报告文件；不提供任意宿主命令、通用 RPC 或 socket 转发。
+  `--report-path` 的隔离内绝对路径必须先核验位于该副本的 `blindtest/` 下，再映射为相对路径；宿主导入只接受相对条目，拒绝绝对/越界条目、符号链接和硬链接，不执行报告或终端输出中的命令。
+- 用同一个入口、身份、挂载和环境白名单执行探针：允许目录写入成功；读取宿主假凭据哨兵、修改主检出哨兵、读取 Git hook 哨兵均失败；路径穿越和符号链接不能绕过；宿主 socket 和敏感环境变量不可达。
+  探针只用专建的假哨兵，不读取真实秘密。记录入口及配置的哈希、隔离实例/镜像标识、输入快照 SHA 或内容清单哈希、内外路径映射、探针结果和中继版本到 `STATE.md`。
+- 复用、重试、换 agent 和恢复时重新核对以上证据与实际存活实例；缺失、变化或无法核验时回 `H9_ISOLATION`，不能用旧报告替代。
+
+本仓库当前没有通过上述验收的 agent + Orca 中继入口。下面的 `<已验收隔离入口命令>` 只有在验收完成后才能替换使用；不得替换成宿主的 `cd … && agy` 或 `codex`。
+
+#### 7.1.2 派发
+
+测试 agent 是 Antigravity CLI，要以 boost 模式运行：发给它的第一行必须以 `/boost ` 开头。
 `worker-start` 注入的 prompt 以 Orca 的 preamble 开头、Task spec 在 `=== TASK ===` 之后，写在 spec 里的 `/boost` 不会生效（已实测，见 validation.md）。
 另外，Orca 不能从 CLI 把普通文件夹注册成工作区（`project setup-existing-folder --kind folder` 报 `Imported folder does not match the selected project identity.`）。
 所以测试 agent 不用 `worker-start`，按下面的低层方式派发：
 
 ```text
-# 1. 在副本里启动 agy（终端挂在主检出名下，工作目录是副本）
-orca terminal create --worktree current --title "<切片>-<阶段>-blindtest" --command "cd '<副本绝对路径>' && agy --dangerously-skip-permissions" --json
+# 1. 先通过 §7.1.1；宿主终端仅连接已验收隔离入口及其受限中继
+orca terminal create --worktree current --title "<切片>-<阶段>-blindtest" --command "<已验收隔离入口命令>" --json
 orca terminal wait --terminal <handle> --for tui-idle --timeout-ms 60000 --json
 #    satisfied:false 且 blockedReason = agent-trust-workspace → H7_TRUST；人在该终端处理后重新 wait，satisfied:true 才继续
 # 2. 建 Task，取得 preamble（不注入）
@@ -224,8 +248,10 @@ orca terminal send --terminal <handle> --text "/boost <result.preamble 全文>" 
 - 这条通道在 Orca 中是 `unsupervised`：`worker_done`、`ask`、heartbeat 照常工作并结算 Task / Dispatch，
   但 `worker-release` 回执为 `retained`（`no_owned_resource`），`worker-stop` 也不会关进程。核对完 `worker_done` 后由协调者 `orca terminal close --terminal <handle>`。
 - 测试 agent 的 Task spec 用 `prompts/blindtest-spec.md` 或 `prompts/blindtest-accept.md`。
+- agent 在隔离环境内启动 `agy`，不使用跳过权限检查的参数；目录信任提示仍按 §8.3 由人处理，不能替代隔离验收。
 
 ### 7.2 其他 worker
+实现和 review 的 Task spec 必须带上 §7.1.1 的隔离执行入口及缺证据即阻塞的要求；`worker-start` 只启动编辑/审查会话，不授权其在宿主运行仓库代码。重试和复用终端也要重新带上该要求。
 ```text
 orca orchestration task-create --task-title "<切片>/<角色>-r<k>" --spec "<按 prompts/ 模板填好的完整 spec>" --json
 orca orchestration worker-start --task <task_id> --worktree current --agent <codex|claude> --json
@@ -254,19 +280,20 @@ orca orchestration check --wait --types "worker_done,escalation,question" --time
 
 ### 8.2 启动失败与重试
 - 只有已证明的 `failed` / `stopped` 才重试。Claude、Codex worker 用 `worker-start --task <id> --retry-of <dispatch_id> --worktree ... --agent ...`，放置方式重写一遍。
-- 测试 agent 不用 `worker-start` 重试（`/boost` 会落到 preamble 之后）：关闭原终端，按 §7.1 重新建终端，用同一 spec 建新 Task（标题加 `-retry<n>`，`STATE.md` 记录与原 Task 的对应），
+- 测试 agent 不用 `worker-start` 重试（`/boost` 会落到 preamble 之后）：关闭原终端，重新核验 §7.1.1 后按 §7.1 重新建终端，用同一 spec 建新 Task（标题加 `-retry<n>`，`STATE.md` 记录与原 Task 的对应），
   再 `dispatch --return-preamble` 并以 `/boost` 发送。同一审查阶段的测试 agent 累计三次失败即转 `blocked`，与下一条的熔断同样处理。
 - 同一 Task 连续三次失败，Orca 会让该 Task 失败（circuit break）：不另开 Run 或换 Task 绕过，转 `blocked` 报告给人。
 
 ### 8.3 目录信任提示
 新目录（尤其是黑盒副本）首次启动 Claude Code、Codex 或 Antigravity CLI 时都会弹出信任提示（三者均已实测），`worker-start` 报 `Agent startup blocked: agent-trust-workspace`，
 `terminal wait` 报 `blockedReason: agent-trust-workspace`。协调者不代按按键：按回执的 `recovery` 释放失败的启动，进入 `H7_TRUST`，
-请人在 Orca 中打开该终端自行选择；或改用 §7.1 的方式先建终端，等人处理完提示、`terminal wait` 为 `satisfied:true` 后，Claude / Codex 用 `worker-start --terminal` 接管，测试 agent 按 §7.1 第 2–3 步派发。
+请人在 Orca 中打开该终端自行选择；测试 agent 只能在已验收隔离入口中处理，不能改用宿主终端绕过。
+信任提示通过不代表 §7.1.1 通过；两项都满足后，测试 agent 才按 §7.1 第 2–3 步派发。
 
 ### 8.4 测试 agent 不可用
 `command -v agy` 失败、当前模型不是 Gemini 或 Antigravity 额度不够时，转 `human:H8_TEST_AGENT`：AGENTS.md 指定的测试 agent 是 Gemini，换人选由人决定，协调者不自动替换。
-人选择 Codex 时，关闭 Codex 的记忆（全局配置开着记忆，新对话也会加载项目历史，审查就不独立了）：§7.1 第 1 步的命令换成
-`codex -c memories.use_memories=false -c memories.generate_memories=false`，第 3 步不加 `/boost`。人的原话和换用范围（本次审查还是整个切片）记入 `STATE.md`。
+人选择 Codex 时，仍经 §7.1.1 的隔离入口，重新验收换用后的身份和配置；不直接替换宿主启动命令。
+隔离环境内启动 `codex -c memories.use_memories=false -c memories.generate_memories=false`（关闭记忆以保持审查独立），第 3 步不加 `/boost`。人的原话和换用范围（本次审查还是整个切片）记入 `STATE.md`。
 不用 Claude worker 代替测试 agent。
 
 ### 8.5 终端的保留与释放
@@ -309,6 +336,7 @@ Run、Task、Dispatch、消息都持久化在 Orca 中；协调者会话不是�
    - `orca orchestration run-show --id <run> --json`、`task-list --run <run> --json`、`worker-list --run <run> --json`；
    - 收件箱：`orca orchestration run-use --id <run> --json` 绑定后 `check --json`（不加 `--wait`）取出积压的批次；
    - `STATE.md` 中引用的文件（review 结论、交付说明、黑盒报告）是否存在、HEAD 是否一致。
+   - §7.1.1 的隔离实例、入口/配置哈希、快照和探针是否仍与实际一致；不一致或无法确认时转 `H9_ISOLATION`，不复用该 worker 或采信新报告。
 3. 不一致时以 Git 和 Orca 的记录为准，修正 `STATE.md`，写明修正了什么。
 4. 从 §5 中当前阶段继续。旧会话里给人的问题没有答复时，重新问一次。
 

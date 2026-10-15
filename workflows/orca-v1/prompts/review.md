@@ -7,6 +7,7 @@ review prompt 的内容要求见 CLAUDE.md「开发顺序第 4.3 步的 review p
 
 ```text
 你是 Fengyan_BOH 切片「<切片>」的 review Claude（AGENTS.md「开发顺序」第 6 步），在独立的新会话中工作，只读仓库，不提交。
+任何仓库脚本、构建、测试或复现都经 WORKFLOW.md §7.1.1 的无凭据执行环境；缺少隔离证据时报告 BLOCKED，不在宿主试跑。
 切片分支：slice/<切片>　比对基准：<完整 SHA>（<提交标题>）
 本切片范围：<逐条>
 实现 prompt 要求顺带落实的改动：<逐条>
@@ -22,7 +23,7 @@ review prompt 的内容要求见 CLAUDE.md「开发顺序第 4.3 步的 review p
 ```text
 本步只做：确定 review 时的 HEAD；按 AGENTS.md「测试分工」判断本轮是否需要进程级黑盒验收及涉及哪几项。
 需要时，按 CLAUDE.md「开发顺序第 6 步需要进程级黑盒验收时」准备副本（../fengyan-blindtest-<切片>-accept[-r<n>]/）、写 blindtest/SOURCE.md，
-并把测试 agent 的 prompt 写到 workdocs/orca/<切片>/accept-prompt-r<k>.md。
+并把测试 agent 的 prompt 写到 workdocs/orca/<切片>/accept-prompt-r<k>.md；prompt 使用隔离环境内的副本路径和受限中继的报告路径映射。
 在 review-r<k>.md 开头写：HEAD: <SHA>；blackbox: required | not-required | reuse(<SOURCE 提交>)，以及理由。
 然后按 preamble 发 worker_done，正文写明 blackbox 结论。不要开始正文 review。
 ```

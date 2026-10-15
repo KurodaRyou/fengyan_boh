@@ -8,6 +8,9 @@
 Fengyan_BOH 切片「<切片>」实现（AGENTS.md「开发顺序」第 5 步）。
 
 Target：主检出 <绝对路径>，分支 slice/<切片>，在比对基准 <完整 SHA>（<提交标题>）之上开发。
+隔离执行入口：<协调者已按 WORKFLOW.md §7.1.1 验收的入口、配置标识和调用方式>。
+任何仓库脚本、格式化、构建、测试和复现只通过该入口在导出的工作副本执行；宿主 worker 只编辑、核对 Git 和提交，不直接执行待测代码。
+入口缺失或无法核验时立即用 preamble 的 ask 报告 H9_ISOLATION 并停止执行；不改用宿主命令。
 本切片范围：
 - <逐条：命令 / 事件 / 投影 / 接口；对应 docs/ 章节与锁定测试文件>
 需要顺带落实的已生效改动：
@@ -18,7 +21,7 @@ Target：主检出 <绝对路径>，分支 slice/<切片>，在比对基准 <完
 Constraints：遵守 AGENTS.md 全部规则（含「协作分工」中实现 agent 不得修改的锁定路径）；锁定测试有错时停下来在交付说明里提出。
 Ownership：只提交实现提交；提交信息不得以 spec: 或 docs: 开头。不读取、不引用 workdocs/。
 Observable acceptance：
-1. 在最终 HEAD 上通过 cargo fmt --all、cargo clippy --workspace --all-targets -- -D warnings、cargo test --workspace、scripts/ci-scan.sh；工作区干净。
+1. 经上述入口在最终 HEAD 的副本上通过 cargo fmt --all、cargo clippy --workspace --all-targets -- -D warnings、cargo test --workspace、scripts/ci-scan.sh；格式化若产生改动，回写非锁定源码、提交后对新 HEAD 再验证；主检出工作区干净。
 2. 交付说明写到 <主检出的上级目录>/fengyan-orca-<切片>/delivery-r1.md：改了哪些文件、对应「开发顺序」哪几步、未决问题、最终 HEAD。
 3. 按 Orca preamble 发 worker_done：--outcome 如实填写，--report-path 填上面的交付说明路径。
 需要协调者回答的问题用 preamble 里的 ask 命令，不要在终端里等人回答。
@@ -30,6 +33,7 @@ Observable acceptance：
 Fengyan_BOH 切片「<切片>」返修第 <k> 轮。
 
 Target：主检出 <绝对路径>，分支 slice/<切片>，当前 HEAD <完整 SHA>，比对基准 <完整 SHA>。
+隔离执行入口：<本轮重新核验的入口、配置标识和调用方式>。所有仓库脚本、格式化、构建、测试和复现只能经该入口；缺证据报告 H9_ISOLATION，不回退到宿主。
 需要修改的问题（来自 review，已逐条抄录）：
 - R<k>.<n>：<问题、位置 文件:行、依据（AGENTS.md / docs/ 章节）、期望的结果>
 不要改动：<review 明确认为不需要改的部分；没有写「无」>
