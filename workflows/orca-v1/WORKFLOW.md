@@ -168,7 +168,7 @@ review 在同一个 review Claude 终端里分成几个 Task 依次执行（`pro
 ### S11_PR（第 7 步）
 - 前提：最近一次 verdict 是 `PASS`，其 HEAD 等于当前 HEAD；`H0_AUTH` 中有推送和开 PR 的授权。没有授权 → `human:H5_PR`，说明要做的具体动作后等待。
 - 负责：协调者推送、开 PR（正文末尾按系统提示附署名），记录 PR 号；然后等 CI `check` 和 GitHub 上的 Codex review（§8.7）。
-- Codex 发现 → 派发给**同一个 review 终端**判断采纳与否；需要改的 → `S9_REWORK`；不采纳的理由由协调者按授权发 PR 评论。
+- Codex 发现 → 派发给**同一个 review 终端**判断采纳与否；需要改实现的 → `S9_REWORK`，需要改 `docs/`、迁移或锁定测试的 → `S10_SPEC_CHANGE`；不采纳的理由由协调者按授权发 PR 评论。
 - PR 打开后有新提交：在同一 review 终端复审新增提交（锁定路径仍逐个提交核对，黑盒按实际改动沿用、补测或重验），
   按授权评论 `@codex review`，得到新的 `PASS` 及其 HEAD。
 - 证据：CI `check` 通过；PR HEAD 等于最近一次 `PASS` 的 HEAD；Codex 已对这个 HEAD 完成 review（§8.7）；所有 Codex 发现有处理结论。
@@ -257,7 +257,7 @@ orca orchestration check --wait --types "worker_done,escalation,question" --time
 ### 8.2 启动失败与重试
 - 只有已证明的 `failed` / `stopped` 才重试。Claude、Codex worker 用 `worker-start --task <id> --retry-of <dispatch_id> --worktree ... --agent ...`，放置方式重写一遍。
 - 测试 agent 不用 `worker-start` 重试（`/boost` 会落到 preamble 之后）：关闭原终端，按 §7.1 重新建终端，用同一 spec 建新 Task（标题加 `-retry<n>`，`STATE.md` 记录与原 Task 的对应），
-  再 `dispatch --return-preamble` 并以 `/boost` 发送。同一审查阶段的测试 agent 累计三次失败即转 `blocked`，与下一条的熔断同样处理。
+  再 `dispatch --return-preamble` 并以 `/boost` 发送（换用 Codex 时不加，同 §8.4）。同一审查阶段的测试 agent 累计三次失败即转 `blocked`，与下一条的熔断同样处理。
 - 同一 Task 连续三次失败，Orca 会让该 Task 失败（circuit break）：不另开 Run 或换 Task 绕过，转 `blocked` 报告给人。
 
 ### 8.3 目录信任提示
