@@ -1,20 +1,18 @@
 # review Claude 的 Task spec 模板
 
 review prompt 的内容要求见 CLAUDE.md「开发顺序第 4.3 步的 review prompt」；核对清单由 AGENTS.md 和 CLAUDE.md 规定，这里不改写。
-本文件只补充 Orca v1 的分步方式和结论格式。所有分步按 WORKFLOW.md §7.2 派给**同一个隔离 review 会话**及其中继终端；规范变更后按 S10 新建，不在宿主启动 Claude worker。
+本文件只补充 Orca v1 的分步方式和结论格式。所有分步都派给**同一个 review 终端**（第一次 `--agent claude` 新建，之后 `--terminal` 复用）。
 
 ## 公共部分（每个分步 spec 开头都带上）
 
 ```text
 你是 Fengyan_BOH 切片「<切片>」的 review Claude（AGENTS.md「开发顺序」第 6 步），在独立的新会话中工作，只读仓库，不提交。
-隔离入口/实例/会话：<已验收标识>；只读输入：<路径、宿主 HEAD、历史/材料清单哈希>；输出根：<隔离路径>；无凭据执行器：<调用方式>。
-你和全部工具都在隔离实例内，不能访问宿主主检出、Git 元数据、凭据、workdocs 目录或 Orca socket。逐提交历史和本切片必要报告由协调者导入，只可写临时 HOME 和上述输出根；仓库脚本、构建、测试或复现另经无凭据执行器。缺少证据时经受限 ask 报告 H9_ISOLATION/BLOCKED，不回退宿主。
 切片分支：slice/<切片>　比对基准：<完整 SHA>（<提交标题>）
 本切片范围：<逐条>
 实现 prompt 要求顺带落实的改动：<逐条>
 实现 prompt 中的小改动：<逐条>
 按设计预计<需要 | 不需要>进程级黑盒验收（只是预计，按实际改动重新判定）。
-结论写到 <输出根>/review-r<k>.md；经受限中继交付，由协调者校验并映射到 workdocs/orca/<切片>/。所有分步的文件路径都是隔离内路径；不直接创建、修改或清理宿主文件。
+结论写到 workdocs/orca/<切片>/review-r<k>.md。
 实现 agent 的交付说明（只是实现方的陈述，改动范围以 git 为准）：
 <协调者粘贴 delivery-r<k>.md 全文>
 ```
@@ -23,8 +21,8 @@ review prompt 的内容要求见 CLAUDE.md「开发顺序第 4.3 步的 review p
 
 ```text
 本步只做：确定 review 时的 HEAD；按 AGENTS.md「测试分工」判断本轮是否需要进程级黑盒验收及涉及哪几项。
-需要时，输出按 CLAUDE.md 准备副本所需的完整宿主 SHA、SOURCE.md 和 accept-prompt-r<k>.md，写在输出根内；协调者核验 SHA 后导出副本（../fengyan-blindtest-<切片>-accept[-r<n>]/）并导入材料。
-prompt 使用测试隔离环境内的副本路径和受限中继的报告映射。你不操作宿主目录，不把隔离库 SHA 冒充宿主 SHA。
+需要时，按 CLAUDE.md「开发顺序第 6 步需要进程级黑盒验收时」准备副本（../fengyan-blindtest-<切片>-accept[-r<n>]/）、写 blindtest/SOURCE.md，
+并把测试 agent 的 prompt 写到 workdocs/orca/<切片>/accept-prompt-r<k>.md。
 在 review-r<k>.md 开头写：HEAD: <SHA>；blackbox: required | not-required | reuse(<SOURCE 提交>)，以及理由。
 然后按 preamble 发 worker_done，正文写明 blackbox 结论。不要开始正文 review。
 ```
@@ -43,7 +41,7 @@ RETURN_IMPL 附返修清单，每条编号 R<k>.<n>，写明位置、依据、�
 ## 分步 3：黑盒报告核对（需要时）
 
 ```text
-测试 agent 的报告已由协调者校验导入到 <隔离输入路径>/blindtest/。按 CLAUDE.md 核对报告，输出明确的延后项及留存/清理清单；协调者校验后登记到宿主 workdocs、留存并把副本移到废纸篓，你不直接修改宿主。
+测试 agent 的报告在 <副本>/blindtest/。按 CLAUDE.md 核对报告、登记延后项、留存到 workdocs/blindtest/<副本目录名>/、把副本移到废纸篓。
 更新 review-r<k>.md 的 verdict 行（规则同分步 2），再发 worker_done。
 ```
 
@@ -52,7 +50,7 @@ RETURN_IMPL 附返修清单，每条编号 R<k>.<n>，写明位置、依据、�
 ```text
 返修第 <k> 轮已提交，新的 HEAD 是 <SHA>，交付说明如下：<粘贴>。
 在本会话中复审新增提交：锁定路径仍逐个提交核对；黑盒按 AGENTS.md 判断沿用、补测或重验并写明依据
-（对比的是协调者从 workdocs/blindtest/ 筛选导入的 SOURCE.md 所记录的提交）。需要补测或重验时，先只做分诊部分并发 worker_done。
+（对比的是 workdocs/blindtest/ 中留存的 SOURCE.md 记录的提交）。需要补测或重验时，先只做分诊部分并发 worker_done。
 结论写到 review-r<k+1>.md，verdict 行规则同上。
 ```
 

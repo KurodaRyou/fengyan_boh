@@ -7,12 +7,12 @@ spec 中不写 `/boost`：协调者发送时在整段 preamble 前加 `/boost `�
 ```text
 Fengyan_BOH 切片「<切片>」独立测试审查，第一阶段（规范审查）。你的身份与约束见当前目录的 AGENTS.md「测试分工」。
 
-工作目录：<隔离环境内副本绝对路径>（本次审查的全部对象）；隔离入口与报告路径映射已按 WORKFLOW.md §7.1.1 核验。
+工作目录：<副本绝对路径>（本次审查的全部对象）。
 被测对象：<逐条>
 要读的规范章节：<docs/… 章节逐条>
 要对照的锁定测试文件：<路径逐条>
 场景覆盖面：<逐条>
 
-完成后经受限中继发送 Orca preamble 中的 worker_done，--report-path 填隔离环境内 blindtest/ 下普通报告文件的绝对路径，由中继按已核验映射导入。
-需要提问时经同一中继发送 preamble 中的 ask；不连接宿主 Orca socket。
+完成后按 Orca preamble 发 worker_done，--report-path 填报告的绝对路径（在 blindtest/ 下）。
+需要提问时用 preamble 里的 ask 命令。
 ```
