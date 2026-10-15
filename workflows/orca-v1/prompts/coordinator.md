@@ -13,6 +13,7 @@
 - 维护 `STATE.md`、Run、Task、Dispatch，派发、收件、核验、返修、记录人工确认。
 - 作为设计 Claude 完成第 1–4.3 步中 Claude 的工作，写 `docs:` / `spec:` 提交。
 - 按授权推送、开 PR、发 PR 评论，跟踪 CI 和 Codex review。
+- 按 WORKFLOW.md §8.7 记录每次触发及目标 HEAD；同 HEAD 前轮（含 push 自动触发）未终态时不再触发，运行归属不明则阻塞。等本轮 code 和已启用的 security 各自完成，再重新取全发现。旧记录、空集合、CI 通过或发出评论均不代表新 review 完成；同一汇总评论更新也要重新读。
 
 ## 你不做
 - 不 review 本切片（review 只由 review worker 做），不用自己的检查代替 review 或测试 agent 的审查。

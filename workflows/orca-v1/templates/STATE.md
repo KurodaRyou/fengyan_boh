@@ -43,5 +43,19 @@
 ## 已处理消息
 <!-- message id 列表，防止重复处理 -->
 
+## GitHub review 轮次
+<!-- 完成证据与发现去重分开；按 WORKFLOW.md §8.7 核对，旧 HEAD 或旧轮次不放行。 -->
+- PR: <号/URL>　轮次: <n>　目标 HEAD: <完整 SHA>
+- 要求的类型: <code / code + security；配置依据>
+- 触发前快照: <review id；汇总评论 id/updated_at/正文哈希及各类型完成状态>
+- 前轮终态/串行证据或本轮 run 关联: <含 push 自动触发；未归属运行存在时阻塞>
+- 触发: <PR 创建或评论 id/URL/GitHub 时间>　状态: <pending / confirmed / unknown>
+| 类型 | 状态 | 完成记录 id/URL | 完整 SHA（短 SHA 解析依据） | 完成时间 | updated_at/正文哈希 | 相对触发前新增/变化 |
+|---|---|---|---|---|---|---|
+| code | waiting | | | | | |
+| security（启用时） | waiting | | | | | |
+- 完成后的全量读取与处理结论: <时间；集合/id/updated_at/正文哈希 → 处理结论>
+- 推进前复核: <PR HEAD；CI check 对应 SHA；Claude PASS HEAD；各类 Codex 完成 SHA>
+
 ## 待处理问题
 - 
