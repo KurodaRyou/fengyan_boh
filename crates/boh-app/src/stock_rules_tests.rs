@@ -32,14 +32,14 @@ async fn seed(node: &Node) -> (String, String) {
 }
 
 fn receipt(item: &str, supplier: &str, count: usize) -> Value {
-    let line = json!({"item_id": item, "input": {"qty": 5, "unit_code": "g", "base_qty_per_unit": 1},
+    let line = json!({"item_id": item, "input": {"qty":"5", "unit_code": "g", "base_qty_per_unit":"1"},
         "produced_on": "2026-10-01", "expires_on": "2026-10-20", "line_cost_cents": 0});
     json!({"command_id": master_command_id(3), "supplier_id": supplier, "lines": vec![line; count],
         "captured_at": NOW, "sent_at": NOW})
 }
 
 fn waste(item: &str) -> Value {
-    json!({"item_id": item, "input": {"qty": 1, "unit_code": "g", "base_qty_per_unit": 1}, "reason_code": "EXPIRED"})
+    json!({"item_id": item, "input": {"qty":"1", "unit_code": "g", "base_qty_per_unit":"1"}, "reason_code": "EXPIRED"})
 }
 
 async fn assert_waste_error(
@@ -117,7 +117,7 @@ async fn waste_checks_each_line_before_loading_later_balances_or_confirming_shor
     .await;
     assert_eq!(received.0, 200, "{received:?}");
     let mut shortage = waste(&item);
-    shortage["input"]["qty"] = json!(6);
+    shortage["input"]["qty"] = json!("6");
     assert_waste_error(
         &node,
         vec![shortage, unknown_item],
@@ -130,7 +130,7 @@ async fn waste_checks_each_line_before_loading_later_balances_or_confirming_shor
 }
 
 #[tokio::test]
-async fn waste_references_precede_book_overflow_and_book_overflow_precedes_later_lines() {
+async fn waste_references_precede_stock_limit_and_stock_limit_precedes_later_lines() {
     let node = node(true).await;
     let (item, supplier) = seed(&node).await;
     assert_eq!(
@@ -147,8 +147,11 @@ async fn waste_references_precede_book_overflow_and_book_overflow_precedes_later
     node.storage
         .writer
         .call(|tx| -> Result<(), StorageError> {
-            tx.execute("UPDATE inventory_lots SET remaining_qty = ?1", [i64::MAX])
-                .map_err(|e| StorageError::sqlite("设置账面越界夹具", e))?;
+            tx.execute(
+                "UPDATE inventory_lots SET remaining_qty = CASE WHEN lot_serial = 1 THEN -1000000000000 ELSE 0 END",
+                [],
+            )
+            .map_err(|e| StorageError::sqlite("设置库存下限夹具", e))?;
             Ok(())
         })
         .await
@@ -176,16 +179,54 @@ async fn waste_references_precede_book_overflow_and_book_overflow_precedes_later
     assert_waste_error(
         &node,
         vec![waste(&item), waste(UNKNOWN)],
-        400,
-        "VALIDATION_FAILED",
-        json!({}),
+        409,
+        "STOCK_LIMIT_EXCEEDED",
+        json!({"line": 0, "item_id": item}),
     )
     .await;
     node.storage.writer_handle.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn waste_accepts_wide_intermediate_sum_and_uses_the_updated_book_on_the_next_line() {
+async fn stored_state_outside_the_stock_limit_is_an_internal_error_not_a_line_conflict() {
+    let node = node(true).await;
+    let (item, supplier) = seed(&node).await;
+    assert_eq!(
+        send(
+            node.router.clone(),
+            Method::POST,
+            RECEIPTS,
+            receipt(&item, &supplier, 2)
+        )
+        .await
+        .0,
+        200
+    );
+    // Each lot is within its CHECK constraint, but the net book is 2L. Only a
+    // projection fault can store that; no request line caused it.
+    node.storage
+        .writer
+        .call(|tx| -> Result<(), StorageError> {
+            tx.execute(
+                "UPDATE inventory_lots SET remaining_qty = 1000000000000",
+                [],
+            )
+            .map_err(|e| StorageError::sqlite("设置越界投影夹具", e))?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_waste_error(&node, vec![waste(&item)], 500, "INTERNAL_ERROR", json!({})).await;
+    let mut again = receipt(&item, &supplier, 1);
+    again["command_id"] = json!(master_command_id(5));
+    let (status, reply) = send(node.router.clone(), Method::POST, RECEIPTS, again).await;
+    assert_eq!(status, 500, "{reply}");
+    assert_eq!(reply["error"]["code"], "INTERNAL_ERROR", "{reply}");
+    node.storage.writer_handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn waste_accepts_intermediate_sum_above_stock_limit_and_updates_the_next_line() {
     let node = node(true).await;
     let (item, supplier) = seed(&node).await;
     assert_eq!(
@@ -202,12 +243,14 @@ async fn waste_accepts_wide_intermediate_sum_and_uses_the_updated_book_on_the_ne
     node.storage
         .writer
         .call(|tx| -> Result<(), StorageError> {
-            for (serial, qty) in [(1, i64::MAX), (2, 1), (3, -1)] {
+            // Only the final net book is limited; summing the positive lots
+            // temporarily exceeds L before the negative lot cancels it.
+            for (serial, qty) in [(1, 1_000_000_000_000_i64), (2, 1000), (3, -1000)] {
                 tx.execute(
                     "UPDATE inventory_lots SET remaining_qty = ?2 WHERE lot_serial = ?1",
                     [serial, qty],
                 )
-                .map_err(|e| StorageError::sqlite("设置宽整数夹具", e))?;
+                .map_err(|e| StorageError::sqlite("设置库存上限夹具", e))?;
             }
             Ok(())
         })
@@ -224,7 +267,7 @@ async fn waste_accepts_wide_intermediate_sum_and_uses_the_updated_book_on_the_ne
     assert_eq!(precheck.0, 200, "{precheck:?}");
     let logged = send(node.router.clone(), Method::POST, WASTE, json!({"command_id": master_command_id(4), "lines": lines, "captured_at": NOW, "sent_at": NOW})).await;
     assert_eq!(logged.0, 200, "{logged:?}");
-    for (index, qty) in [i64::MAX, i64::MAX - 1].into_iter().enumerate() {
+    for (index, qty) in ["1000000000", "999999999"].into_iter().enumerate() {
         assert_eq!(precheck.1["data"]["lines"][index]["item_book_qty"], qty);
         assert_eq!(
             logged.1["data"]["waste_record"]["lines"][index]["item_book_qty"],
@@ -338,12 +381,12 @@ async fn interleaved_items_keep_separate_balances_and_serials() {
     }
     let mut first = waste(&flour);
     first["lot_id"] = json!("RAW-FLOUR-20261006-001");
-    first["input"]["qty"] = json!(6);
+    first["input"]["qty"] = json!("6");
     first["confirm_shortage"] = json!(true);
     let command = json!({"command_id": master_command_id(4), "lines": [first, waste(sugar), waste(&flour)], "captured_at": NOW, "sent_at": NOW});
     let reply = send(node.router.clone(), Method::POST, WASTE, command).await;
     assert_eq!(reply.0, 200, "{reply:?}");
-    for (index, book) in [10, 5, 4].into_iter().enumerate() {
+    for (index, book) in ["10", "5", "4"].into_iter().enumerate() {
         assert_eq!(
             reply.1["data"]["waste_record"]["lines"][index]["item_book_qty"],
             book
@@ -351,11 +394,11 @@ async fn interleaved_items_keep_separate_balances_and_serials() {
     }
     assert_eq!(
         reply.1["data"]["waste_record"]["lines"][0]["lot_book_qty"],
-        5
+        "5"
     );
     assert_eq!(
         reply.1["data"]["waste_record"]["lines"][2]["alloc"],
-        json!([{"lot_id": "RAW-FLOUR-20261006-002", "qty": 1, "source": "FIFO"}])
+        json!([{"lot_id": "RAW-FLOUR-20261006-002", "qty":"1", "source": "FIFO"}])
     );
     node.storage.writer_handle.shutdown().await.unwrap();
 }
@@ -386,7 +429,7 @@ async fn normalized_requests_and_saved_responses_keep_their_exact_text() {
     assert_eq!(received.0, 200, "{received:?}");
     let saved = saved_command(&node, master_command_id(3)).await;
     let request = format!(
-        r#"{{"captured_at":{},"lines":[{{"expires_on":"2026-10-20","input":{{"base_qty_per_unit":1,"qty":5,"unit_code":"g"}},"item_id":"{item}","line_cost_cents":0,"produced_on":"2026-10-01"}},{{"expires_on":"2026-10-15","input":{{"base_qty_per_unit":1,"qty":5,"unit_code":"g"}},"item_id":"{item}","line_cost_cents":0,"produced_on":"2026-10-01"}}],"supplier_id":"{supplier}"}}"#,
+        r#"{{"captured_at":{},"lines":[{{"expires_on":"2026-10-20","input":{{"base_qty_per_unit":"1","qty":"5","unit_code":"g"}},"item_id":"{item}","line_cost_cents":0,"produced_on":"2026-10-01"}},{{"expires_on":"2026-10-15","input":{{"base_qty_per_unit":"1","qty":"5","unit_code":"g"}},"item_id":"{item}","line_cost_cents":0,"produced_on":"2026-10-01"}}],"supplier_id":"{supplier}"}}"#,
         NOW + 60_000
     );
     assert_eq!(saved.0, request);
@@ -416,7 +459,7 @@ async fn normalized_requests_and_saved_responses_keep_their_exact_text() {
     assert_eq!(
         saved.0,
         format!(
-            r#"{{"captured_at":{NOW},"lines":[{{"input":{{"base_qty_per_unit":1,"qty":1,"unit_code":"g"}},"item_id":"{item}","reason_code":"EXPIRED"}}]}}"#
+            r#"{{"captured_at":{NOW},"lines":[{{"input":{{"base_qty_per_unit":"1","qty":"1","unit_code":"g"}},"item_id":"{item}","reason_code":"EXPIRED"}}]}}"#
         )
     );
     assert_eq!(

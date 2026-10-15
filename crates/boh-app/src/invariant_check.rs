@@ -3,6 +3,7 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use boh_domain::UnixMillis;
+use boh_domain::quantity::Quantity;
 use boh_storage::rusqlite::Connection;
 use boh_storage::{Readers, StorageError, clock::Clock};
 use serde::Serialize;
@@ -65,8 +66,8 @@ struct Check {
 struct Sample {
     check: &'static str,
     subject: Subject,
-    actual: i64,
-    expected: i64,
+    actual: Quantity,
+    expected: Quantity,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -336,9 +337,9 @@ fn check_snapshot(conn: &Connection) -> Result<SnapshotResult, StorageError> {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<String>>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
+                    Quantity::from_milli(row.get(2)?),
+                    Quantity::from_milli(row.get(3)?),
+                    Quantity::from_milli(row.get(4)?),
                 ))
             })()
             .map_err(|error| StorageError::sqlite(operation, error))?;
@@ -400,6 +401,80 @@ mod tests {
     use boh_storage::clock::ManualClock;
     use std::num::NonZeroUsize;
     use std::time::Duration;
+
+    #[test]
+    fn health_report_uses_canonical_decimal_strings_for_all_quantity_signs() {
+        let health = InvariantCheckHealth::default();
+        health.record(
+            Ok(SnapshotResult {
+                max_seq: 1,
+                checks: vec![Check {
+                    check: "INVENTORY_LOT_REMAINING",
+                    violations: 3,
+                }],
+                violation_count: 3,
+                samples: [(7000, 0), (-1250, -1), (0, 35_437)]
+                    .into_iter()
+                    .map(|(actual, expected)| Sample {
+                        check: "INVENTORY_LOT_REMAINING",
+                        subject: Subject::Lot {
+                            item_id: "item".into(),
+                            lot_id: "lot".into(),
+                        },
+                        actual: Quantity::from_milli(actual),
+                        expected: Quantity::from_milli(expected),
+                    })
+                    .collect(),
+                samples_truncated: false,
+            }),
+            UnixMillis(100),
+        );
+        let value = serde_json::to_value(health.snapshot()).unwrap();
+        assert_eq!(value["last_attempt"]["result"], "violated");
+        assert_eq!(value["last_report"]["violation_count"], 3);
+        for (sample, (actual, expected)) in value["last_report"]["samples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip([("7", "0"), ("-1.25", "-0.001"), ("0", "35.437")])
+        {
+            assert_eq!(sample["actual"], actual);
+            assert_eq!(sample["expected"], expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn invariant_check_decodes_database_quantities_in_milli_units() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = boh_storage::open(&dir.path().join("boh.db"), NonZeroUsize::MIN).unwrap();
+        storage
+            .writer
+            .call(|tx| -> Result<(), StorageError> {
+                let item_id = "01890a5d-ac96-774b-bcce-b302099a8301";
+                tx.execute(
+                    "INSERT INTO items (id, code, name, base_unit, category, active, revision)
+                 VALUES (?1, 'FLOUR', 'Flour', 'g', 'RAW', 1, 1)",
+                    [item_id],
+                )
+                .map_err(|error| StorageError::sqlite("写入自检测试物料", error))?;
+                tx.execute(
+                    "INSERT INTO inventory_unallocated (item_id, qty) VALUES (?1, -1250)",
+                    [item_id],
+                )
+                .map_err(|error| StorageError::sqlite("写入自检测试账外缺口", error))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let report = storage.readers.call(check_snapshot).await.unwrap();
+        assert_eq!(report.violation_count, 1);
+        assert_eq!(report.checks.len(), 3);
+        assert_eq!(report.samples[0].check, "INVENTORY_UNALLOCATED");
+        let sample = serde_json::to_value(&report.samples[0]).unwrap();
+        assert_eq!(sample["actual"], "-1.25");
+        assert_eq!(sample["expected"], "0");
+        storage.writer_handle.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn shutdown_drains_queued_checks_even_when_the_submitter_stops_waiting() {

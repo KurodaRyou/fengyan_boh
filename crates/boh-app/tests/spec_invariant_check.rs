@@ -182,7 +182,8 @@ fn passed(finished_at: i64, max_seq: i64) -> Value {
     })
 }
 
-fn lot_sample(item_id: &str, lot_id: &str, actual: i64, expected: i64) -> Value {
+/// 第 1 项的一条样本；`actual`、`expected` 是基本单位的小数字符串（存储值 7000 写作 "7"）。
+fn lot_sample(item_id: &str, lot_id: &str, actual: &str, expected: &str) -> Value {
     json!({
         "check": LOT,
         "subject": { "item_id": item_id, "lot_id": lot_id },
@@ -191,7 +192,8 @@ fn lot_sample(item_id: &str, lot_id: &str, actual: i64, expected: i64) -> Value 
     })
 }
 
-fn item_sample(check: &str, item_id: &str, actual: i64, expected: i64) -> Value {
+/// 第 2、3 项的一条样本；`actual`、`expected` 同 `lot_sample`。
+fn item_sample(check: &str, item_id: &str, actual: &str, expected: &str) -> Value {
     json!({
         "check": check,
         "subject": { "item_id": item_id },
@@ -262,7 +264,7 @@ async fn receive(
         .map(|qty| {
             json!({
                 "item_id": item,
-                "input": { "qty": qty, "unit_code": "g", "base_qty_per_unit": 1 },
+                "input": { "qty": qty.to_string(), "unit_code": "g", "base_qty_per_unit": "1" },
                 "produced_on": "2026-10-01", "expires_on": "2026-10-20", "line_cost_cents": 100,
             })
         })
@@ -289,7 +291,7 @@ async fn receive(
 async fn waste(router: &Router, n: u16, now: i64, item: &str, lot: Option<&str>, qty: i64) {
     let mut line = json!({
         "item_id": item,
-        "input": { "qty": qty, "unit_code": "g", "base_qty_per_unit": 1 },
+        "input": { "qty": qty.to_string(), "unit_code": "g", "base_qty_per_unit": "1" },
         "reason_code": "EXPIRED",
         "confirm_shortage": true,
     });
@@ -313,7 +315,7 @@ struct Stock {
 /// 在 `NOW` 建一个一致的库存账本，共 7 个事件（seq 1～7）：
 /// 物料 FLOUR、SUGAR（SUGAR 没有库存），供应商，报损原因 EXPIRED；FLOUR 收货 A 5、B 10；
 /// 指定 B 报损 12（确认）→ B −2；不指定批次报损 6（确认）→ FIFO 扣 A 5 → A 0，余下 1 记入账外缺口。
-/// 结果：A 0、B −2，FLOUR 账外缺口 −1，账面 FLOUR −3、SUGAR 0。
+/// 结果：A 0、B −2，FLOUR 账外缺口 −1，账面 FLOUR −3、SUGAR 0。投影中的数量是千分之一克（B −2000）。
 async fn stock(router: &Router) -> Stock {
     let flour = item(router, 1, "FLOUR").await;
     let sugar = item(router, 2, "SUGAR").await;
@@ -351,8 +353,9 @@ async fn consistent_ledger_with_negative_lot_passes() {
     node.shutdown().await.unwrap();
 }
 
-// 启动检查发现违规：A 的余量被改成 7（流水合计 0）；FLOUR 的账外缺口行被删除（流水合计 −1，缺行按 0）；
-// SUGAR 多出一行账外缺口 −4（没有流水，按 0）。违规按「检查码 + 对象」计数，样本按检查顺序、再按 subject 排列。
+// 启动检查发现违规：A 的余量被改成 7 g（存 7000；流水合计 0）；FLOUR 的账外缺口行被删除（流水合计 −1，缺行按 0）；
+// SUGAR 多出一行账外缺口 −4（没有流水，按 0）。违规按「检查码 + 对象」计数，样本按检查顺序、再按 subject 排列；
+// 样本的 actual、expected 是基本单位的小数字符串（docs/invariant-check.md「检查项」）。
 // 账面视图由表计算，与表一致，第 3 项无违规。violated 使 status 为 degraded。
 // 「检查不修改数据库，不自动修复」：检查前后账本、幂等记录和库存投影逐行相同。
 // 「其他降级原因照常生效」的反面：之后的整点备份成功，不清除自检造成的降级。violated 不阻止写入。
@@ -363,19 +366,19 @@ async fn startup_check_reports_lot_and_unallocated_mismatches() {
     let Stock { flour, sugar } = stock(&node.router).await;
     node.shutdown().await.unwrap();
     fixture.corrupt(&format!(
-        "UPDATE inventory_lots SET remaining_qty = 7 WHERE lot_id = '{A}';
+        "UPDATE inventory_lots SET remaining_qty = 7000 WHERE lot_id = '{A}';
          DELETE FROM inventory_unallocated WHERE item_id = '{flour}';
-         INSERT INTO inventory_unallocated (item_id, qty) VALUES ('{sugar}', -4);"
+         INSERT INTO inventory_unallocated (item_id, qty) VALUES ('{sugar}', -4000);"
     ));
     let before = fixture.state();
 
     fixture.set(NOW + HOUR);
     let (node, startup) = fixture.start().await;
     assert_eq!(fixture.state(), before);
-    let mut samples = vec![lot_sample(&flour, A, 7, 0)];
+    let mut samples = vec![lot_sample(&flour, A, "7", "0")];
     samples.extend(by_item(vec![
-        item_sample(UNALLOCATED, &flour, 0, -1),
-        item_sample(UNALLOCATED, &sugar, -4, 0),
+        item_sample(UNALLOCATED, &flour, "0", "-1"),
+        item_sample(UNALLOCATED, &sugar, "-4", "0"),
     ]));
     assert_eq!(
         startup,
@@ -420,7 +423,7 @@ async fn missing_unallocated_row_with_zero_total_is_legal() {
     fixture.corrupt(&format!(
         "INSERT INTO inventory_movements (event_seq, movement_no, item_id, lot_id, kind, alloc_source,
              nominal_qty, qty_delta, absorbed_by_event_id, physical_at, business_date)
-         VALUES (7, 50, '{sugar}', NULL, 'WASTE', 'ABSORBED', -3, 0,
+         VALUES (7, 50, '{sugar}', NULL, 'WASTE', 'ABSORBED', -3000, 0,
              (SELECT id FROM store_events WHERE seq = 6), {NOW}, '2026-10-06');"
     ));
 
@@ -433,7 +436,7 @@ async fn missing_unallocated_row_with_zero_total_is_legal() {
 // 「对象范围」：第 1 项是 inventory_lots 的全部批次（含没有流水的），第 2 项是有账外缺口行或有 lot_id IS NULL
 // 流水的全部物料；都不按物料是否停用过滤。SUGAR 先停用，再加两个没有流水的批次：余量 0 的合法，余量 3 的违规；
 // 再加一条 lot_id IS NULL、qty_delta = +3 的盘点流水，没有账外缺口行（流水合计为正，按第 2 项报告）。
-// FLOUR 的账外缺口行从 −1 改成 −2：两边都有值但不相等。
+// FLOUR 的账外缺口行从 −1 改成 −1.5（存 −1500）：两边都有值但不相等，样本写作 "-1.5"。
 #[tokio::test]
 async fn object_ranges_include_lots_without_movements_and_inactive_items() {
     let fixture = Fixture::new(NOW);
@@ -456,19 +459,19 @@ async fn object_ranges_include_lots_without_movements_and_inactive_items() {
         "INSERT INTO inventory_lots (lot_id, item_id, lot_date, lot_serial, origin, source_event_seq,
              source_line_no, remaining_qty, expires_at, manufacturer_lot_no)
          VALUES ('RAW-SUGAR-20261006-001', '{sugar}', '2026-10-06', 1, 'RECEIPT', 5, 10, 0, NULL, NULL),
-                ('RAW-SUGAR-20261006-002', '{sugar}', '2026-10-06', 2, 'RECEIPT', 5, 11, 3, NULL, NULL);
+                ('RAW-SUGAR-20261006-002', '{sugar}', '2026-10-06', 2, 'RECEIPT', 5, 11, 3000, NULL, NULL);
          INSERT INTO inventory_movements (event_seq, movement_no, item_id, lot_id, kind, alloc_source,
              nominal_qty, qty_delta, absorbed_by_event_id, physical_at, business_date)
-         VALUES (7, 50, '{sugar}', NULL, 'ADJUST', 'COUNT', 3, 3, NULL, {NOW}, '2026-10-06');
-         UPDATE inventory_unallocated SET qty = -2 WHERE item_id = '{flour}';"
+         VALUES (7, 50, '{sugar}', NULL, 'ADJUST', 'COUNT', 3000, 3000, NULL, {NOW}, '2026-10-06');
+         UPDATE inventory_unallocated SET qty = -1500 WHERE item_id = '{flour}';"
     ));
 
     fixture.set(NOW + HOUR);
     let (node, startup) = fixture.start().await;
-    let mut samples = vec![lot_sample(&sugar, "RAW-SUGAR-20261006-002", 3, 0)];
+    let mut samples = vec![lot_sample(&sugar, "RAW-SUGAR-20261006-002", "3", "0")];
     samples.extend(by_item(vec![
-        item_sample(UNALLOCATED, &flour, -2, -1),
-        item_sample(UNALLOCATED, &sugar, 0, 3),
+        item_sample(UNALLOCATED, &flour, "-1.5", "-1"),
+        item_sample(UNALLOCATED, &sugar, "0", "3"),
     ]));
     assert_eq!(
         startup,
@@ -496,16 +499,16 @@ async fn samples_are_ordered_and_truncated_at_twenty() {
     lots.sort();
     node.shutdown().await.unwrap();
     fixture.corrupt(&format!(
-        "UPDATE inventory_lots SET remaining_qty = 11;
-         INSERT INTO inventory_unallocated (item_id, qty) VALUES ('{flour}', -2), ('{sugar}', -4);"
+        "UPDATE inventory_lots SET remaining_qty = 11000;
+         INSERT INTO inventory_unallocated (item_id, qty) VALUES ('{flour}', -2000), ('{sugar}', -4000);"
     ));
     let lot_samples: Vec<Value> = lots
         .iter()
-        .map(|lot| lot_sample(&flour, lot, 11, 10))
+        .map(|lot| lot_sample(&flour, lot, "11", "10"))
         .collect();
     let unallocated = by_item(vec![
-        item_sample(UNALLOCATED, &flour, -2, 0),
-        item_sample(UNALLOCATED, &sugar, -4, 0),
+        item_sample(UNALLOCATED, &flour, "-2", "0"),
+        item_sample(UNALLOCATED, &sugar, "-4", "0"),
     ]);
 
     fixture.set(NOW + HOUR);
@@ -521,7 +524,7 @@ async fn samples_are_ordered_and_truncated_at_twenty() {
     exec(
         &node,
         format!(
-            "UPDATE inventory_lots SET remaining_qty = 10 WHERE lot_id >= '{}';",
+            "UPDATE inventory_lots SET remaining_qty = 10000 WHERE lot_id >= '{}';",
             lots[19]
         ),
     )
@@ -558,7 +561,7 @@ async fn samples_are_ordered_and_truncated_at_twenty() {
 // 服务端生成的 UUIDv7 以 recorded_at 为时间部分：在 NOW 建 SUGAR、在 NOW + 1ms 建 FLOUR，SUGAR 的 item_id 较小；
 // 而批次号 RAW-FLOUR-… 小于 RAW-SUGAR-…，两个排序键给出相反的顺序。
 // FLOUR 先实时收货（批次日期 2026-10-06），再补交一张 48 小时前录入的收货（批次日期 2026-10-04）：
-// 后建的批次号较小，表中的插入顺序与 lot_id 顺序相反。三个批次的余量各加 1。
+// 后建的批次号较小，表中的插入顺序与 lot_id 顺序相反。三个批次的余量各加 0.001 g（存储值 + 1），样本写作 "3.001" 等。
 #[tokio::test]
 async fn samples_sort_by_item_id_then_lot_id() {
     let fixture = Fixture::new(NOW);
@@ -582,9 +585,9 @@ async fn samples_sort_by_item_id_then_lot_id() {
     .await;
     fixture.set(NOW + HOUR);
     let samples = vec![
-        lot_sample(&sugar, "RAW-SUGAR-20261006-001", 4, 3),
-        lot_sample(&flour, "RAW-FLOUR-20261004-001", 8, 7),
-        lot_sample(&flour, "RAW-FLOUR-20261006-001", 6, 5),
+        lot_sample(&sugar, "RAW-SUGAR-20261006-001", "3.001", "3"),
+        lot_sample(&flour, "RAW-FLOUR-20261004-001", "7.001", "7"),
+        lot_sample(&flour, "RAW-FLOUR-20261006-001", "5.001", "5"),
     ];
     assert_eq!(
         run(&node).await,
@@ -598,7 +601,7 @@ async fn samples_sort_by_item_id_then_lot_id() {
 
 // ---------------------------------------------------------------- 报告的更新
 
-// 运行中经唯一写连接制造异常：A 改成 7 → violated，degraded。
+// 运行中经唯一写连接制造异常：A 改成 7 g → violated，degraded。
 // 「任一汇总超出 i64：本次检查失败」：再给 A 加两条 qty_delta = i64::MAX 的流水 → failed，只更新 last_attempt，
 // last_report 保持上一份 violated 报告，仍 degraded。
 // 修复后把时钟回拨到早于上述两次的时刻再检查：passed 照样覆盖之前的结果（按执行先后，不比较时间戳），status 回到 ok。
@@ -610,7 +613,7 @@ async fn failure_keeps_the_last_report_and_a_repair_clears_it() {
 
     exec(
         &node,
-        format!("UPDATE inventory_lots SET remaining_qty = 7 WHERE lot_id = '{A}';"),
+        format!("UPDATE inventory_lots SET remaining_qty = 7000 WHERE lot_id = '{A}';"),
     )
     .await;
     fixture.set(NOW + 2 * HOUR);
@@ -618,7 +621,7 @@ async fn failure_keeps_the_last_report_and_a_repair_clears_it() {
         NOW + 2 * HOUR,
         7,
         [1, 0, 0],
-        vec![lot_sample(&flour, A, 7, 0)],
+        vec![lot_sample(&flour, A, "7", "0")],
         false,
     );
     assert_eq!(
@@ -717,9 +720,10 @@ async fn first_failure_degrades_and_a_later_failure_keeps_the_passed_report() {
     node.shutdown().await.unwrap();
 }
 
-// 「不发布半份报告」「当前每次检查执行表中全部检查项」：A 改成 7 → violated。再给 FLOUR 加两个批次，各有一条
-// qty_delta = i64::MAX 的流水、余量也是 i64::MAX：第 1 项逐批次一致（恰在 i64 上限，合法），第 3 项的批次余量之和
-// 超出 i64 → failed。前面第 1 项已发现的违规不发布，last_report 仍是上一份。删掉这两个批次、修复 A 后 passed。
+// 「不发布半份报告」「当前每次检查执行表中全部检查项」：A 改成 7 g → violated。再给 FLOUR 加两条 lot_id IS NULL、
+// qty_delta = i64::MIN 的流水：第 1 项照常发现 A 的违规，第 2 项的流水之和超出 i64 → failed。前面第 1 项已发现的违规不发布，
+// last_report 仍是上一份。删掉这两条流水、修复 A 后 passed。
+// （批次余量和账外缺口受库存状态上限的表约束限制，第 3 项的汇总造不出溢出；溢出只经不受范围约束的流水制造。）
 #[tokio::test]
 async fn a_later_check_failure_publishes_no_partial_report() {
     let fixture = Fixture::new(NOW);
@@ -727,7 +731,7 @@ async fn a_later_check_failure_publishes_no_partial_report() {
     let Stock { flour, .. } = stock(&node.router).await;
     exec(
         &node,
-        format!("UPDATE inventory_lots SET remaining_qty = 7 WHERE lot_id = '{A}';"),
+        format!("UPDATE inventory_lots SET remaining_qty = 7000 WHERE lot_id = '{A}';"),
     )
     .await;
     fixture.set(NOW + HOUR);
@@ -735,7 +739,7 @@ async fn a_later_check_failure_publishes_no_partial_report() {
         NOW + HOUR,
         7,
         [1, 0, 0],
-        vec![lot_sample(&flour, A, 7, 0)],
+        vec![lot_sample(&flour, A, "7", "0")],
         false,
     );
     assert_eq!(
@@ -743,18 +747,14 @@ async fn a_later_check_failure_publishes_no_partial_report() {
         json!({ "last_attempt": attempt(NOW + HOUR, "violated"), "last_report": violated })
     );
 
-    let max = i64::MAX;
+    let min = i64::MIN;
     exec(
         &node,
         format!(
-            "INSERT INTO inventory_lots (lot_id, item_id, lot_date, lot_serial, origin, source_event_seq,
-                 source_line_no, remaining_qty, expires_at, manufacturer_lot_no)
-             VALUES ('RAW-FLOUR-20261006-010', '{flour}', '2026-10-06', 10, 'RECEIPT', 5, 10, {max}, NULL, NULL),
-                    ('RAW-FLOUR-20261006-011', '{flour}', '2026-10-06', 11, 'RECEIPT', 5, 11, {max}, NULL, NULL);
-             INSERT INTO inventory_movements (event_seq, movement_no, item_id, lot_id, kind, alloc_source,
+            "INSERT INTO inventory_movements (event_seq, movement_no, item_id, lot_id, kind, alloc_source,
                  nominal_qty, qty_delta, absorbed_by_event_id, physical_at, business_date)
-             VALUES (5, 100, '{flour}', 'RAW-FLOUR-20261006-010', 'RECEIPT', 'NEW_LOT', {max}, {max}, NULL, {NOW}, '2026-10-06'),
-                    (5, 101, '{flour}', 'RAW-FLOUR-20261006-011', 'RECEIPT', 'NEW_LOT', {max}, {max}, NULL, {NOW}, '2026-10-06');"
+             VALUES (7, 100, '{flour}', NULL, 'WASTE', 'SHORTFALL', {min}, {min}, NULL, {NOW}, '2026-10-06'),
+                    (7, 101, '{flour}', NULL, 'WASTE', 'SHORTFALL', {min}, {min}, NULL, {NOW}, '2026-10-06');"
         ),
     )
     .await;
@@ -768,8 +768,7 @@ async fn a_later_check_failure_publishes_no_partial_report() {
     exec(
         &node,
         format!(
-            "DELETE FROM inventory_movements WHERE event_seq = 5 AND movement_no IN (100, 101);
-             DELETE FROM inventory_lots WHERE lot_id IN ('RAW-FLOUR-20261006-010', 'RAW-FLOUR-20261006-011');
+            "DELETE FROM inventory_movements WHERE event_seq = 7 AND movement_no IN (100, 101);
              UPDATE inventory_lots SET remaining_qty = 0 WHERE lot_id = '{A}';"
         ),
     )
@@ -791,7 +790,7 @@ async fn a_passing_check_keeps_other_degradation() {
 
     exec(
         &node,
-        format!("UPDATE inventory_lots SET remaining_qty = 7 WHERE lot_id = '{A}';"),
+        format!("UPDATE inventory_lots SET remaining_qty = 7000 WHERE lot_id = '{A}';"),
     )
     .await;
     fixture.set(NOW - 300_001);
@@ -799,7 +798,7 @@ async fn a_passing_check_keeps_other_degradation() {
         run(&node).await,
         json!({
             "last_attempt": attempt(NOW - 300_001, "violated"),
-            "last_report": report(NOW - 300_001, 7, [1, 0, 0], vec![lot_sample(&flour, A, 7, 0)], false),
+            "last_report": report(NOW - 300_001, 7, [1, 0, 0], vec![lot_sample(&flour, A, "7", "0")], false),
         })
     );
     let data = health(&node.router).await;
@@ -855,7 +854,7 @@ async fn closing_backs_up_before_checking() {
     let Stock { flour, .. } = stock(&node.router).await;
     exec(
         &node,
-        format!("UPDATE inventory_lots SET remaining_qty = 7 WHERE lot_id = '{A}';"),
+        format!("UPDATE inventory_lots SET remaining_qty = 7000 WHERE lot_id = '{A}';"),
     )
     .await;
 
@@ -891,7 +890,7 @@ async fn closing_backs_up_before_checking() {
     drop(check_hold);
     let closing = json!({
         "last_attempt": attempt(local(24, 0), "violated"),
-        "last_report": report(local(24, 0), 7, [1, 0, 0], vec![lot_sample(&flour, A, 7, 0)], false),
+        "last_report": report(local(24, 0), 7, [1, 0, 0], vec![lot_sample(&flour, A, "7", "0")], false),
     });
     let data = wait_for_health(&node.router, "closing check", |d| {
         !d["invariant_check"]["last_attempt"]["finished_at"].eq(&json!(local(23, 10)))

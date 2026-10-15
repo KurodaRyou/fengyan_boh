@@ -111,7 +111,7 @@
 
 ### 路线图
 
-已完成：write path 与基础设施；设备主数据（walking skeleton）；温度记录；备份与 `/health`；其余主数据（物料、配方、供应商、报损原因）与库存投影；收货与批次号；库存明细与批次查询；报损；不变量自检。迁移到 007。
+已完成：write path 与基础设施；设备主数据（walking skeleton）；温度记录；备份与 `/health`；其余主数据（物料、配方、供应商、报损原因）与库存投影；收货与批次号；库存明细与批次查询；报损；不变量自检；库存规则归属。迁移到 007。
 
 当前实现边界：
 - `init` 写入 `store_meta` 和预置报损原因；第一个店长随认证切片加入。
@@ -121,8 +121,7 @@
 - `MASTER_DATA_CHANGED` 只有 `source = LOCAL` 的写入口。
 
 待做，按顺序：
-1. 库存规则归属（把报损、收货中多个命令共用的库存规则按模块归属提取出来，行为不变）→ 定点小数（数量支持 3 位小数、录入上限、库存状态上限）→ 盘点（含盘点吸收：已有的报损一并实现吸收判定）→ 局域网 HTTPS → 员工认证（`EMPLOYEE` 投影、写接口、golden 样本与第一个店长）。
-   - 库存规则归属排在定点小数和盘点之前：两者都要改动库存规则，先收归到共享模块，减少各命令中的重复修改。
+1. 定点小数（数量支持 3 位小数、小数换算系数、录入上限、库存状态上限）→ 盘点（含盘点吸收：已有的报损一并实现吸收判定）→ 局域网 HTTPS → 员工认证（`EMPLOYEE` 投影、写接口、golden 样本与第一个店长）。
 2. 扩展：生产 → 纠错（冲销、数量更正）→ 补录入口 → 销售导入。每一步配对应的验收用例。
 
 ---
@@ -218,6 +217,14 @@ scripts/        CI 扫描脚本。
 
 ## 不可违反的规则
 
+### 开发阶段与上线
+- **上线**指第一家门店节点开始记录真实业务。当前状态：**尚未上线**。上线时由人在这里写明日期。
+- 上线之前没有业务数据。任何结构变动都直接修改，不升版本号，不做新旧兼容：
+  - 事件 payload 直接改结构，不升 `schema_version`，不写 upcast；
+  - 迁移直接改已有文件，不新增编号；
+  - golden 样本、schema 测试的校验和、锁定测试及其他测试随之修改（锁定路径照常经 `spec:` / `docs:` 提交，预期值由人确认）。开发库和测试数据直接重建。
+- 上线之后，「迁移」「只追加」中禁止修改迁移文件和事件 payload 结构的规则生效。
+
 ### SQLite
 - 每个连接打开时都设置（见 `boh-storage/src/connection.rs`；备份校验连接例外，见下）：
   `journal_mode = WAL`、`busy_timeout = 5000`、`synchronous = FULL`、`foreign_keys = ON`、`recursive_triggers = ON`。
@@ -253,7 +260,7 @@ scripts/        CI 扫描脚本。
 - 结果只放在进程内存中，经 `/health` 报告；不写数据库，不自动修复。发现违规或检查失败都不拒绝启动、不阻止写入和备份、不让进程退出或重启。
 
 ### 迁移
-- 迁移文件一旦发布（合并到主干）**禁止修改**，只能新增下一个编号的文件。schema 测试对每个迁移文件做内容校验和。
+- 上线之后，迁移文件**禁止修改**，只能新增下一个编号的文件（上线之前见「开发阶段与上线」）。schema 测试对每个迁移文件做内容校验和。
 - 每个迁移在一个事务中执行并设置 `user_version`。数据库版本高于程序支持的版本时**拒绝启动**。
 - 先写迁移和 schema 测试（`crates/boh-storage/tests/schema.rs`），测试通过、schema 锁定后再写业务实现。
 
@@ -285,7 +292,7 @@ scripts/        CI 扫描脚本。
     - golden 锁定的类型同时约束写入端和重放端；upcast 在类型上进行。
 - 主数据也走事件流（`MASTER_DATA_CHANGED`），主数据表是投影。
   例外：员工凭据、设备注册、会话等认证状态表不进事件流、不同步、不参与重建。
-- 事件 payload 结构一旦发布不得修改：改结构只能升 `schema_version`，再写 upcast。
+- 上线之后，事件 payload 结构不得修改：改结构只能升 `schema_version`，再写 upcast（上线之前见「开发阶段与上线」）。
   - 例外：`GOODS_RECEIVED@1` 缺少生成批次号所需的信息，不能 upcast，也不推测；账本中有 `@1` 收货时，迁移 007 报错、节点拒绝启动（见 `docs/domain.md`「收货接口」）。
 
 ### 幂等
@@ -312,7 +319,11 @@ scripts/        CI 扫描脚本。
 
 ### 数值
 - **禁止浮点数参与业务计算**（clippy `float_arithmetic = deny`）。
-- 金额：`i64`，单位“分”。重量 / 体积 / 数量：`i64`，单位为该物料的最小单位（克、毫升、个）。
+- 金额：`i64`，单位“分”。
+- 数量（重量 / 体积 / 个数）：基本单位（克、毫升、个）的定点小数，最多 3 位小数，存千分之一基本单位的 `i64`。
+- 换算系数：最多 9 位小数，存十亿分之一基本单位的 `i64`。
+- 数量和换算系数在事件 payload 与 HTTP 中写成小数字符串，格式、上限与舍入见 `docs/domain.md`「数量」「单位」。
+- 只在 `docs/domain.md` 规定的位置舍入（单位换算）；定点乘法的中间值用 `i128`，舍入后再转回 `i64`。
 - `[profile.release] overflow-checks = true`；业务计算一律用 `checked_*`。
 
 ### Rust
@@ -382,6 +393,7 @@ scripts/        CI 扫描脚本。
 - 警告不改变 `success`。警告码见 `docs/domain.md`：`STOCK_SHORTFALL`、`ABSORBED_BY_COUNT`、`EXPIRES_BEFORE_OLDER_STOCK`、`CAPTURE_TIME_ADJUSTED`。
 - 错误对象包含 `code`、`message`、`details`；`details` 总是存在，没有明细时为 `{}`。
 - HTTP 状态码要和语义一致：校验失败 400、不存在 404、幂等冲突与业务冲突 409、内部错误 500。`code` 是稳定的大写蛇形字符串，客户端按 `code` 判断，不按 `message`。
+- 数量和换算系数一律用小数字符串，不用 JSON 数字；金额用 JSON 整数（分）。见 `docs/domain.md`「数量」。
 - 通用错误码：结构或取值错误 `400 VALIDATION_FAILED`；引用的实体不存在 `404 REFERENCE_NOT_FOUND`。
 - 其他通用错误码：未匹配的路由 `404 ROUTE_NOT_FOUND`；方法不允许 `405 METHOD_NOT_ALLOWED`；内部错误 `500 INTERNAL_ERROR`；缺少或无效的身份 `401 UNAUTHENTICATED`；角色不够 `403 FORBIDDEN`。
 - 身份与权限通过后，请求体不是合法 JSON、缺少 `Content-Type: application/json`、字段缺失、未知字段、类型或取值不对，以及路径参数无法解析，一律 `400 VALIDATION_FAILED`。
@@ -454,7 +466,7 @@ ARM 门店机改用 `aarch64-unknown-linux-musl`。部署文件见 `deploy/`。
   修改预期值、删除用例、加 `#[ignore]`、用 `cfg` / feature 排除、在 `Cargo.toml` 中设置 `test = false` / `autotests = false`、改 CI 让测试不运行。
 - 以上两条由 Claude review 逐个提交核对，Codex 不报。
   - Codex review 看到的是整个 PR 压成的一个提交（作者为 Codex，提交信息取 PR 标题），分不出改动属于哪个提交，报出的都是误报。
-- 修改已合入 `main` 的迁移文件。
+- 上线之后修改已合入 `main` 的迁移文件。
 
 **P1**
 - 违反「不可违反的规则」任一条，例如：另开写连接、绕过 `Ledger::append` 写 `store_events`、闭包内做网络 I/O 或 sleep、
@@ -463,4 +475,4 @@ ARM 门店机改用 `aarch64-unknown-linux-musl`。部署文件见 `deploy/`。
 - 写命令缺少幂等处理，或缺少重复提交同一 `command_id` 的测试。
 - 认证接口、PIN 或令牌可经明文 HTTP 访问或传输。
 
-`spec:` / `docs:` 提交是设计变更：检查内容是否自洽、是否与 `docs/domain.md`、`docs/auth.md` 一致；其中修改已合入的迁移仍按 P0 处理。
+`spec:` / `docs:` 提交是设计变更：检查内容是否自洽、是否与 `docs/domain.md`、`docs/auth.md` 一致；其中上线之后修改已合入的迁移仍按 P0 处理。

@@ -149,6 +149,9 @@ async fn post_ok(router: &axum::Router, uri: &str, body: serde_json::Value) -> s
 // ITEM 的 default_shelf_life_ms 出现与省略、SUPPLIER 的 contact_phone 出现与省略各一份样本，省略时不写 null；
 // ITEM 的 units 为空数组时照常写出；RECIPE 新建（一个版本）一份样本，追加版本后的快照含全部版本。
 // 键顺序为 domain.md「主数据」快照字段的顺序；非 ASCII 文本不转义、引号转义一并锁定。
+// 数量与换算系数是小数字符串（domain.md「数量」「单位」），payload 中只有规范形式：请求中的 "25000.000"、"2.500" 写成 "25000"、"2.5"。
+// 配方版本保存换算后的 output_qty_per_batch、qty_per_batch 和录入时的 input 快照（产出为 output_input），键顺序为
+// version、output_qty_per_batch、output_input、lines；行为 item_id、qty_per_batch、input。
 #[tokio::test]
 async fn master_data_changed_items_recipes_suppliers_and_waste_reasons() {
     let dir = tempfile::tempdir().unwrap();
@@ -163,8 +166,9 @@ async fn master_data_changed_items_recipes_suppliers_and_waste_reasons() {
             "command_id": cmd(1), "code": "FLOUR", "name": "高筋面粉 \"T65\"", "base_unit": "g",
             "category": "RAW", "default_shelf_life_ms": 15_552_000_000_i64,
             "units": [
-                { "unit_code": "bag", "base_qty_per_unit": 25000 },
-                { "unit_code": "cup", "base_qty_per_unit": 120 },
+                { "unit_code": "bag", "base_qty_per_unit": "25000.000" },
+                { "unit_code": "kg", "base_qty_per_unit": "1000" },
+                { "unit_code": "oz", "base_qty_per_unit": "28.349523125" },
             ],
             "active": true,
         }),
@@ -202,10 +206,11 @@ async fn master_data_changed_items_recipes_suppliers_and_waste_reasons() {
         "/api/v1/recipes",
         json!({
             "command_id": cmd(4), "code": "R-TOAST", "name": "吐司", "output_item_id": toast,
-            "active": true, "output_qty_per_batch": 12,
+            "active": true,
+            "output_input": { "qty": "12", "unit_code": "pcs", "base_qty_per_unit": "1" },
             "lines": [
-                { "item_id": flour, "qty_per_batch": 3000 },
-                { "item_id": egg, "qty_per_batch": 6 },
+                { "item_id": flour, "input": { "qty": "2.500", "unit_code": "kg", "base_qty_per_unit": "1000" } },
+                { "item_id": egg, "input": { "qty": "6", "unit_code": "pcs", "base_qty_per_unit": "1" } },
             ],
         }),
     )
@@ -217,8 +222,9 @@ async fn master_data_changed_items_recipes_suppliers_and_waste_reasons() {
         &router,
         &format!("/api/v1/recipes/{recipe}/versions"),
         json!({
-            "command_id": cmd(5), "base_revision": 1, "output_qty_per_batch": 10,
-            "lines": [{ "item_id": egg, "qty_per_batch": 8 }],
+            "command_id": cmd(5), "base_revision": 1,
+            "output_input": { "qty": "10", "unit_code": "pcs", "base_qty_per_unit": "1" },
+            "lines": [{ "item_id": egg, "input": { "qty": "8", "unit_code": "pcs", "base_qty_per_unit": "1" } }],
         }),
     )
     .await;
@@ -263,7 +269,7 @@ async fn master_data_changed_items_recipes_suppliers_and_waste_reasons() {
             )),
             r#"{"entity":"ITEM","source":"LOCAL","snapshot":{"code":"EGG","name":"鸡蛋","base_unit":"pcs","category":"RAW","units":[],"active":true}}"#,
             golden(include_str!("golden/MASTER_DATA_CHANGED@1/RECIPE.json")),
-            r#"{"entity":"RECIPE","source":"LOCAL","snapshot":{"code":"R-TOAST","name":"吐司","output_item_id":"01890a5d-ac96-774b-bcce-b302099a8502","versions":[{"version":1,"output_qty_per_batch":12,"lines":[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8501","qty_per_batch":3000},{"item_id":"01890a5d-ac96-774b-bcce-b302099a8503","qty_per_batch":6}]},{"version":2,"output_qty_per_batch":10,"lines":[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8503","qty_per_batch":8}]}],"active":true}}"#,
+            r#"{"entity":"RECIPE","source":"LOCAL","snapshot":{"code":"R-TOAST","name":"吐司","output_item_id":"01890a5d-ac96-774b-bcce-b302099a8502","versions":[{"version":1,"output_qty_per_batch":"12","output_input":{"qty":"12","unit_code":"pcs","base_qty_per_unit":"1"},"lines":[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8501","qty_per_batch":"2500","input":{"qty":"2.5","unit_code":"kg","base_qty_per_unit":"1000"}},{"item_id":"01890a5d-ac96-774b-bcce-b302099a8503","qty_per_batch":"6","input":{"qty":"6","unit_code":"pcs","base_qty_per_unit":"1"}}]},{"version":2,"output_qty_per_batch":"10","output_input":{"qty":"10","unit_code":"pcs","base_qty_per_unit":"1"},"lines":[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8503","qty_per_batch":"8","input":{"qty":"8","unit_code":"pcs","base_qty_per_unit":"1"}}]}],"active":true}}"#,
             golden(include_str!("golden/MASTER_DATA_CHANGED@1/SUPPLIER.json")),
             golden(include_str!(
                 "golden/MASTER_DATA_CHANGED@1/SUPPLIER_WITHOUT_CONTACT_PHONE.json"
@@ -281,6 +287,7 @@ const GOLDEN_SUPPLIER_ID: &str = "01890a5d-ac96-774b-bcce-b302099a8601";
 // GOODS_RECEIVED@2：行的 manufacturer_lot_no 出现与省略各一份样本，省略时不写 null；键顺序与 @1 相同。
 // lot_id 是批次号（10-06 收货，面粉两次收货依次为 001、002），不做替换，逐字节比对。
 // expires_at 是 expires_on 在 Asia/Shanghai 的当日最后一毫秒；非 ASCII 文本不转义、引号转义一并锁定。
+// qty 与 input 中的数量、系数是规范形式的小数字符串：请求中的 "2.000"、"3000.50" 写成 "2"、"3000.5"。
 // 收货行新建批次，不被吸收（domain.md「盘点吸收」），没有吸收分支。
 // GOODS_RECEIVED@1 不再由系统产生；golden/GOODS_RECEIVED@1/ 的样本保留为 @1 的历史结构，
 // 用作「账本中有 @1 收货」的输入（schema.rs 的迁移 007、spec_replay.rs 的重建）。
@@ -295,7 +302,7 @@ async fn goods_received_with_and_without_manufacturer_lot_no() {
         "/api/v1/items",
         json!({
             "command_id": cmd(1), "code": "FLOUR", "name": "面粉", "base_unit": "g",
-            "category": "RAW", "units": [{ "unit_code": "袋", "base_qty_per_unit": 25000 }],
+            "category": "RAW", "units": [{ "unit_code": "袋", "base_qty_per_unit": "25000" }],
             "active": true,
         }),
     )
@@ -316,7 +323,7 @@ async fn goods_received_with_and_without_manufacturer_lot_no() {
         (
             cmd(3),
             json!({
-                "item_id": flour, "input": { "qty": 2, "unit_code": "袋", "base_qty_per_unit": 25000 },
+                "item_id": flour, "input": { "qty": "2.000", "unit_code": "袋", "base_qty_per_unit": "25000" },
                 "manufacturer_lot_no": "批号 \"A\"-1", "produced_on": "2026-10-01",
                 "expires_on": "2026-10-20", "line_cost_cents": 12345,
             }),
@@ -324,7 +331,7 @@ async fn goods_received_with_and_without_manufacturer_lot_no() {
         (
             cmd(4),
             json!({
-                "item_id": flour, "input": { "qty": 3000, "unit_code": "g", "base_qty_per_unit": 1 },
+                "item_id": flour, "input": { "qty": "3000.50", "unit_code": "g", "base_qty_per_unit": "1" },
                 "produced_on": "2026-10-06", "expires_on": "2026-10-06", "line_cost_cents": 0,
             }),
         ),
@@ -369,7 +376,8 @@ async fn goods_received_with_and_without_manufacturer_lot_no() {
 // - SPECIFIED_LOT：指定批次的行带 lot_id 和 lot_book_qty，alloc 恰好一项 SPECIFIED；input 的非 ASCII 单位不转义。
 //   面粉批次 …-001 25000 g、…-002 3000 g；指定 …-001 报 1 袋：批次账面 25000、物料净账面 28000，不需要确认。
 // - UNSPECIFIED_LOT：不指定批次的行没有 lot_id、lot_book_qty；alloc 中 FIFO 项带 lot_id，SHORTFALL 项不带。
-//   接着报 5000 g（确认）：净账面 3000，…-002 3000 FIFO + 2000 SHORTFALL。
+//   接着报 5000.25 g（确认）：净账面 3000，…-002 3000 FIFO + 2000.25 SHORTFALL。
+// 数量、账面和 alloc 的 qty 都是规范形式的小数字符串（请求中的 "25000.0"、"5000.250" 写成 "25000"、"5000.25"）。
 // - 被吸收的行（ABSORBED、ABSORBED_SPECIFIED_LOT）以 absorbed_by_event_id 代替 alloc；吸收判定随盘点切片实现，
 //   本切片没有写入口，样本由 spec_replay.rs 经 open_writer 写入账本并重建验证。
 // 确认标记不写进 payload。
@@ -384,7 +392,7 @@ async fn waste_logged_specified_and_unspecified_lot() {
         "/api/v1/items",
         json!({
             "command_id": cmd(1), "code": "FLOUR", "name": "面粉", "base_unit": "g",
-            "category": "RAW", "units": [{ "unit_code": "袋", "base_qty_per_unit": 25000 }],
+            "category": "RAW", "units": [{ "unit_code": "袋", "base_qty_per_unit": "25000" }],
             "active": true,
         }),
     )
@@ -414,11 +422,11 @@ async fn waste_logged_specified_and_unspecified_lot() {
             "command_id": cmd(4), "supplier_id": supplier,
             "lines": [
                 {
-                    "item_id": flour, "input": { "qty": 1, "unit_code": "袋", "base_qty_per_unit": 25000 },
+                    "item_id": flour, "input": { "qty": "1", "unit_code": "袋", "base_qty_per_unit": "25000" },
                     "produced_on": "2026-10-01", "expires_on": "2026-10-20", "line_cost_cents": 100,
                 },
                 {
-                    "item_id": flour, "input": { "qty": 3000, "unit_code": "g", "base_qty_per_unit": 1 },
+                    "item_id": flour, "input": { "qty": "3000", "unit_code": "g", "base_qty_per_unit": "1" },
                     "produced_on": "2026-10-01", "expires_on": "2026-10-20", "line_cost_cents": 100,
                 },
             ],
@@ -431,14 +439,14 @@ async fn waste_logged_specified_and_unspecified_lot() {
             cmd(5),
             json!({
                 "item_id": flour, "lot_id": "RAW-FLOUR-20261006-001",
-                "input": { "qty": 1, "unit_code": "袋", "base_qty_per_unit": 25000 },
+                "input": { "qty": "1", "unit_code": "袋", "base_qty_per_unit": "25000.0" },
                 "reason_code": "EXPIRED",
             }),
         ),
         (
             cmd(6),
             json!({
-                "item_id": flour, "input": { "qty": 5000, "unit_code": "g", "base_qty_per_unit": 1 },
+                "item_id": flour, "input": { "qty": "5000.250", "unit_code": "g", "base_qty_per_unit": "1" },
                 "reason_code": "EXPIRED", "confirm_shortage": true,
             }),
         ),
@@ -473,7 +481,8 @@ async fn waste_logged_specified_and_unspecified_lot() {
 // docs/interfaces.md「boh-domain：报损 payload」：每份 WASTE_LOGGED@1 样本经 boh_domain::waste::WasteLogged 解析再序列化，
 // 与样本逐字节相同——含被吸收的两个分支（写入路径随盘点切片才产生它们，这里锁定被测类型的序列化：键顺序、省略的键、
 // 不写 null、不丢 item_book_qty / lot_book_qty / input）。
-// 解析拒绝规定以外的结构：未知字段、alloc 与 absorbed_by_event_id 同时出现或都不出现、lot_id 与 lot_book_qty 只出现一个。
+// 解析拒绝规定以外的结构：未知字段、alloc 与 absorbed_by_event_id 同时出现或都不出现、lot_id 与 lot_book_qty 只出现一个、
+// 数量写成 JSON 数字（domain.md「数量」：payload 中的数量是小数字符串）。
 #[test]
 fn waste_logged_payload_type_round_trips_every_sample() {
     use boh_domain::waste::WasteLogged;
@@ -493,8 +502,8 @@ fn waste_logged_payload_type_round_trips_every_sample() {
     let line = |extra: &str| {
         format!(r#"{{"lines":[{{"item_id":"01890a5d-ac96-774b-bcce-b302099a8501"{extra}}}]}}"#)
     };
-    let input = r#","qty":1,"input":{"qty":1,"unit_code":"g","base_qty_per_unit":1},"reason_code":"EXPIRED","item_book_qty":3"#;
-    let fifo = r#","alloc":[{"lot_id":"RAW-FLOUR-20261006-001","qty":1,"source":"FIFO"}]"#;
+    let input = r#","qty":"1","input":{"qty":"1","unit_code":"g","base_qty_per_unit":"1"},"reason_code":"EXPIRED","item_book_qty":"3""#;
+    let fifo = r#","alloc":[{"lot_id":"RAW-FLOUR-20261006-001","qty":"1","source":"FIFO"}]"#;
     let absorbed = r#","absorbed_by_event_id":"01890a5d-ac96-774b-bcce-b302099a8701""#;
     let lot = r#","lot_id":"RAW-FLOUR-20261006-001""#;
     for (name, text) in [
@@ -502,7 +511,7 @@ fn waste_logged_payload_type_round_trips_every_sample() {
         ("neither", line(input)),
         (
             "lot_book_qty without lot_id",
-            line(&format!("{input},\"lot_book_qty\":1{fifo}")),
+            line(&format!("{input},\"lot_book_qty\":\"1\"{fifo}")),
         ),
         (
             "lot_id without lot_book_qty",
@@ -511,6 +520,41 @@ fn waste_logged_payload_type_round_trips_every_sample() {
         (
             "unknown field",
             line(&format!("{input},\"note\":\"x\"{fifo}")),
+        ),
+        (
+            "qty as number",
+            line(&format!(
+                "{}{fifo}",
+                input.replacen(r#""qty":"1""#, r#""qty":1"#, 1)
+            )),
+        ),
+        (
+            "input qty as number",
+            line(&format!(
+                "{}{fifo}",
+                input.replace(r#"{"qty":"1""#, r#"{"qty":1"#)
+            )),
+        ),
+        (
+            "factor as number",
+            line(&format!(
+                "{}{fifo}",
+                input.replace(r#""base_qty_per_unit":"1""#, r#""base_qty_per_unit":1"#)
+            )),
+        ),
+        (
+            "item_book_qty as number",
+            line(&format!(
+                "{}{fifo}",
+                input.replace(r#""item_book_qty":"3""#, r#""item_book_qty":3"#)
+            )),
+        ),
+        (
+            "alloc qty as number",
+            line(&format!(
+                "{input}{}",
+                fifo.replace(r#""qty":"1""#, r#""qty":1"#)
+            )),
         ),
     ] {
         assert!(

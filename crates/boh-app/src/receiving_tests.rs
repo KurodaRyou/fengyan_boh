@@ -29,7 +29,7 @@ fn request(n: u16, supplier_id: &str, item_id: &str, expiries: &[&str]) -> Value
         .iter()
         .map(|expires_on| {
             json!({
-                "item_id": item_id, "input": {"qty": 5, "unit_code": "g", "base_qty_per_unit": 1},
+                "item_id": item_id, "input": {"qty": "5", "unit_code": "g", "base_qty_per_unit": "1"},
                 "produced_on": "2026-10-01", "expires_on": expires_on, "line_cost_cents": 1000
             })
         })
@@ -183,7 +183,7 @@ async fn expiry_warnings_skip_depleted_and_undated_lots_and_do_not_look_ahead() 
         .writer
         .call(move |tx| -> Result<(), StorageError> {
             tx.execute(
-                "UPDATE inventory_lots SET remaining_qty = 5, expires_at = NULL WHERE lot_id = ?1",
+                "UPDATE inventory_lots SET remaining_qty = 5000, expires_at = NULL WHERE lot_id = ?1",
                 [old_lot],
             )
             .map_err(|error| StorageError::sqlite("更新库存批次", error))?;
@@ -347,9 +347,9 @@ async fn inventory_includes_negative_lots_and_shortfalls_and_lookup_retains_zero
         // These projection states become reachable through later waste/count slices.
         tx.execute("UPDATE inventory_lots SET remaining_qty = 0 WHERE lot_serial = 1", [])
             .map_err(|error| StorageError::sqlite("设置零余量查询夹具", error))?;
-        tx.execute("UPDATE inventory_lots SET remaining_qty = -3, expires_at = NULL WHERE lot_serial = 2", [])
+        tx.execute("UPDATE inventory_lots SET remaining_qty = -3000, expires_at = NULL WHERE lot_serial = 2", [])
             .map_err(|error| StorageError::sqlite("设置负余量查询夹具", error))?;
-        tx.execute("INSERT INTO inventory_unallocated (item_id, qty) VALUES (?1, -2)", [fixture_item])
+        tx.execute("INSERT INTO inventory_unallocated (item_id, qty) VALUES (?1, -2000)", [fixture_item])
             .map_err(|error| StorageError::sqlite("设置账外缺口查询夹具", error))?;
         Ok(())
     }).await.unwrap();
@@ -363,14 +363,14 @@ async fn inventory_includes_negative_lots_and_shortfalls_and_lookup_retains_zero
     assert_eq!(status, 200, "{inventory}");
     let row = &inventory["data"]["items"][0];
     assert_eq!(row["item_id"], item);
-    assert_eq!(row["on_hand_qty"], 0);
-    assert_eq!(row["unallocated_qty"], -2);
+    assert_eq!(row["on_hand_qty"], "0");
+    assert_eq!(row["unallocated_qty"], "-2");
     assert_eq!(row["lots"].as_array().unwrap().len(), 2);
     let negative = &row["lots"][0];
     assert_eq!(
         negative,
         &json!({
-            "lot_id": "RAW-FLOUR-20261006-002", "origin": "RECEIPT", "remaining_qty": -3,
+            "lot_id": "RAW-FLOUR-20261006-002", "origin": "RECEIPT", "remaining_qty": "-3",
             "source_occurred_at": NOW,
         })
     );
@@ -393,6 +393,6 @@ async fn inventory_includes_negative_lots_and_shortfalls_and_lookup_retains_zero
     )
     .await;
     assert_eq!(status, 200, "{zero}");
-    assert_eq!(zero["data"]["lot"]["remaining_qty"], 0);
+    assert_eq!(zero["data"]["lot"]["remaining_qty"], "0");
     node.storage.writer_handle.shutdown().await.unwrap();
 }

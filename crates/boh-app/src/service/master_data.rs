@@ -3,6 +3,8 @@
 use axum::http::StatusCode;
 use boh_domain::equipment::MasterDataSource;
 use boh_domain::master_data::*;
+use boh_domain::quantity::{Quantity, UnitFactor};
+use boh_domain::receiving::ReceiptInput;
 use boh_domain::time::{BusinessDayCutoff, StoreTimeZone, business_date};
 use boh_domain::{AggregateId, CommandId, EventId, StoreId, UnixMillis};
 use boh_storage::clock::Clock;
@@ -78,23 +80,15 @@ fn check_code(tx: &Transaction<'_>, table: &str, id_key: &str, code: &str) -> Re
     Ok(())
 }
 
-fn item_reference(tx: &Transaction<'_>, id: AggregateId) -> Result<(), ApiError> {
-    let found: bool = tx
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM items WHERE id = ?1)",
-            [id.to_string()],
-            |r| r.get(0),
-        )
-        .map_err(|error| StorageError::sqlite("查询物料", error))?;
-    if !found {
-        return Err(missing_reference("ITEM", id));
-    }
-    Ok(())
-}
-
-fn line_references(tx: &Transaction<'_>, lines: &[RecipeLine]) -> Result<(), ApiError> {
-    for line in lines {
-        item_reference(tx, line.item_id)?;
+fn recipe_units(
+    tx: &Transaction<'_>,
+    output_item_id: AggregateId,
+    output_input: &ReceiptInput,
+    lines: &[RecipeInputLine],
+) -> Result<(), ApiError> {
+    super::item_units::validate_item(tx, None, output_item_id, output_input)?;
+    for (index, line) in lines.iter().enumerate() {
+        super::item_units::validate_item(tx, Some(index), line.item_id, &line.input)?;
     }
     Ok(())
 }
@@ -272,6 +266,7 @@ pub async fn create_recipe(
     state: AppState,
     actor: Actor,
     command: CreateRecipe,
+    snapshot: RecipeSnapshot,
 ) -> Result<Value, ApiError> {
     let request = normalized(&command, None)?;
     execute(
@@ -282,11 +277,15 @@ pub async fn create_recipe(
         request,
         move |write| {
             check_code(write.tx, "recipes", "recipe_id", &command.code)?;
-            item_reference(write.tx, command.output_item_id)?;
-            line_references(write.tx, &command.lines)?;
+            recipe_units(
+                write.tx,
+                command.output_item_id,
+                &command.output_input,
+                &command.lines,
+            )?;
             let row = Recipe {
                 recipe_id: write.id()?,
-                snapshot: command.snapshot(),
+                snapshot,
                 revision: 1,
             };
             write.append(
@@ -346,6 +345,7 @@ pub async fn add_recipe_version(
     actor: Actor,
     id: AggregateId,
     command: AddRecipeVersion,
+    mut proposed: RecipeVersion,
 ) -> Result<Value, ApiError> {
     let request = normalized(&command, Some(("recipe_id", id)))?;
     execute(
@@ -358,22 +358,25 @@ pub async fn add_recipe_version(
             let mut row =
                 read_recipe(write.tx, id)?.ok_or_else(|| missing_reference("RECIPE", id))?;
             revision(row.revision, command.base_revision)?;
-            line_references(write.tx, &command.lines)?;
+            recipe_units(
+                write.tx,
+                row.snapshot.output_item_id,
+                &command.output_input,
+                &command.lines,
+            )?;
             let latest = row
                 .snapshot
                 .versions
                 .last()
                 .ok_or_else(|| ApiError::internal_message("recipe has no versions"))?;
-            if latest.output_qty_per_batch != command.output_qty_per_batch
-                || latest.lines != command.lines
-            {
-                let version = next(latest.version)?;
+            // Compare the full converted snapshot, including input and line order.
+            // Use the current version number for the comparison so an unchanged
+            // command does not need to allocate another version.
+            proposed.version = latest.version;
+            if &proposed != latest {
+                proposed.version = next(latest.version)?;
                 row.revision = next(row.revision)?;
-                row.snapshot.versions.push(RecipeVersion {
-                    version,
-                    output_qty_per_batch: command.output_qty_per_batch,
-                    lines: command.lines,
-                });
+                row.snapshot.versions.push(proposed);
                 write.append(
                     id,
                     row.revision,
@@ -552,7 +555,7 @@ fn read_item(conn: &Connection, id: AggregateId) -> Result<Option<Item>, ApiErro
             .query_map([id.to_string()], |r| {
                 Ok(ItemUnit {
                     unit_code: r.get(0)?,
-                    base_qty_per_unit: r.get(1)?,
+                    base_qty_per_unit: UnitFactor::from_nano(r.get(1)?),
                 })
             })
             .map_err(|error| StorageError::sqlite("查询物料单位", error))?
@@ -584,27 +587,29 @@ fn read_recipe(conn: &Connection, id: AggregateId) -> Result<Option<Recipe>, Api
         .optional()
         .map_err(|error| StorageError::sqlite("查询配方", error))?;
     if let Some(row) = &mut row {
-        let mut statement = conn.prepare("SELECT version, output_qty_per_batch FROM recipe_versions WHERE recipe_id = ?1 ORDER BY version")
+        let mut statement = conn.prepare("SELECT version, output_qty_per_batch, output_input_qty, output_input_unit_code, output_input_base_qty_per_unit FROM recipe_versions WHERE recipe_id = ?1 ORDER BY version")
             .map_err(|error| StorageError::sqlite("准备查询配方版本", error))?;
         let mut versions: Vec<RecipeVersion> = statement
             .query_map([id.to_string()], |r| {
                 Ok(RecipeVersion {
                     version: r.get(0)?,
-                    output_qty_per_batch: r.get(1)?,
+                    output_qty_per_batch: Quantity::from_milli(r.get(1)?),
+                    output_input: read_input(r, 2)?,
                     lines: Vec::new(),
                 })
             })
             .map_err(|error| StorageError::sqlite("查询配方版本", error))?
             .collect::<Result<_, _>>()
             .map_err(|error| StorageError::sqlite("读取配方版本", error))?;
-        let mut lines = conn.prepare("SELECT item_id, qty_per_batch FROM recipe_lines WHERE recipe_id = ?1 AND version = ?2 ORDER BY line_no")
+        let mut lines = conn.prepare("SELECT item_id, qty_per_batch, input_qty, input_unit_code, input_base_qty_per_unit FROM recipe_lines WHERE recipe_id = ?1 AND version = ?2 ORDER BY line_no")
             .map_err(|error| StorageError::sqlite("准备查询配方明细", error))?;
         for version in &mut versions {
             version.lines = lines
                 .query_map(params![id.to_string(), version.version], |r| {
                     Ok(RecipeLine {
                         item_id: row_id(r, 0)?,
-                        qty_per_batch: r.get(1)?,
+                        qty_per_batch: Quantity::from_milli(r.get(1)?),
+                        input: read_input(r, 2)?,
                     })
                 })
                 .map_err(|error| StorageError::sqlite("查询配方明细", error))?
@@ -614,6 +619,14 @@ fn read_recipe(conn: &Connection, id: AggregateId) -> Result<Option<Recipe>, Api
         row.snapshot.versions = versions;
     }
     Ok(row)
+}
+
+fn read_input(row: &Row<'_>, index: usize) -> boh_storage::rusqlite::Result<ReceiptInput> {
+    Ok(ReceiptInput {
+        qty: Quantity::from_milli(row.get(index)?),
+        unit_code: row.get(index + 1)?,
+        base_qty_per_unit: UnitFactor::from_nano(row.get(index + 2)?),
+    })
 }
 
 fn read_supplier(row: &Row<'_>) -> boh_storage::rusqlite::Result<Supplier> {

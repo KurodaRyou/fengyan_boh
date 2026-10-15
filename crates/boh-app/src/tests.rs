@@ -602,8 +602,8 @@ fn master_command_id(n: u16) -> String {
 fn item_body(n: u16) -> Value {
     json!({"command_id": master_command_id(n), "code": "FLOUR", "name": "面粉", "base_unit": "g",
     "category": "RAW", "active": true, "units": [
-        {"unit_code": "bag", "base_qty_per_unit": 25000},
-        {"unit_code": "cup", "base_qty_per_unit": 120}
+        {"unit_code": "bag", "base_qty_per_unit": "25000"},
+        {"unit_code": "cup", "base_qty_per_unit": "120"}
     ]})
 }
 
@@ -621,8 +621,8 @@ async fn seed_item(node: &Node) -> String {
 
 fn recipe_body(item_id: &str) -> Value {
     json!({"command_id": master_command_id(2), "code": "R1", "name": "配方", "active": true,
-        "output_item_id": item_id, "output_qty_per_batch": 2,
-        "lines": [{"item_id": item_id, "qty_per_batch": 4}]})
+        "output_item_id": item_id, "output_input": {"qty": "2", "unit_code": "g", "base_qty_per_unit": "1"},
+        "lines": [{"item_id": item_id, "input": {"qty": "4", "unit_code": "g", "base_qty_per_unit": "1"}}]})
 }
 
 #[tokio::test]
@@ -650,8 +650,8 @@ async fn child_projection_failures_restore_complete_snapshots_and_allow_original
         .unwrap();
     let update = json!({"command_id": master_command_id(3), "base_revision": 1,
     "name": "新面粉", "category": "SEMI", "active": false, "units": [
-        {"unit_code": "bag", "base_qty_per_unit": 20000},
-        {"unit_code": "box", "base_qty_per_unit": 1000}
+        {"unit_code": "bag", "base_qty_per_unit": "20000"},
+        {"unit_code": "box", "base_qty_per_unit": "1000"}
     ]});
     let path = format!("/api/v1/items/{item_id}");
     assert_internal_error(send(node.router.clone(), Method::PUT, &path, update.clone()).await);
@@ -711,7 +711,7 @@ async fn child_projection_failures_restore_complete_snapshots_and_allow_original
         .await
         .unwrap();
     let version = json!({"command_id": master_command_id(4), "base_revision": 1,
-        "output_qty_per_batch": 3, "lines": [{"item_id": item_id, "qty_per_batch": 6}]});
+        "output_input": {"qty": "3", "unit_code": "g", "base_qty_per_unit": "1"}, "lines": [{"item_id": item_id, "input": {"qty": "6", "unit_code": "g", "base_qty_per_unit": "1"}}]});
     let path = format!("/api/v1/recipes/{recipe_id}/versions");
     assert_internal_error(send(node.router.clone(), Method::POST, &path, version.clone()).await);
     assert_eq!(counts(&node).await, (3, 3, 0));
@@ -772,7 +772,7 @@ async fn concurrent_recipe_versions_serialize_and_retries_keep_the_original_snap
     let recipe_id = recipe["data"]["recipe"]["recipe_id"].as_str().unwrap();
     let path = format!("/api/v1/recipes/{recipe_id}/versions");
     let version = json!({"command_id": master_command_id(3), "base_revision": 1,
-        "output_qty_per_batch": 3, "lines": [{"item_id": item_id, "qty_per_batch": 6}]});
+        "output_input": {"qty": "3", "unit_code": "g", "base_qty_per_unit": "1"}, "lines": [{"item_id": item_id, "input": {"qty": "6", "unit_code": "g", "base_qty_per_unit": "1"}}]});
     let (a, b) = tokio::join!(
         send(node.router.clone(), Method::POST, &path, version.clone()),
         send(node.router.clone(), Method::POST, &path, version.clone()),
@@ -782,7 +782,7 @@ async fn concurrent_recipe_versions_serialize_and_retries_keep_the_original_snap
     assert_eq!(counts(&node).await, (3, 3, 0));
     let competing = |n| {
         json!({"command_id": master_command_id(n), "base_revision": 2,
-        "output_qty_per_batch": n, "lines": [{"item_id": item_id, "qty_per_batch": 8}]})
+        "output_input": {"qty": n.to_string(), "unit_code": "g", "base_qty_per_unit": "1"}, "lines": [{"item_id": item_id, "input": {"qty": "8", "unit_code": "g", "base_qty_per_unit": "1"}}]})
     };
     let (c, d) = tokio::join!(
         send(node.router.clone(), Method::POST, &path, competing(4)),
@@ -856,7 +856,7 @@ async fn remaining_master_data_revision_overflows_do_not_commit_partial_changes(
             // Appending a version must also check revision before changing history.
             assert_internal_error(send(node.router.clone(), Method::POST, &format!("{url}/{id}/versions"),
                 json!({"command_id": master_command_id(4), "base_revision": i64::MAX,
-                    "output_qty_per_batch": 3, "lines": [{"item_id": item_id, "qty_per_batch": 6}]})).await);
+                    "output_input": {"qty": "3", "unit_code": "g", "base_qty_per_unit": "1"}, "lines": [{"item_id": item_id, "input": {"qty": "6", "unit_code": "g", "base_qty_per_unit": "1"}}]})).await);
         }
         assert_eq!(counts(&node).await, (2, 2, 0));
         let (_, listed) = send(node.router.clone(), Method::GET, url, Value::Null).await;

@@ -63,7 +63,7 @@ fn cmd(n: u16) -> String {
 fn rline(item_id: &str, qty: i64, expires_on: &str) -> Value {
     json!({
         "item_id": item_id,
-        "input": { "qty": qty, "unit_code": "g", "base_qty_per_unit": 1 },
+        "input": { "qty": qty.to_string(), "unit_code": "g", "base_qty_per_unit": "1" },
         "produced_on": "2026-10-01", "expires_on": expires_on, "line_cost_cents": 100,
     })
 }
@@ -187,10 +187,10 @@ impl Node {
     }
 }
 
-/// 库存明细中的一个批次行（不含 `item_id`）；没有生产商批号时不带该键。
+/// 库存明细中的一个批次行（不含 `item_id`），余量 `remaining_qty` 克写成小数字符串；没有生产商批号时不带该键。
 fn lot_row(lot_id: &str, remaining_qty: i64, source_occurred_at: i64, expires_at: i64) -> Value {
     json!({
-        "lot_id": lot_id, "origin": "RECEIPT", "remaining_qty": remaining_qty,
+        "lot_id": lot_id, "origin": "RECEIPT", "remaining_qty": remaining_qty.to_string(),
         "source_occurred_at": source_occurred_at, "expires_at": expires_at,
     })
 }
@@ -207,7 +207,8 @@ fn with_item(mut row: Value, item_id: &str) -> Value {
 
 // 库存明细查询：data 为 {business_date, items}。
 // - items 每个物料一项，含停用的和没有库存的，按 code 的字节序升序（"BUTTER" 在 "B_2" 之前：'U' < '_'）；
-//   每项 {item_id, on_hand_qty, unallocated_qty, lots}，没有库存时 on_hand_qty、unallocated_qty 为 0，lots 为空数组。
+//   每项 {item_id, on_hand_qty, unallocated_qty, lots}，数量是小数字符串（domain「数量」）；没有库存时 on_hand_qty、
+//   unallocated_qty 为 "0"，lots 为空数组。
 // - lots 按 FIFO（批次日期、流水号）排列，不按到期日或入账先后：迟到入账（lag 48 小时）的 10-04 批次 D 排最前，之后是 10-06 的 A、B、C。
 //   每行 {lot_id, origin, remaining_qty, source_occurred_at, expires_at, manufacturer_lot_no?}，不含 item_id；
 //   source_occurred_at 是收货的 occurred_at；manufacturer_lot_no 出现时照原样返回，没有时省略该键。
@@ -275,13 +276,13 @@ async fn detail_lists_every_item_with_lots_in_fifo_order() {
             "business_date": "2026-10-06",
             "items": [
                 {
-                    "item_id": butter, "on_hand_qty": 3000, "unallocated_qty": 0,
+                    "item_id": butter, "on_hand_qty": "3000", "unallocated_qty": "0",
                     "lots": [lot_row(&first[2], 3000, NOW - 10 * MINUTE, END_OF_10_20)],
                 },
-                { "item_id": b2, "on_hand_qty": 0, "unallocated_qty": 0, "lots": [] },
-                { "item_id": egg, "on_hand_qty": 0, "unallocated_qty": 0, "lots": [] },
+                { "item_id": b2, "on_hand_qty": "0", "unallocated_qty": "0", "lots": [] },
+                { "item_id": egg, "on_hand_qty": "0", "unallocated_qty": "0", "lots": [] },
                 {
-                    "item_id": flour, "on_hand_qty": 42, "unallocated_qty": 0,
+                    "item_id": flour, "on_hand_qty": "42", "unallocated_qty": "0",
                     "lots": [
                         lot_row(&d, 7, NOW - 48 * HOUR, END_OF_10_30),
                         lot_row(&first[0], 5, NOW - 10 * MINUTE, END_OF_10_20),
@@ -290,7 +291,7 @@ async fn detail_lists_every_item_with_lots_in_fifo_order() {
                     ],
                 },
                 {
-                    "item_id": sugar, "on_hand_qty": 10, "unallocated_qty": 0,
+                    "item_id": sugar, "on_hand_qty": "10", "unallocated_qty": "0",
                     "lots": [lot_row(&s, 10, NOW, END_OF_10_20)],
                 },
             ],
@@ -351,7 +352,7 @@ async fn business_date_follows_the_node_clock() {
         .await
         .remove(0);
     let items = json!([{
-        "item_id": flour, "on_hand_qty": 5, "unallocated_qty": 0,
+        "item_id": flour, "on_hand_qty": "5", "unallocated_qty": "0",
         "lots": [lot_row(&lot, 5, NOW, END_OF_10_20)],
     }]);
     for (now, business_date) in [
@@ -463,7 +464,7 @@ async fn zero_and_negative_lots_and_unallocated_qty_are_reported() {
     let waste = |n: u16, line: Value| json!({ "command_id": cmd(n), "lines": [line], "captured_at": SENT, "sent_at": SENT });
     let wline = |qty: i64| {
         json!({
-            "item_id": flour, "input": { "qty": qty, "unit_code": "g", "base_qty_per_unit": 1 },
+            "item_id": flour, "input": { "qty": qty.to_string(), "unit_code": "g", "base_qty_per_unit": "1" },
             "reason_code": "EXPIRED",
         })
     };
@@ -490,7 +491,7 @@ async fn zero_and_negative_lots_and_unallocated_qty_are_reported() {
     assert_eq!(d, "RAW-FLOUR-20261006-004");
 
     let item = json!({
-        "item_id": flour, "on_hand_qty": 3, "unallocated_qty": -1,
+        "item_id": flour, "on_hand_qty": "3", "unallocated_qty": "-1",
         "lots": [
             lot_row(&lots[1], -2, NOW, END_OF_10_20),
             lot_row(&d, 6, NOW, END_OF_10_25),
@@ -654,7 +655,7 @@ async fn lot_numbers_carry_digit_and_underscore_codes() {
 
     let item = |item_id: &str, lot_id: &str, qty: i64| {
         json!({
-            "item_id": item_id, "on_hand_qty": qty, "unallocated_qty": 0,
+            "item_id": item_id, "on_hand_qty": qty.to_string(), "unallocated_qty": "0",
             "lots": [lot_row(lot_id, qty, NOW, END_OF_10_20)],
         })
     };
@@ -740,4 +741,80 @@ async fn lot_lookup_requires_identity_and_does_not_write() {
     }
 
     assert_eq!(node.state(), before);
+}
+
+// domain「数量」与「库存明细查询」「批次查询」：响应中的数量（on_hand_qty、unallocated_qty、remaining_qty）是规范形式的小数字符串，
+// 负数带负号。面粉收货 1.25 oz（35.437 g）和 0.5 g 两个批次，再不指定批次报损 36 g（确认）：FIFO 扣完两个批次，
+// 0.063 g 记入账外缺口。
+// - 库存明细：两个批次余量都为 0，lots 为空数组；unallocated_qty 与 on_hand_qty 都是 "-0.063"（不因 lots 为空显示为 0）。
+// - 批次查询：两个批次的 remaining_qty 都是 "0"。
+#[tokio::test]
+async fn fractional_and_negative_quantities_are_decimal_strings() {
+    let node = node();
+    let flour = node
+        .write(
+            &MANAGER,
+            Method::POST,
+            "/api/v1/items",
+            json!({
+                "command_id": cmd(1), "code": "FLOUR", "name": "FLOUR", "base_unit": "g",
+                "category": "RAW", "units": [{ "unit_code": "oz", "base_qty_per_unit": "28.349523125" }],
+                "active": true,
+            }),
+        )
+        .await["item"]["item_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let supplier = node.supplier(2).await;
+    node.write(
+        &MANAGER,
+        Method::POST,
+        "/api/v1/waste-reasons",
+        json!({ "command_id": cmd(3), "code": "EXPIRED", "name": "过期", "active": true }),
+    )
+    .await;
+    let mut oz = rline(&flour, 1, "2026-10-20");
+    oz["input"] = json!({ "qty": "1.25", "unit_code": "oz", "base_qty_per_unit": "28.349523125" });
+    let mut half = rline(&flour, 1, "2026-10-25");
+    half["input"]["qty"] = json!("0.5");
+    let lots = node.receive(4, &supplier, vec![oz, half], 0).await;
+
+    let item = |on_hand: &str, unallocated: &str, lots: Value| {
+        json!({ "business_date": "2026-10-06", "items": [{
+            "item_id": flour, "on_hand_qty": on_hand, "unallocated_qty": unallocated, "lots": lots,
+        }] })
+    };
+    let mut first = lot_row(&lots[0], 0, NOW, END_OF_10_20);
+    first["remaining_qty"] = json!("35.437");
+    let mut second = lot_row(&lots[1], 0, NOW, END_OF_10_25);
+    second["remaining_qty"] = json!("0.5");
+    assert_eq!(
+        node.detail("").await,
+        item("35.937", "0", json!([first, second]))
+    );
+
+    node.write(
+        &STAFF,
+        Method::POST,
+        "/api/v1/waste-records",
+        json!({
+            "command_id": cmd(5), "captured_at": SENT, "sent_at": SENT,
+            "lines": [{
+                "item_id": flour, "input": { "qty": "36", "unit_code": "g", "base_qty_per_unit": "1" },
+                "reason_code": "EXPIRED", "confirm_shortage": true,
+            }],
+        }),
+    )
+    .await;
+
+    assert_eq!(node.detail("").await, item("-0.063", "-0.063", json!([])));
+    for (lot_id, expires_at) in [(&lots[0], END_OF_10_20), (&lots[1], END_OF_10_25)] {
+        let reply = node.lot(Some(&STAFF), lot_id).await;
+        assert_eq!(
+            assert_success(&reply),
+            &json!({ "lot": with_item(lot_row(lot_id, 0, NOW, expires_at), &flour) }),
+            "{lot_id}"
+        );
+    }
 }

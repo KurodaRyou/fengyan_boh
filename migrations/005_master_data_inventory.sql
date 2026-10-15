@@ -1,8 +1,11 @@
 -- 005_master_data_inventory.sql
--- 其余主数据（物料、配方、供应商、报损原因）与库存投影。合并到 main 后禁止修改，变更请新增下一个编号的文件。
+-- 其余主数据（物料、配方、供应商、报损原因）与库存投影。
+-- 上线之后禁止修改，变更请新增下一个编号的文件；上线之前直接修改本文件（见 AGENTS.md「开发阶段与上线」）。
 -- 全部是投影：只由 projections::apply 按事件写入，可由 rebuild-projections 从 store_events 完整重建。
 -- 引用其他投影的外键延迟到提交时检查：重建在一个事务内清空并重写全部投影，顺序不限。
 -- 主数据表每行的 id 是事件的 aggregate_id，revision 是 aggregate_version，其余列取自快照。
+-- 数量列存千分之一基本单位的整数，换算系数存十亿分之一基本单位的整数（见 docs/domain.md「数量」「单位」）。
+-- 库存状态上限 L = 10^9 个基本单位，存储值 10^12。
 
 -- 物料（MASTER_DATA_CHANGED，entity = 'ITEM'）。快照的 units 拆到 item_units。
 CREATE TABLE items (
@@ -21,7 +24,7 @@ CREATE TABLE items (
 CREATE TABLE item_units (
     item_id           TEXT NOT NULL REFERENCES items(id) DEFERRABLE INITIALLY DEFERRED,
     unit_code         TEXT NOT NULL CHECK (unit_code <> ''),
-    base_qty_per_unit INTEGER NOT NULL CHECK (base_qty_per_unit > 0),
+    base_qty_per_unit INTEGER NOT NULL CHECK (base_qty_per_unit BETWEEN 1 AND 1000000000000000000), -- 系数上限 10^9
     PRIMARY KEY (item_id, unit_code)
 ) STRICT;
 
@@ -36,20 +39,30 @@ CREATE TABLE recipes (
     revision       INTEGER NOT NULL CHECK (revision >= 1)
 ) STRICT;
 
+-- 每批产出：output_qty_per_batch 是换算后的数量（产出物料的基本单位），output_input_* 是录入时的 input 快照。
+-- output_input_qty 存千分之一录入单位，不超过录入上限 9999.999（存储值 9999999）。
 CREATE TABLE recipe_versions (
-    recipe_id            TEXT NOT NULL REFERENCES recipes(id) DEFERRABLE INITIALLY DEFERRED,
-    version              INTEGER NOT NULL CHECK (version >= 1),
-    output_qty_per_batch INTEGER NOT NULL CHECK (output_qty_per_batch > 0), -- 产出物料的基本单位
+    recipe_id                      TEXT NOT NULL REFERENCES recipes(id) DEFERRABLE INITIALLY DEFERRED,
+    version                        INTEGER NOT NULL CHECK (version >= 1),
+    output_qty_per_batch           INTEGER NOT NULL CHECK (output_qty_per_batch > 0),
+    output_input_qty               INTEGER NOT NULL CHECK (output_input_qty BETWEEN 1 AND 9999999),
+    output_input_unit_code         TEXT NOT NULL CHECK (output_input_unit_code <> ''),
+    output_input_base_qty_per_unit INTEGER NOT NULL
+                                   CHECK (output_input_base_qty_per_unit BETWEEN 1 AND 1000000000000000000),
     PRIMARY KEY (recipe_id, version)
 ) STRICT;
 
 -- 每个版本的用料：line_no 是该版本 lines 数组的下标，从 0 开始。
+-- qty_per_batch 是换算后的数量（该物料的基本单位），input_* 是录入时的 input 快照，取值同 recipe_versions。
 CREATE TABLE recipe_lines (
-    recipe_id     TEXT NOT NULL,
-    version       INTEGER NOT NULL,
-    line_no       INTEGER NOT NULL CHECK (line_no >= 0),
-    item_id       TEXT NOT NULL REFERENCES items(id) DEFERRABLE INITIALLY DEFERRED,
-    qty_per_batch INTEGER NOT NULL CHECK (qty_per_batch > 0), -- 该物料的基本单位
+    recipe_id               TEXT NOT NULL,
+    version                 INTEGER NOT NULL,
+    line_no                 INTEGER NOT NULL CHECK (line_no >= 0),
+    item_id                 TEXT NOT NULL REFERENCES items(id) DEFERRABLE INITIALLY DEFERRED,
+    qty_per_batch           INTEGER NOT NULL CHECK (qty_per_batch > 0),
+    input_qty               INTEGER NOT NULL CHECK (input_qty BETWEEN 1 AND 9999999),
+    input_unit_code         TEXT NOT NULL CHECK (input_unit_code <> ''),
+    input_base_qty_per_unit INTEGER NOT NULL CHECK (input_base_qty_per_unit BETWEEN 1 AND 1000000000000000000),
     PRIMARY KEY (recipe_id, version, line_no),
     UNIQUE (recipe_id, version, item_id),
     FOREIGN KEY (recipe_id, version) REFERENCES recipe_versions(recipe_id, version)
@@ -77,9 +90,7 @@ CREATE TABLE waste_reasons (
     revision INTEGER NOT NULL CHECK (revision >= 1)
 ) STRICT;
 
--- 批次：每条收货行、每次生产产出、每个盘盈一行；余量为 0 的批次保留。
--- FIFO 按（盘盈优先、source_event_seq、source_line_no）升序，见 docs/domain.md「批次」。
--- source_event_seq、source_line_no 是建批次的事件和原 payload 下标，之后的调整不改变它们。
+-- 批次的初始结构。007 删除并重建本表；现行结构以 007 为准，批次与 FIFO 规则见 docs/domain.md「批次」。
 CREATE TABLE inventory_lots (
     lot_id           TEXT PRIMARY KEY
                      CHECK (length(lot_id) = 36 AND lot_id = lower(lot_id) AND substr(lot_id, 15, 1) = '7'),
@@ -95,10 +106,10 @@ CREATE TABLE inventory_lots (
 
 CREATE INDEX idx_inventory_lots_item ON inventory_lots(item_id);
 
--- 账外缺口：每个物料至多一行。
+-- 账外缺口：每个物料至多一行，不低于 −L。
 CREATE TABLE inventory_unallocated (
     item_id TEXT PRIMARY KEY REFERENCES items(id) DEFERRABLE INITIALLY DEFERRED,
-    qty     INTEGER NOT NULL CHECK (qty <= 0)
+    qty     INTEGER NOT NULL CHECK (qty BETWEEN -1000000000000 AND 0)
 ) STRICT;
 
 -- 库存流水：每条库存影响按批次展开，一行一条。数量带符号，增加为正。
@@ -131,12 +142,14 @@ CREATE INDEX idx_inventory_movements_item ON inventory_movements(item_id, busine
 
 -- 盘点：每次盘点（STOCK_ADJUSTED 事件）的每个被盘物料一行，零差异也写。
 -- observed_at 是盘点事件的 occurred_at；吸收判定按 (item_id, observed_at, event_seq) 查找。
+-- book_qty 是盘点前的净账面，counted_qty 是盘点后的净账面（清点的实物总量），绝对值都不超过 L。
 CREATE TABLE inventory_counts (
     event_seq   INTEGER NOT NULL REFERENCES store_events(seq),
     item_id     TEXT NOT NULL REFERENCES items(id) DEFERRABLE INITIALLY DEFERRED,
     observed_at INTEGER NOT NULL,
-    book_qty    INTEGER NOT NULL,                     -- 提交时范围内批次余量与账外缺口之和
-    counted_qty INTEGER NOT NULL CHECK (counted_qty >= 0),
+    book_qty    INTEGER NOT NULL                      -- 提交时范围内批次余量与账外缺口之和
+                CHECK (book_qty BETWEEN -1000000000000 AND 1000000000000),
+    counted_qty INTEGER NOT NULL CHECK (counted_qty BETWEEN 0 AND 1000000000000),
     PRIMARY KEY (event_seq, item_id)
 ) STRICT;
 

@@ -1,5 +1,7 @@
-//! 锁定测试：收货接口。规则见 docs/domain.md「收货接口」「批次」「单位」「时间」「事件目录」「投影表」「验收用例」，
-//! AGENTS.md「幂等」「HTTP 约定」「ID 与时间」，接口见 docs/interfaces.md。
+//! 锁定测试：收货接口。规则见 docs/domain.md「收货接口」「批次」「数量」「单位」「时间」「事件目录」「投影表」「验收用例」，
+//! AGENTS.md「幂等」「HTTP 约定」「ID 与时间」「数值」，接口见 docs/interfaces.md。
+//! 数量与换算系数在请求、响应和 payload 中是小数字符串；inventory_lots、inventory_movements、inventory_on_hand 中的数量
+//! 是千分之一基本单位（1 g 存为 1000）。
 
 mod spec_support;
 
@@ -148,7 +150,7 @@ impl Node {
     }
 
     /// 新建一个以克为基本单位的物料；`units` 为 `[(unit_code, base_qty_per_unit)]`，须按 `unit_code` 升序。
-    async fn item(&self, command_id: &str, code: &str, units: &[(&str, i64)]) -> String {
+    async fn item(&self, command_id: &str, code: &str, units: &[(&str, &str)]) -> String {
         self.master(
             "/api/v1/items",
             "item",
@@ -168,7 +170,7 @@ impl Node {
         command_id: &str,
         item_id: &str,
         base_revision: i64,
-        units: &[(&str, i64)],
+        units: &[(&str, &str)],
         active: bool,
     ) {
         let reply = spec_support::put(
@@ -348,7 +350,7 @@ impl Node {
     }
 }
 
-fn units_json(units: &[(&str, i64)]) -> Value {
+fn units_json(units: &[(&str, &str)]) -> Value {
     Value::Array(
         units
             .iter()
@@ -362,9 +364,9 @@ fn cmd(n: u16) -> String {
     format!("01890a5d-ac96-774b-bcce-b30209a9{n:04x}")
 }
 
-/// 请求中的一行：`qty` 个 `unit_code`（每个 `factor` 个基本单位），默认生产日期 2026-10-01、到期 2026-10-20、
+/// 请求中的一行：`qty` 个 `unit_code`（每个 `factor` 个基本单位，都是小数字符串），默认生产日期 2026-10-01、到期 2026-10-20、
 /// 金额 1000 分、没有生产商批号。
-fn line(item_id: &str, qty: i64, unit_code: &str, factor: i64) -> Value {
+fn line(item_id: &str, qty: &str, unit_code: &str, factor: &str) -> Value {
     json!({
         "item_id": item_id,
         "input": { "qty": qty, "unit_code": unit_code, "base_qty_per_unit": factor },
@@ -465,7 +467,8 @@ fn assert_warnings(reply: &JsonReply, expected: &[(&str, Value)]) {
 
 // 收货接口「新建」：普通员工即可收货；一个命令写一条 GOODS_RECEIVED@2（新的 RECEIPT 聚合，version 1）和一行
 // processed_commands；每行建一个批次并写一条流水。
-// - qty = input.qty × base_qty_per_unit；expires_at = expires_on 当日最后一毫秒（Asia/Shanghai）。
+// - qty 是 input 的单位换算结果（2 bag × 25000 = "50000"）；expires_at = expires_on 当日最后一毫秒（Asia/Shanghai）。
+// - 投影的数量是千分之一基本单位：50000 g 的批次余量与流水都是 50000000。
 // - 批次号 <类型>-<编码>-<批次日期>-<流水号>：面粉的两行按行序取 001、002，黄油另从 001 开始；批次日期是 occurred_at
 //   （10-06 08:50）的当地日期；投影的 lot_date、lot_serial 由批次号拆出。
 // - 同一物料的两行分别建批次，source_line_no 为原下标（domain「批次」来源）；用基本单位提交时系数为 1。
@@ -474,13 +477,13 @@ fn assert_warnings(reply: &JsonReply, expected: &[(&str, Value)]) {
 #[tokio::test]
 async fn receive_writes_event_lots_movements_and_command() {
     let node = node();
-    let flour = node.item(&cmd(1), "FLOUR", &[("bag", 25000)]).await;
+    let flour = node.item(&cmd(1), "FLOUR", &[("bag", "25000")]).await;
     let butter = node.item(&cmd(2), "BUTTER", &[]).await;
     let supplier = node.supplier(&cmd(3), "S1").await;
-    let mut line0 = line(&flour, 2, "bag", 25000);
+    let mut line0 = line(&flour, "2", "bag", "25000");
     line0["manufacturer_lot_no"] = json!("L-2026-1001");
-    let line1 = expiring(line(&butter, 500, "g", 1), "2026-10-15");
-    let mut line2 = expiring(line(&flour, 3000, "g", 1), "2026-10-22");
+    let line1 = expiring(line(&butter, "500", "g", "1"), "2026-10-15");
+    let mut line2 = expiring(line(&flour, "3000", "g", "1"), "2026-10-22");
     line2["produced_on"] = json!("2026-10-06");
     line2["line_cost_cents"] = json!(0);
     let request = body(
@@ -506,22 +509,22 @@ async fn receive_writes_event_lots_movements_and_command() {
     let occurred_at = NOW - 10 * MINUTE;
     let payload_lines = json!([
         {
-            "item_id": flour, "qty": 50000,
-            "input": { "qty": 2, "unit_code": "bag", "base_qty_per_unit": 25000 },
+            "item_id": flour, "qty": "50000",
+            "input": { "qty": "2", "unit_code": "bag", "base_qty_per_unit": "25000" },
             "lot_id": lots[0], "manufacturer_lot_no": "L-2026-1001",
             "produced_on": "2026-10-01", "expires_on": "2026-10-20", "expires_at": END_OF_10_20,
             "line_cost_cents": 1000,
         },
         {
-            "item_id": butter, "qty": 500,
-            "input": { "qty": 500, "unit_code": "g", "base_qty_per_unit": 1 },
+            "item_id": butter, "qty": "500",
+            "input": { "qty": "500", "unit_code": "g", "base_qty_per_unit": "1" },
             "lot_id": lots[1],
             "produced_on": "2026-10-01", "expires_on": "2026-10-15", "expires_at": END_OF_10_15,
             "line_cost_cents": 1000,
         },
         {
-            "item_id": flour, "qty": 3000,
-            "input": { "qty": 3000, "unit_code": "g", "base_qty_per_unit": 1 },
+            "item_id": flour, "qty": "3000",
+            "input": { "qty": "3000", "unit_code": "g", "base_qty_per_unit": "1" },
             "lot_id": lots[2],
             "produced_on": "2026-10-06", "expires_on": "2026-10-22", "expires_at": END_OF_10_22,
             "line_cost_cents": 0,
@@ -575,7 +578,7 @@ async fn receive_writes_event_lots_movements_and_command() {
                 "RECEIPT".into(),
                 seq,
                 0,
-                50000,
+                50_000_000,
                 Some(END_OF_10_20),
                 Some("L-2026-1001".into()),
             ),
@@ -587,7 +590,7 @@ async fn receive_writes_event_lots_movements_and_command() {
                 "RECEIPT".into(),
                 seq,
                 1,
-                500,
+                500_000,
                 Some(END_OF_10_15),
                 None,
             ),
@@ -599,7 +602,7 @@ async fn receive_writes_event_lots_movements_and_command() {
                 "RECEIPT".into(),
                 seq,
                 2,
-                3000,
+                3_000_000,
                 Some(END_OF_10_22),
                 None,
             ),
@@ -623,13 +626,13 @@ async fn receive_writes_event_lots_movements_and_command() {
     assert_eq!(
         node.movements().unwrap(),
         [
-            movement(0, &flour, &lots[0], 50000),
-            movement(1, &butter, &lots[1], 500),
-            movement(2, &flour, &lots[2], 3000),
+            movement(0, &flour, &lots[0], 50_000_000),
+            movement(1, &butter, &lots[1], 500_000),
+            movement(2, &flour, &lots[2], 3_000_000),
         ]
     );
-    assert_eq!(node.on_hand(&flour).unwrap(), 53000);
-    assert_eq!(node.on_hand(&butter).unwrap(), 500);
+    assert_eq!(node.on_hand(&flour).unwrap(), 53_000_000);
+    assert_eq!(node.on_hand(&butter).unwrap(), 500_000);
     let mut canonical = request.clone();
     canonical.as_object_mut().unwrap().remove("command_id");
     canonical.as_object_mut().unwrap().remove("sent_at");
@@ -649,13 +652,13 @@ async fn managers_can_receive_and_each_receipt_is_a_new_aggregate() {
     let first = node
         .receive_ok(
             &MANAGER,
-            &body(&cmd(3), &supplier, vec![line(&flour, 1, "g", 1)], 0),
+            &body(&cmd(3), &supplier, vec![line(&flour, "1", "g", "1")], 0),
         )
         .await;
     let second = node
         .receive_ok(
             &STAFF,
-            &body(&cmd(4), &supplier, vec![line(&flour, 1, "g", 1)], 0),
+            &body(&cmd(4), &supplier, vec![line(&flour, "1", "g", "1")], 0),
         )
         .await;
 
@@ -671,36 +674,53 @@ async fn managers_can_receive_and_each_receipt_is_a_new_aggregate() {
 }
 
 // 取值边界照常受理：manufacturer_lot_no 恰好 64 个字符（按 Unicode 字符计，含非 ASCII），首尾以外的空白原样保存；
-// line_cost_cents = 0；produced_on = expires_on；input.qty × base_qty_per_unit 恰好等于 i64::MAX（另一个物料）；
-// expires_on 恰好是上限 9998-12-31。
+// line_cost_cents = 0 与上限 99999999；produced_on = expires_on；input.qty 为录入上限 9999.999 和最小值 0.001；
+// 换算系数为上限 1000000000（0.001 个 = 1000000 g）；9999.999 mg × 0.001 = 9.999999 g，四舍五入为 "10"；
+// expires_on 恰好是上限 9998-12-31。投影中的余量是千分之一克。
 #[tokio::test]
 async fn boundary_values_are_accepted() {
     let node = node();
     let flour = node.item(&cmd(1), "FLOUR", &[]).await;
-    let big = node.item(&cmd(4), "BIG", &[("unit", 1)]).await;
+    let big = node
+        .item(&cmd(4), "BIG", &[("max", "1000000000"), ("mg", "0.001")])
+        .await;
     let supplier = node.supplier(&cmd(2), "S1").await;
     let lot_no = format!("批 号{}", "x".repeat(61));
     assert_eq!(lot_no.chars().count(), 64);
-    let mut line0 = line(&flour, 1, "g", 1);
+    let mut line0 = line(&flour, "1", "g", "1");
     line0["manufacturer_lot_no"] = json!(lot_no);
     line0["line_cost_cents"] = json!(0);
     line0["produced_on"] = json!("2026-10-06");
     line0["expires_on"] = json!("2026-10-06");
-    let line1 = line(&big, i64::MAX, "unit", 1);
-    let mut line2 = line(&flour, 1, "g", 1);
+    let line1 = line(&flour, "9999.999", "g", "1");
+    let mut line2 = line(&flour, "0.001", "g", "1");
     line2["expires_on"] = json!("9998-12-31");
+    line2["line_cost_cents"] = json!(99_999_999);
+    let line3 = line(&big, "0.001", "max", "1000000000");
+    let line4 = line(&big, "9999.999", "mg", "0.001");
 
     let receipt = node
         .receive_ok(
             &STAFF,
-            &body(&cmd(3), &supplier, vec![line0, line1, line2], 0),
+            &body(
+                &cmd(3),
+                &supplier,
+                vec![line0, line1, line2, line3, line4],
+                0,
+            ),
         )
         .await;
 
     assert_eq!(receipt["lines"][0]["manufacturer_lot_no"], json!(lot_no));
     assert_eq!(receipt["lines"][0]["expires_at"], json!(END_OF_10_06));
-    assert_eq!(receipt["lines"][1]["qty"], json!(i64::MAX));
+    assert_eq!(receipt["lines"][1]["qty"], json!("9999.999"));
+    assert_eq!(receipt["lines"][2]["qty"], json!("0.001"));
     assert_eq!(receipt["lines"][2]["expires_at"], json!(END_OF_9998_12_31));
+    assert_eq!(receipt["lines"][2]["line_cost_cents"], json!(99_999_999));
+    assert_eq!(receipt["lines"][3]["qty"], json!("1000000"));
+    assert_eq!(receipt["lines"][4]["qty"], json!("10"));
+    let remaining: Vec<i64> = node.lots().unwrap().iter().map(|lot| lot.7).collect();
+    assert_eq!(remaining, [1_000, 9_999_999, 1, 1_000_000_000, 10_000]);
 }
 
 // domain「主数据」：命令引用已停用的供应商和物料照常受理。
@@ -714,7 +734,7 @@ async fn inactive_supplier_and_item_are_accepted() {
 
     node.receive_ok(
         &STAFF,
-        &body(&cmd(5), &supplier, vec![line(&flour, 1, "g", 1)], 0),
+        &body(&cmd(5), &supplier, vec![line(&flour, "1", "g", "1")], 0),
     )
     .await;
 
@@ -733,7 +753,12 @@ async fn business_date_and_physical_at_follow_occurred_at() {
     let today = node
         .receive_ok(
             &STAFF,
-            &body(&cmd(3), &supplier, vec![line(&flour, 1, "g", 1)], 5 * HOUR),
+            &body(
+                &cmd(3),
+                &supplier,
+                vec![line(&flour, "1", "g", "1")],
+                5 * HOUR,
+            ),
         )
         .await;
     let yesterday = node
@@ -742,7 +767,7 @@ async fn business_date_and_physical_at_follow_occurred_at() {
             &body(
                 &cmd(4),
                 &supplier,
-                vec![line(&flour, 1, "g", 1)],
+                vec![line(&flour, "1", "g", "1")],
                 5 * HOUR + 1,
             ),
         )
@@ -778,7 +803,12 @@ async fn relative_calibration_applies() {
     let reply = node
         .receive(
             &STAFF,
-            &body(&cmd(3), &supplier, vec![line(&flour, 1, "g", 1)], -MINUTE),
+            &body(
+                &cmd(3),
+                &supplier,
+                vec![line(&flour, "1", "g", "1")],
+                -MINUTE,
+            ),
         )
         .await;
     assert_eq!(receipt(&reply)["occurred_at"], json!(NOW));
@@ -791,7 +821,7 @@ async fn relative_calibration_applies() {
             &body(
                 &cmd(4),
                 &supplier,
-                vec![line(&flour, 1, "g", 1)],
+                vec![line(&flour, "1", "g", "1")],
                 MAX_LAG + 1,
             ),
         )
@@ -803,7 +833,12 @@ async fn relative_calibration_applies() {
     let reply = node
         .receive(
             &STAFF,
-            &body(&cmd(4), &supplier, vec![line(&flour, 1, "g", 1)], MAX_LAG),
+            &body(
+                &cmd(4),
+                &supplier,
+                vec![line(&flour, "1", "g", "1")],
+                MAX_LAG,
+            ),
         )
         .await;
     assert_eq!(receipt(&reply)["business_date"], json!("2026-10-03"));
@@ -832,8 +867,8 @@ async fn expiry_before_stock_used_first_warns_per_line() {
                 &cmd(4),
                 &supplier,
                 vec![
-                    expiring(line(&flour, 5, "g", 1), "2026-10-20"),
-                    expiring(line(&flour, 5, "g", 1), "2026-10-25"),
+                    expiring(line(&flour, "5", "g", "1"), "2026-10-20"),
+                    expiring(line(&flour, "5", "g", "1"), "2026-10-25"),
                 ],
                 0,
             ),
@@ -845,7 +880,7 @@ async fn expiry_before_stock_used_first_warns_per_line() {
         &body(
             &cmd(5),
             &supplier,
-            vec![expiring(line(&sugar, 5, "g", 1), "2027-04-06")],
+            vec![expiring(line(&sugar, "5", "g", "1"), "2027-04-06")],
             0,
         ),
     )
@@ -858,11 +893,11 @@ async fn expiry_before_stock_used_first_warns_per_line() {
                 &cmd(6),
                 &supplier,
                 vec![
-                    expiring(line(&flour, 1, "g", 1), "2026-10-15"),
-                    expiring(line(&flour, 1, "g", 1), "2026-10-25"),
-                    expiring(line(&flour, 1, "g", 1), "2026-10-22"),
+                    expiring(line(&flour, "1", "g", "1"), "2026-10-15"),
+                    expiring(line(&flour, "1", "g", "1"), "2026-10-25"),
+                    expiring(line(&flour, "1", "g", "1"), "2026-10-22"),
                     // 与同次的 lines[1] 同日到期：不早于任何先扣的批次。
-                    expiring(line(&flour, 1, "g", 1), "2026-10-25"),
+                    expiring(line(&flour, "1", "g", "1"), "2026-10-25"),
                 ],
                 -MINUTE,
             ),
@@ -894,7 +929,7 @@ async fn expiry_before_stock_used_first_warns_per_line() {
         ],
     );
     assert_eq!(node.lots().unwrap().len(), 7);
-    assert_eq!(node.on_hand(&flour).unwrap(), 14);
+    assert_eq!(node.on_hand(&flour).unwrap(), 14_000);
     assert_eq!(lot_ids(&a).len(), 2);
 }
 
@@ -911,7 +946,7 @@ async fn expiry_before_earlier_line_of_same_receipt_warns() {
         &body(
             &cmd(3),
             &supplier,
-            vec![expiring(line(&flour, 5, "g", 1), "2026-10-20")],
+            vec![expiring(line(&flour, "5", "g", "1"), "2026-10-20")],
             0,
         ),
     )
@@ -924,8 +959,8 @@ async fn expiry_before_earlier_line_of_same_receipt_warns() {
                 &cmd(4),
                 &supplier,
                 vec![
-                    expiring(line(&flour, 1, "g", 1), "2026-10-25"),
-                    expiring(line(&flour, 1, "g", 1), "2026-10-22"),
+                    expiring(line(&flour, "1", "g", "1"), "2026-10-25"),
+                    expiring(line(&flour, "1", "g", "1"), "2026-10-22"),
                 ],
                 0,
             ),
@@ -941,7 +976,7 @@ async fn expiry_before_earlier_line_of_same_receipt_warns() {
         )],
     );
     assert_eq!(node.lots().unwrap().len(), 3);
-    assert_eq!(node.on_hand(&flour).unwrap(), 7);
+    assert_eq!(node.on_hand(&flour).unwrap(), 7_000);
 }
 
 // domain「批次」：同到期日不算「早于」；按 FIFO 先被扣的批次到期更早时也不警告。
@@ -955,7 +990,7 @@ async fn equal_or_later_expiry_does_not_warn() {
         &body(
             &cmd(3),
             &supplier,
-            vec![expiring(line(&flour, 5, "g", 1), "2026-10-15")],
+            vec![expiring(line(&flour, "5", "g", "1"), "2026-10-15")],
             0,
         ),
     )
@@ -968,7 +1003,7 @@ async fn equal_or_later_expiry_does_not_warn() {
                 &body(
                     &cmd(n),
                     &supplier,
-                    vec![expiring(line(&flour, 1, "g", 1), expires_on)],
+                    vec![expiring(line(&flour, "1", "g", "1"), expires_on)],
                     0,
                 ),
             )
@@ -996,8 +1031,8 @@ async fn expired_on_receipt_is_rejected() {
                 &cmd(3),
                 &supplier,
                 vec![
-                    line(&flour, 1, "g", 1),
-                    expiring(line(&flour, 1, "g", 1), "2026-10-07"),
+                    line(&flour, "1", "g", "1"),
+                    expiring(line(&flour, "1", "g", "1"), "2026-10-07"),
                 ],
                 sent,
                 sent,
@@ -1017,7 +1052,7 @@ async fn expired_on_receipt_is_rejected() {
             &timed_body(
                 &cmd(3),
                 &supplier,
-                vec![expiring(line(&flour, 1, "g", 1), "2026-10-08")],
+                vec![expiring(line(&flour, "1", "g", "1"), "2026-10-08")],
                 sent,
                 sent,
             ),
@@ -1035,7 +1070,7 @@ async fn produced_on_is_checked_against_the_calendar_date() {
     let supplier = node.supplier(&cmd(2), "S1").await;
     node.clock.set(UnixMillis(AT_10_08_0200));
     let today = |n: u16, produced_on: &str| {
-        let mut l = line(&flour, 1, "g", 1);
+        let mut l = line(&flour, "1", "g", "1");
         l["produced_on"] = json!(produced_on);
         timed_body(&cmd(n), &supplier, vec![l], AT_10_08_0200, AT_10_08_0200)
     };
@@ -1062,7 +1097,7 @@ async fn lot_dates_follow_occurred_at_not_recorded_at() {
     node.clock.set(UnixMillis(AT_10_08_0030));
     let sent = AT_10_08_0030;
 
-    let mut future = line(&flour, 1, "g", 1);
+    let mut future = line(&flour, "1", "g", "1");
     future["produced_on"] = json!("2026-10-08");
     let reply = node
         .receive(
@@ -1075,7 +1110,7 @@ async fn lot_dates_follow_occurred_at_not_recorded_at() {
         &json!({ "line": 0, "item_id": flour, "reason": "PRODUCED_IN_FUTURE" })
     );
 
-    let mut last_day = expiring(line(&flour, 1, "g", 1), "2026-10-07");
+    let mut last_day = expiring(line(&flour, "1", "g", "1"), "2026-10-07");
     last_day["produced_on"] = json!("2026-10-07");
     let receipt = node
         .receive_ok(
@@ -1096,41 +1131,9 @@ async fn lot_dates_follow_occurred_at_not_recorded_at() {
 #[tokio::test]
 async fn changed_conversion_is_a_conflict() {
     let node = node();
-    let flour = node.item(&cmd(1), "FLOUR", &[("bag", 25000)]).await;
+    let flour = node.item(&cmd(1), "FLOUR", &[("bag", "25000")]).await;
     let supplier = node.supplier(&cmd(2), "S1").await;
-    node.update_item(&cmd(3), &flour, 1, &[("bag", 20000)], true)
-        .await;
-    let before = node.state();
-
-    let reply = node
-        .receive(
-            &STAFF,
-            &body(&cmd(4), &supplier, vec![line(&flour, 2, "bag", 25000)], 0),
-        )
-        .await;
-    assert_eq!(
-        assert_error(&reply, 409, "UNIT_CONVERSION_CHANGED"),
-        &json!({ "line": 0, "item_id": flour, "unit_code": "bag", "base_qty_per_unit": 20000 })
-    );
-    assert_eq!(node.state(), before);
-
-    let receipt = node
-        .receive_ok(
-            &STAFF,
-            &body(&cmd(4), &supplier, vec![line(&flour, 2, "bag", 20000)], 0),
-        )
-        .await;
-    assert_eq!(receipt["lines"][0]["qty"], json!(40000));
-}
-
-// domain「收货接口」：用基本单位提交时当前系数为 1，系数不是 1 也是 409 UNIT_CONVERSION_CHANGED；
-// unit_code 既不是基本单位也不在 units 中（含已删除的单位、大小写不同）：400 UNKNOWN_UNIT。都不写任何内容。
-#[tokio::test]
-async fn unit_mismatches_are_rejected() {
-    let node = node();
-    let flour = node.item(&cmd(1), "FLOUR", &[("bag", 25000)]).await;
-    let supplier = node.supplier(&cmd(2), "S1").await;
-    node.update_item(&cmd(3), &flour, 1, &[("box", 10000)], true)
+    node.update_item(&cmd(3), &flour, 1, &[("bag", "20000")], true)
         .await;
     let before = node.state();
 
@@ -1140,14 +1143,59 @@ async fn unit_mismatches_are_rejected() {
             &body(
                 &cmd(4),
                 &supplier,
-                vec![line(&flour, 1, "box", 10000), line(&flour, 5, "g", 1000)],
+                vec![line(&flour, "2", "bag", "25000")],
                 0,
             ),
         )
         .await;
     assert_eq!(
         assert_error(&reply, 409, "UNIT_CONVERSION_CHANGED"),
-        &json!({ "line": 1, "item_id": flour, "unit_code": "g", "base_qty_per_unit": 1 })
+        &json!({ "line": 0, "item_id": flour, "unit_code": "bag", "base_qty_per_unit": "20000" })
+    );
+    assert_eq!(node.state(), before);
+
+    let receipt = node
+        .receive_ok(
+            &STAFF,
+            &body(
+                &cmd(4),
+                &supplier,
+                vec![line(&flour, "2", "bag", "20000")],
+                0,
+            ),
+        )
+        .await;
+    assert_eq!(receipt["lines"][0]["qty"], json!("40000"));
+}
+
+// domain「收货接口」：用基本单位提交时当前系数为 1，系数不是 1 也是 409 UNIT_CONVERSION_CHANGED；
+// unit_code 既不是基本单位也不在 units 中（含已删除的单位、大小写不同）：400 UNKNOWN_UNIT。都不写任何内容。
+#[tokio::test]
+async fn unit_mismatches_are_rejected() {
+    let node = node();
+    let flour = node.item(&cmd(1), "FLOUR", &[("bag", "25000")]).await;
+    let supplier = node.supplier(&cmd(2), "S1").await;
+    node.update_item(&cmd(3), &flour, 1, &[("box", "10000")], true)
+        .await;
+    let before = node.state();
+
+    let reply = node
+        .receive(
+            &STAFF,
+            &body(
+                &cmd(4),
+                &supplier,
+                vec![
+                    line(&flour, "1", "box", "10000"),
+                    line(&flour, "5", "g", "1000"),
+                ],
+                0,
+            ),
+        )
+        .await;
+    assert_eq!(
+        assert_error(&reply, 409, "UNIT_CONVERSION_CHANGED"),
+        &json!({ "line": 1, "item_id": flour, "unit_code": "g", "base_qty_per_unit": "1" })
     );
 
     for unit_code in ["bag", "BOX", "kg"] {
@@ -1157,7 +1205,7 @@ async fn unit_mismatches_are_rejected() {
                 &body(
                     &cmd(4),
                     &supplier,
-                    vec![line(&flour, 1, unit_code, 25000)],
+                    vec![line(&flour, "1", unit_code, "25000")],
                     0,
                 ),
             )
@@ -1195,7 +1243,7 @@ async fn unknown_references_are_not_found() {
         let reply = node
             .receive(
                 &STAFF,
-                &body(&cmd(3), supplier_id, vec![line(item_id, 1, "g", 1)], 0),
+                &body(&cmd(3), supplier_id, vec![line(item_id, "1", "g", "1")], 0),
             )
             .await;
         assert_eq!(
@@ -1213,12 +1261,21 @@ async fn unknown_references_are_not_found() {
 
 // domain「收货接口」取值、「写命令通用规则」取值与 AGENTS「HTTP 约定」：结构或取值错误一律 400 VALIDATION_FAILED，details 为 {}，什么都不写。
 // 引用都存在、单位合法，只有被改动的字段不合法。
+// - input.qty、base_qty_per_unit 的写法与范围见 domain「数量」「单位」（spec_support 的两张非法写法表）；
+//   input.qty 大于 0 而换算结果四舍五入为 0（0.4 × 0.001 = 0.0004；0.001 × 0.499999999 = 0.000499999999 不到中点）也是取值错误，
+//   只用请求中的值判定，与单位是否存在无关（这里的 bag 系数与当前值不同，换算为 0 先命中）。
+// - line_cost_cents 是 JSON 整数 0～99999999。
 #[tokio::test]
 async fn invalid_values_are_validation_failed() {
     let node = node();
-    let flour = node.item(&cmd(1), "FLOUR", &[("bag", 25000)]).await;
+    let flour = node.item(&cmd(1), "FLOUR", &[("bag", "25000")]).await;
     let supplier = node.supplier(&cmd(2), "S1").await;
-    let valid = body(&cmd(3), &supplier, vec![line(&flour, 2, "bag", 25000)], 0);
+    let valid = body(
+        &cmd(3),
+        &supplier,
+        vec![line(&flour, "2", "bag", "25000")],
+        0,
+    );
     let before = node.state();
 
     let mut cases: Vec<(&str, Value)> = Vec::new();
@@ -1272,14 +1329,36 @@ async fn invalid_values_are_validation_failed() {
     row("input missing", &|l| {
         l.as_object_mut().unwrap().remove("input");
     });
-    row("input.qty 0", &|l| l["input"]["qty"] = json!(0));
-    row("input.qty negative", &|l| l["input"]["qty"] = json!(-1));
-    row("input.qty string", &|l| l["input"]["qty"] = json!("2"));
-    row("input.qty fraction", &|l| l["input"]["qty"] = json!(1.5));
-    row("factor 0", &|l| l["input"]["base_qty_per_unit"] = json!(0));
-    row("factor negative", &|l| {
-        l["input"]["base_qty_per_unit"] = json!(-25000)
+    row("input.qty missing", &|l| {
+        l["input"].as_object_mut().unwrap().remove("qty");
     });
+    row("factor missing", &|l| {
+        l["input"]
+            .as_object_mut()
+            .unwrap()
+            .remove("base_qty_per_unit");
+    });
+    row("unit_code missing", &|l| {
+        l["input"].as_object_mut().unwrap().remove("unit_code");
+    });
+    row(
+        "conversion rounds to 0",
+        &|l| l["input"] = json!({ "qty": "0.4", "unit_code": "bag", "base_qty_per_unit": "0.001" }),
+    );
+    row(
+        "conversion with smallest factor",
+        &|l| {
+            l["input"] =
+                json!({ "qty": "9999.999", "unit_code": "bag", "base_qty_per_unit": "0.000000001" })
+        },
+    );
+    row(
+        "conversion just below the midpoint",
+        &|l| {
+            l["input"] =
+                json!({ "qty": "0.001", "unit_code": "bag", "base_qty_per_unit": "0.499999999" })
+        },
+    );
     row("unit_code empty", &|l| l["input"]["unit_code"] = json!(""));
     row("unit_code padded", &|l| {
         l["input"]["unit_code"] = json!(" bag")
@@ -1287,11 +1366,7 @@ async fn invalid_values_are_validation_failed() {
     row("input unknown field", &|l| {
         l["input"]["unit"] = json!("bag")
     });
-    row("qty overflow", &|l| {
-        l["input"]["qty"] = json!(i64::MAX);
-        l["input"]["base_qty_per_unit"] = json!(2);
-    });
-    row("qty field present", &|l| l["qty"] = json!(50000));
+    row("qty field present", &|l| l["qty"] = json!("50000"));
     row("lot_id present", &|l| l["lot_id"] = json!(UNKNOWN_ID));
     row("expires_at present", &|l| {
         l["expires_at"] = json!(END_OF_10_20)
@@ -1301,6 +1376,18 @@ async fn invalid_values_are_validation_failed() {
     });
     row("line_cost_cents negative", &|l| {
         l["line_cost_cents"] = json!(-1)
+    });
+    row("line_cost_cents above 99999999", &|l| {
+        l["line_cost_cents"] = json!(100_000_000)
+    });
+    row("line_cost_cents string", &|l| {
+        l["line_cost_cents"] = json!("1000")
+    });
+    row("line_cost_cents fraction", &|l| {
+        l["line_cost_cents"] = json!(10.5)
+    });
+    row("line_cost_cents null", &|l| {
+        l["line_cost_cents"] = Value::Null
     });
     row("manufacturer_lot_no empty", &|l| {
         l["manufacturer_lot_no"] = json!("")
@@ -1349,6 +1436,16 @@ async fn invalid_values_are_validation_failed() {
         request["command_id"] = json!(text);
         cases.push(("command_id non-canonical", request));
     }
+    for (name, qty) in spec_support::invalid_input_qty_texts() {
+        let mut request = valid.clone();
+        request["lines"][0]["input"]["qty"] = qty;
+        cases.push((name, request));
+    }
+    for (name, factor) in spec_support::invalid_factor_texts() {
+        let mut request = valid.clone();
+        request["lines"][0]["input"]["base_qty_per_unit"] = factor;
+        cases.push((name, request));
+    }
 
     for (name, request) in &cases {
         let reply = node.receive(&STAFF, request).await;
@@ -1378,7 +1475,7 @@ async fn out_of_range_times_are_validation_failed() {
                 &timed_body(
                     &cmd(3),
                     &supplier,
-                    vec![line(&flour, 1, "g", 1)],
+                    vec![line(&flour, "1", "g", "1")],
                     captured_at,
                     sent_at,
                 ),
@@ -1396,7 +1493,7 @@ async fn out_of_range_times_are_validation_failed() {
             &timed_body(
                 &cmd(3),
                 &supplier,
-                vec![line(&flour, 1, "g", 1)],
+                vec![line(&flour, "1", "g", "1")],
                 i64::MIN + 1,
                 0,
             ),
@@ -1418,11 +1515,11 @@ async fn out_of_range_times_are_validation_failed() {
 #[tokio::test]
 async fn retries_return_the_original_response() {
     let node = node();
-    let flour = node.item(&cmd(1), "FLOUR", &[("bag", 25000)]).await;
+    let flour = node.item(&cmd(1), "FLOUR", &[("bag", "25000")]).await;
     let supplier = node.supplier(&cmd(2), "S1").await;
     let lines = vec![
-        expiring(line(&flour, 5, "g", 1), "2026-10-20"),
-        expiring(line(&flour, 1, "bag", 25000), "2026-10-15"),
+        expiring(line(&flour, "5", "g", "1"), "2026-10-20"),
+        expiring(line(&flour, "1", "bag", "25000"), "2026-10-15"),
     ];
     let captured_at = SENT + MINUTE;
     let first = node
@@ -1443,7 +1540,7 @@ async fn retries_return_the_original_response() {
             ),
         ],
     );
-    node.update_item(&cmd(4), &flour, 1, &[("bag", 20000)], true)
+    node.update_item(&cmd(4), &flour, 1, &[("bag", "20000")], true)
         .await;
     let before = node.state();
     node.clock.advance(Duration::from_secs(3600));
@@ -1468,13 +1565,13 @@ async fn retries_return_the_original_response() {
 #[tokio::test]
 async fn idempotency_conflicts_list_differing_fields() {
     let node = node();
-    let flour = node.item(&cmd(1), "FLOUR", &[("bag", 25000)]).await;
+    let flour = node.item(&cmd(1), "FLOUR", &[("bag", "25000")]).await;
     let sugar = node.item(&cmd(2), "SUGAR", &[]).await;
     let supplier = node.supplier(&cmd(3), "S1").await;
     let other = node.supplier(&cmd(4), "S2").await;
-    let mut lot_no = line(&flour, 2, "bag", 25000);
+    let mut lot_no = line(&flour, "2", "bag", "25000");
     lot_no["manufacturer_lot_no"] = json!("L1");
-    let lines = vec![lot_no.clone(), line(&sugar, 100, "g", 1)];
+    let lines = vec![lot_no.clone(), line(&sugar, "100", "g", "1")];
     let x = cmd(5);
     node.receive_ok(&STAFF, &body(&x, &supplier, lines.clone(), 10 * MINUTE))
         .await;
@@ -1531,7 +1628,7 @@ async fn idempotency_conflicts_list_differing_fields() {
             body(
                 &x,
                 &supplier,
-                changed_line(&|l| l["input"]["base_qty_per_unit"] = json!(20000)),
+                changed_line(&|l| l["input"]["base_qty_per_unit"] = json!("20000")),
                 10 * MINUTE,
             ),
             json!(["lines"]),
@@ -1596,12 +1693,13 @@ async fn idempotency_conflicts_list_differing_fields() {
 }
 
 // AGENTS「HTTP 约定」处理顺序：请求结构与取值校验先于幂等检查——已成功的 command_id 携带非法内容重发时是 400，不是 409。
+// 超出录入上限（10000 g）、换算结果为 0、数量写成 JSON 数字、金额超出上限都属于取值（domain「数量」「单位」「收货接口」）。
 #[tokio::test]
 async fn validation_precedes_the_idempotency_check() {
     let node = node();
     let flour = node.item(&cmd(1), "FLOUR", &[]).await;
     let supplier = node.supplier(&cmd(2), "S1").await;
-    let original = body(&cmd(3), &supplier, vec![line(&flour, 1, "g", 1)], 0);
+    let original = body(&cmd(3), &supplier, vec![line(&flour, "1", "g", "1")], 0);
     node.receive_ok(&STAFF, &original).await;
     let before = node.state();
 
@@ -1610,7 +1708,20 @@ async fn validation_precedes_the_idempotency_check() {
         ("supplier_id", json!("not-a-uuid")),
         ("produced_on", json!("2026-10-21")),
         ("line_cost_cents", json!(-1)),
+        ("line_cost_cents", json!(100_000_000)),
         ("expires_on", json!("9999-01-01")),
+        (
+            "input",
+            json!({ "qty": "10000", "unit_code": "g", "base_qty_per_unit": "1" }),
+        ),
+        (
+            "input",
+            json!({ "qty": "0.4", "unit_code": "g", "base_qty_per_unit": "0.001" }),
+        ),
+        (
+            "input",
+            json!({ "qty": 1, "unit_code": "g", "base_qty_per_unit": "1" }),
+        ),
     ] {
         let mut request = original.clone();
         if key == "lines" || key == "supplier_id" {
@@ -1633,7 +1744,7 @@ async fn identity_is_required_and_checked_first() {
     let node = node();
     let flour = node.item(&cmd(1), "FLOUR", &[]).await;
     let supplier = node.supplier(&cmd(2), "S1").await;
-    let valid = body(&cmd(3), &supplier, vec![line(&flour, 1, "g", 1)], 0);
+    let valid = body(&cmd(3), &supplier, vec![line(&flour, "1", "g", "1")], 0);
     let before = node.state();
 
     let reply = send(
@@ -1683,4 +1794,303 @@ async fn identity_is_required_and_checked_first() {
     }
 
     assert_eq!(node.state(), before);
+}
+
+// ---------------------------------------------------------------------------------------------
+// 定点数量（domain「数量」「单位」，验收用例「小数系数换算」「换算中点」「录入上限」「收货累计越界」「金额上限」「小数字符串」）
+// ---------------------------------------------------------------------------------------------
+
+// 验收用例「小数系数换算」与 domain「单位」单位换算：qty = input.qty × base_qty_per_unit，每行单独换算，
+// 四舍五入到 0.001 基本单位，中点远离 0。物料基本单位 g，lb 系数 453.59237、oz 系数 28.349523125、half 系数 0.5。
+// - 1.25 oz = 35.43690390625 g → "35.437"；16 oz = 453.59237 g → "453.592"；1 lb → "453.592"（16 oz 与 1 lb 结果相同）。
+// - 0.001 half = 0.0005 → "0.001"；0.003 half = 0.0015 → "0.002"；0.005 half = 0.0025 → "0.003"（中点远离 0，不是银行家舍入）。
+// - "5.500" g → qty "5.5"；payload、响应、规范化请求的 input 中只有规范形式（"5.5"、系数 "1"）。
+// - 投影存千分之一克：35437、453592、453592、1、2、3、5500；账面 948.127 g 存 948127。
+#[tokio::test]
+async fn decimal_factors_convert_with_half_away_rounding() {
+    let node = node();
+    let flour = node
+        .item(
+            &cmd(1),
+            "FLOUR",
+            &[("half", "0.5"), ("lb", "453.59237"), ("oz", "28.349523125")],
+        )
+        .await;
+    let supplier = node.supplier(&cmd(2), "S1").await;
+    let request = body(
+        &cmd(3),
+        &supplier,
+        vec![
+            line(&flour, "1.25", "oz", "28.349523125"),
+            line(&flour, "16", "oz", "28.349523125"),
+            line(&flour, "1", "lb", "453.59237"),
+            line(&flour, "0.001", "half", "0.5"),
+            line(&flour, "0.003", "half", "0.5"),
+            line(&flour, "0.005", "half", "0.50"),
+            line(&flour, "5.500", "g", "1.000"),
+        ],
+        0,
+    );
+
+    let receipt = node.receive_ok(&STAFF, &request).await;
+
+    let converted: Vec<(Value, Value)> = receipt["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| (l["qty"].clone(), l["input"].clone()))
+        .collect();
+    let input = |qty: &str, unit: &str, factor: &str| json!({ "qty": qty, "unit_code": unit, "base_qty_per_unit": factor });
+    assert_eq!(
+        converted,
+        [
+            (json!("35.437"), input("1.25", "oz", "28.349523125")),
+            (json!("453.592"), input("16", "oz", "28.349523125")),
+            (json!("453.592"), input("1", "lb", "453.59237")),
+            (json!("0.001"), input("0.001", "half", "0.5")),
+            (json!("0.002"), input("0.003", "half", "0.5")),
+            (json!("0.003"), input("0.005", "half", "0.5")),
+            (json!("5.5"), input("5.5", "g", "1")),
+        ]
+    );
+    assert_eq!(
+        node.receipts().unwrap()[0].payload["lines"],
+        receipt["lines"]
+    );
+    let remaining: Vec<i64> = node.lots().unwrap().iter().map(|lot| lot.7).collect();
+    assert_eq!(remaining, [35_437, 453_592, 453_592, 1, 2, 3, 5_500]);
+    let deltas: Vec<(i64, i64)> = node
+        .movements()
+        .unwrap()
+        .iter()
+        .map(|m| (m.6, m.7))
+        .collect();
+    assert_eq!(
+        deltas,
+        [
+            (35_437, 35_437),
+            (453_592, 453_592),
+            (453_592, 453_592),
+            (1, 1),
+            (2, 2),
+            (3, 3),
+            (5_500, 5_500)
+        ]
+    );
+    assert_eq!(node.on_hand(&flour).unwrap(), 948_127);
+    let (_, canonical, _) = node.processed(&cmd(3)).unwrap();
+    assert_eq!(
+        canonical["lines"][5]["input"],
+        input("0.005", "half", "0.5")
+    );
+    assert_eq!(canonical["lines"][6]["input"], input("5.5", "g", "1"));
+}
+
+// 验收用例「小数字符串」与 AGENTS「幂等」：请求中小数部分可以带末尾的 0，规范化请求只用规范形式。
+// "5.500" g 照常受理，payload 与响应中为 "5.5"；同一 command_id 再以 "5.5"、"5.50" 重发返回首次响应，seq 不增加；
+// 改为 "5.6" 是 409 IDEMPOTENCY_CONFLICT（fields ["lines"]）；数量写成 JSON 数字 5.5 时 400 VALIDATION_FAILED（取值先于幂等）。
+#[tokio::test]
+async fn trailing_zeros_share_the_canonical_request() {
+    let node = node();
+    let flour = node.item(&cmd(1), "FLOUR", &[("kg", "1000")]).await;
+    let supplier = node.supplier(&cmd(2), "S1").await;
+    let request = |qty: Value, factor: &str| {
+        let mut l = line(&flour, "1", "kg", factor);
+        l["input"]["qty"] = qty;
+        body(&cmd(3), &supplier, vec![l], 0)
+    };
+
+    let first = node.receive(&STAFF, &request(json!("5.500"), "1000")).await;
+    assert_eq!(receipt(&first)["lines"][0]["qty"], json!("5500"));
+    assert_eq!(
+        receipt(&first)["lines"][0]["input"],
+        json!({ "qty": "5.5", "unit_code": "kg", "base_qty_per_unit": "1000" })
+    );
+    let before = node.state();
+
+    for (qty, factor) in [
+        (json!("5.5"), "1000"),
+        (json!("5.50"), "1000.000"),
+        (json!("5.500"), "1000.0"),
+    ] {
+        let reply = node.receive(&STAFF, &request(qty.clone(), factor)).await;
+        assert_eq!(
+            (reply.status.as_u16(), &reply.body),
+            (200, &first.body),
+            "{qty} {factor}"
+        );
+    }
+    let reply = node.receive(&STAFF, &request(json!("5.6"), "1000")).await;
+    assert_eq!(
+        assert_error(&reply, 409, "IDEMPOTENCY_CONFLICT"),
+        &json!({ "fields": ["lines"] })
+    );
+    for qty in [json!(5.5), json!(5)] {
+        let reply = node.receive(&STAFF, &request(qty.clone(), "1000")).await;
+        assert_eq!(
+            assert_error(&reply, 400, "VALIDATION_FAILED"),
+            &json!({}),
+            "{qty}"
+        );
+    }
+
+    assert_eq!(node.state(), before);
+}
+
+// 验收用例「录入上限」与 domain「数量」录入上限：只检查录入时所选单位下的数字，不看换算后的值。
+// 9999.999 kg 照常受理，qty "9999999"（批次余量存 9999999000）；10000 g、10000 kg 都是 400 VALIDATION_FAILED，不入账。
+#[tokio::test]
+async fn the_entry_limit_applies_to_the_selected_unit() {
+    let node = node();
+    let flour = node.item(&cmd(1), "FLOUR", &[("kg", "1000")]).await;
+    let supplier = node.supplier(&cmd(2), "S1").await;
+
+    let receipt = node
+        .receive_ok(
+            &STAFF,
+            &body(
+                &cmd(3),
+                &supplier,
+                vec![line(&flour, "9999.999", "kg", "1000")],
+                0,
+            ),
+        )
+        .await;
+    assert_eq!(receipt["lines"][0]["qty"], json!("9999999"));
+    assert_eq!(node.lots().unwrap()[0].7, 9_999_999_000);
+    let before = node.state();
+
+    for l in [
+        line(&flour, "10000", "g", "1"),
+        line(&flour, "10000", "kg", "1000"),
+    ] {
+        let reply = node
+            .receive(&STAFF, &body(&cmd(4), &supplier, vec![l.clone()], 0))
+            .await;
+        assert_eq!(
+            assert_error(&reply, 400, "VALIDATION_FAILED"),
+            &json!({}),
+            "{l}"
+        );
+    }
+
+    assert_eq!(node.state(), before);
+}
+
+// 验收用例「收货累计越界」与 domain「数量」库存状态上限、「收货接口」业务校验：L = 1000000000 g（存储值 10^12）。
+// 每行处理之后（看到同一命令中前面各行新建的批次），该行物料的净账面、新批次余量都不超过 L；超出时整条命令不入账，
+// 409 STOCK_LIMIT_EXCEEDED，details 为 {line, item_id}（收货只新建批次，不带 lot_id），line 是第一个越界的行。
+// - 面粉先收 999.99 t = 999990000 g；一次收货两行各 5 kg：第二行之后账面恰好 1000000000，照常受理。
+// - 再收 0.001 g：{line 0, item_id 面粉}。[糖 1 g, 面粉 0.001 g]：{line 1}，糖也不入账。
+// - 多行越界时报第一个：[1.001 max, 糖 1 g, 1.001 max]：{line 0, item_id big}。
+// - 单行本身超过 L：1.001 个 max（系数 10^9）= 1001000000 g；9999.999 个 max、9999.999 个 odd（系数 999999999.999999999）
+//   的换算结果约 10^13 g，也是 409，不溢出、不当作取值错误。
+// - 被拒绝的命令不落库，同一 command_id 改为恰好 L（1 个 max）后照常受理。
+// - 幂等检查先于库存状态上限：面粉到达 L 之后，原内容重试两行 5 kg 的收货仍返回首次响应。
+#[tokio::test]
+async fn the_stock_limit_is_checked_after_each_line() {
+    let node = node();
+    let flour = node
+        .item(&cmd(1), "FLOUR", &[("kg", "1000"), ("t", "1000000")])
+        .await;
+    let sugar = node.item(&cmd(2), "SUGAR", &[]).await;
+    let big = node
+        .item(
+            &cmd(3),
+            "BIG",
+            &[("max", "1000000000"), ("odd", "999999999.999999999")],
+        )
+        .await;
+    let supplier = node.supplier(&cmd(4), "S1").await;
+    node.receive_ok(
+        &STAFF,
+        &body(
+            &cmd(5),
+            &supplier,
+            vec![line(&flour, "999.99", "t", "1000000")],
+            0,
+        ),
+    )
+    .await;
+    let at_limit = body(
+        &cmd(6),
+        &supplier,
+        vec![
+            line(&flour, "5", "kg", "1000"),
+            line(&flour, "5", "kg", "1000"),
+        ],
+        0,
+    );
+    let first = node.receive(&STAFF, &at_limit).await;
+    receipt(&first);
+    assert_eq!(node.on_hand(&flour).unwrap(), 1_000_000_000_000);
+    let before = node.state();
+
+    let limit = |line: usize, item_id: &str| json!({ "line": line, "item_id": item_id });
+    for (lines, details) in [
+        (vec![line(&flour, "0.001", "g", "1")], limit(0, &flour)),
+        (
+            vec![line(&sugar, "1", "g", "1"), line(&flour, "0.001", "g", "1")],
+            limit(1, &flour),
+        ),
+        (
+            vec![line(&big, "1.001", "max", "1000000000")],
+            limit(0, &big),
+        ),
+        (
+            vec![line(&big, "9999.999", "max", "1000000000")],
+            limit(0, &big),
+        ),
+        (
+            vec![line(&big, "9999.999", "odd", "999999999.999999999")],
+            limit(0, &big),
+        ),
+        (
+            vec![
+                line(&big, "0.5", "max", "1000000000"),
+                line(&big, "0.501", "max", "1000000000"),
+            ],
+            limit(1, &big),
+        ),
+        (
+            vec![
+                line(&big, "1.001", "max", "1000000000"),
+                line(&sugar, "1", "g", "1"),
+                line(&big, "1.001", "max", "1000000000"),
+            ],
+            limit(0, &big),
+        ),
+    ] {
+        let reply = node
+            .receive(&STAFF, &body(&cmd(7), &supplier, lines.clone(), 0))
+            .await;
+        assert_eq!(
+            assert_error(&reply, 409, "STOCK_LIMIT_EXCEEDED"),
+            &details,
+            "{lines:?}"
+        );
+        assert_eq!(node.state(), before);
+    }
+
+    node.clock.advance(Duration::from_secs(60));
+    let reply = node.receive(&STAFF, &at_limit).await;
+    assert_eq!((reply.status.as_u16(), &reply.body), (200, &first.body));
+    assert_eq!(node.state(), before);
+
+    let receipt = node
+        .receive_ok(
+            &STAFF,
+            &body(
+                &cmd(7),
+                &supplier,
+                vec![
+                    line(&big, "0.5", "max", "1000000000"),
+                    line(&big, "0.5", "max", "1000000000"),
+                ],
+                0,
+            ),
+        )
+        .await;
+    assert_eq!(receipt["lines"][1]["qty"], json!("500000000"));
+    assert_eq!(node.on_hand(&big).unwrap(), 1_000_000_000_000);
 }

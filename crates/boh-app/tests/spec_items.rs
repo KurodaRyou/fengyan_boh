@@ -1,5 +1,6 @@
 //! 锁定测试：物料特有的字段规则（编码字符集、基本单位、分类、默认保质期、单位换算）与 items / item_units 投影。
-//! 规则见 docs/domain.md「主数据」「主数据接口」物料、「单位」；共用的接口行为见 spec_master_data.rs。
+//! 规则见 docs/domain.md「主数据」「主数据接口」物料、「数量」「单位」；共用的接口行为见 spec_master_data.rs。
+//! 换算系数在请求、响应和快照中是小数字符串，item_units 中存十亿分之一基本单位的整数。
 
 mod spec_support;
 
@@ -57,8 +58,8 @@ fn flour(command_id: &str) -> Value {
         "command_id": command_id, "code": "FLOUR", "name": "高筋面粉", "base_unit": "g",
         "category": "RAW", "default_shelf_life_ms": HALF_YEAR,
         "units": [
-            { "unit_code": "bag", "base_qty_per_unit": 25000 },
-            { "unit_code": "cup", "base_qty_per_unit": 120 },
+            { "unit_code": "bag", "base_qty_per_unit": "25000" },
+            { "unit_code": "cup", "base_qty_per_unit": "120" },
         ],
         "active": true,
     })
@@ -111,7 +112,7 @@ impl Node {
         Ok(rows)
     }
 
-    /// `item_units` 的全部行：(item_id, unit_code, base_qty_per_unit)，按物料和单位排序。
+    /// `item_units` 的全部行：(item_id, unit_code, base_qty_per_unit)，按物料和单位排序；系数是十亿分之一基本单位。
     fn units(&self) -> Rows<Vec<(String, String, i64)>> {
         let reader = spec_support::reader(&self.db_path)?;
         let mut statement = reader.prepare(
@@ -146,7 +147,8 @@ impl Node {
     }
 }
 
-// 主数据接口「物料」：快照、行、items 与 item_units 投影一致；units 按 unit_code 拆成 item_units 的行，不含基本单位。
+// 主数据接口「物料」：快照、行、items 与 item_units 投影一致；units 按 unit_code 拆成 item_units 的行，不含基本单位；
+// 系数在行中是小数字符串，在 item_units 中是十亿分之一基本单位（25000 g 存为 25000000000000）。
 #[tokio::test]
 async fn create_projects_units_and_shelf_life() {
     let node = node();
@@ -161,8 +163,8 @@ async fn create_projects_units_and_shelf_life() {
             "item_id": id, "code": "FLOUR", "name": "高筋面粉", "base_unit": "g", "category": "RAW",
             "default_shelf_life_ms": HALF_YEAR,
             "units": [
-                { "unit_code": "bag", "base_qty_per_unit": 25000 },
-                { "unit_code": "cup", "base_qty_per_unit": 120 },
+                { "unit_code": "bag", "base_qty_per_unit": "25000" },
+                { "unit_code": "cup", "base_qty_per_unit": "120" },
             ],
             "active": true, "revision": 1,
         } })
@@ -182,7 +184,10 @@ async fn create_projects_units_and_shelf_life() {
     );
     assert_eq!(
         node.units().unwrap(),
-        [(id.clone(), "bag".into(), 25000), (id, "cup".into(), 120)]
+        [
+            (id.clone(), "bag".into(), 25_000_000_000_000),
+            (id, "cup".into(), 120_000_000_000)
+        ]
     );
 }
 
@@ -199,8 +204,8 @@ async fn update_replaces_units_and_clears_shelf_life() {
             &json!({
                 "command_id": cmd(2), "base_revision": 1, "name": "高筋面粉", "category": "SEMI",
                 "units": [
-                    { "unit_code": "bag", "base_qty_per_unit": 20000 },
-                    { "unit_code": "box", "base_qty_per_unit": 1000 },
+                    { "unit_code": "bag", "base_qty_per_unit": "20000" },
+                    { "unit_code": "box", "base_qty_per_unit": "1000" },
                 ],
                 "active": true,
             }),
@@ -210,8 +215,8 @@ async fn update_replaces_units_and_clears_shelf_life() {
     let snapshot = json!({
         "code": "FLOUR", "name": "高筋面粉", "base_unit": "g", "category": "SEMI",
         "units": [
-            { "unit_code": "bag", "base_qty_per_unit": 20000 },
-            { "unit_code": "box", "base_qty_per_unit": 1000 },
+            { "unit_code": "bag", "base_qty_per_unit": "20000" },
+            { "unit_code": "box", "base_qty_per_unit": "1000" },
         ],
         "active": true,
     });
@@ -227,8 +232,8 @@ async fn update_replaces_units_and_clears_shelf_life() {
     assert_eq!(
         node.units().unwrap(),
         [
-            (id.clone(), "bag".into(), 20000),
-            (id.clone(), "box".into(), 1000)
+            (id.clone(), "bag".into(), 20_000_000_000_000),
+            (id.clone(), "box".into(), 1_000_000_000_000)
         ]
     );
 
@@ -263,9 +268,9 @@ async fn units_may_be_empty_and_are_ordered_by_bytes() {
             "command_id": cmd(2), "code": "CREAM", "name": "淡奶油", "base_unit": "ml",
             "category": "SEMI",
             "units": [
-                { "unit_code": "Box", "base_qty_per_unit": 12000 },
-                { "unit_code": "box", "base_qty_per_unit": 1000 },
-                { "unit_code": "大 盒", "base_qty_per_unit": 2000 },
+                { "unit_code": "Box", "base_qty_per_unit": "12000" },
+                { "unit_code": "box", "base_qty_per_unit": "1000" },
+                { "unit_code": "大 盒", "base_qty_per_unit": "2000" },
             ],
             "active": true,
         }))
@@ -337,7 +342,8 @@ async fn item_code_uses_only_uppercase_letters_digits_and_underscores() {
 
 // 主数据接口「物料」取值：base_unit、category 不在枚举内（区分大小写）；default_shelf_life_ms 不是正整数或为 null；
 // units 缺失、为 null、不是数组；单位项缺字段、多字段、unit_code 为空或首尾有空白、等于 base_unit、重复或未按字节序升序；
-// base_qty_per_unit 不是正整数。新建与修改一律 400 VALIDATION_FAILED，不落库。修改不接受 base_unit、code。
+// base_qty_per_unit 不符合换算系数规则（domain「单位」：小数字符串，大于 0，不超过 10^9，最多 9 位小数；写法见「数量」）。
+// 新建与修改一律 400 VALIDATION_FAILED，不落库。修改不接受 base_unit、code。
 #[tokio::test]
 async fn invalid_item_fields_are_rejected() {
     let node = node();
@@ -365,33 +371,31 @@ async fn invalid_item_fields_are_rejected() {
         ("units", json!({})),
         ("units", json!("bag")),
         ("units", json!([{ "unit_code": "bag" }])),
-        ("units", json!([{ "base_qty_per_unit": 25000 }])),
+        ("units", json!([{ "base_qty_per_unit": "25000" }])),
         (
             "units",
-            json!([{ "unit_code": "bag", "base_qty_per_unit": 25000, "note": "x" }]),
+            json!([{ "unit_code": "bag", "base_qty_per_unit": "25000", "note": "x" }]),
         ),
-        ("units", json!([unit("", json!(1000))])),
-        ("units", json!([unit(" bag", json!(1000))])),
-        ("units", json!([unit("bag ", json!(1000))])),
-        ("units", json!([unit("g", json!(1000))])), // 等于 base_unit
-        ("units", json!([unit("bag", json!(0))])),
-        ("units", json!([unit("bag", json!(-1))])),
-        ("units", json!([unit("bag", json!(1.5))])),
-        ("units", json!([unit("bag", json!("1000"))])),
-        ("units", json!([unit("bag", Value::Null)])),
+        ("units", json!([unit("", json!("1000"))])),
+        ("units", json!([unit(" bag", json!("1000"))])),
+        ("units", json!([unit("bag ", json!("1000"))])),
+        ("units", json!([unit("g", json!("1000"))])), // 等于 base_unit
         (
             "units",
-            json!([unit("bag", json!(1000)), unit("bag", json!(2000))]),
+            json!([unit("bag", json!("1000")), unit("bag", json!("2000"))]),
         ),
         (
             "units",
-            json!([unit("box", json!(1000)), unit("bag", json!(2000))]),
+            json!([unit("box", json!("1000")), unit("bag", json!("2000"))]),
         ),
         (
             "units",
-            json!([unit("box", json!(1000)), unit("Box", json!(2000))]),
+            json!([unit("box", json!("1000")), unit("Box", json!("2000"))]),
         ),
     ];
+    for (_, factor) in spec_support::invalid_factor_texts() {
+        field_cases.push(("units", json!([unit("bag", factor)])));
+    }
     let mut creates: Vec<Value> = Vec::new();
     let mut updates: Vec<Value> = Vec::new();
     for (key, value) in field_cases.drain(..) {
@@ -447,7 +451,7 @@ async fn unit_codes_are_scoped_per_item() {
     let sugar_id = node
         .create_ok(&json!({
             "command_id": cmd(2), "code": "SUGAR", "name": "白砂糖", "base_unit": "g",
-            "category": "RAW", "units": [{ "unit_code": "bag", "base_qty_per_unit": 1000 }],
+            "category": "RAW", "units": [{ "unit_code": "bag", "base_qty_per_unit": "1000" }],
             "active": true,
         }))
         .await;
@@ -459,7 +463,73 @@ async fn unit_codes_are_scoped_per_item() {
         .filter(|u| u.1 == "bag")
         .map(|u| (u.0, u.2))
         .collect();
-    let mut expected = vec![(flour_id, 25000), (sugar_id, 1000)];
+    let mut expected = vec![
+        (flour_id, 25_000_000_000_000),
+        (sugar_id, 1_000_000_000_000),
+    ];
     expected.sort();
     assert_eq!(bags, expected);
+}
+
+// domain「单位」换算系数：小数字符串，大于 0、不超过 10^9、最多 9 位小数；两端可取。行、快照中只有规范形式
+// （去掉末尾的 0，整数不带小数点），item_units 存十亿分之一基本单位。
+// - "28.349523125"（oz）存 28349523125；"0.000000001" 存 1；"1000000000" 存 10^18；"1000.000000000" 写成 "1000"。
+// - 修改时系数只是写法不同（"1000.0"、"1000000.000000000" 与当前的 "1000"、"1000000"）：快照相同，不写事件，
+//   revision 不变，命令照常成功。末尾的 0 也算小数位数，超过 9 位的写法（"28.3495231250"）是取值错误，见上一个用例。
+#[tokio::test]
+async fn decimal_factors_are_canonical_and_stored_in_billionths() {
+    let node = node();
+    let units = json!([
+        { "unit_code": "kg", "base_qty_per_unit": "1000.000000000" },
+        { "unit_code": "max", "base_qty_per_unit": "1000000000" },
+        { "unit_code": "min", "base_qty_per_unit": "0.000000001" },
+        { "unit_code": "oz", "base_qty_per_unit": "28.349523125" },
+        { "unit_code": "t", "base_qty_per_unit": "1000000.0" },
+    ]);
+    let canonical = json!([
+        { "unit_code": "kg", "base_qty_per_unit": "1000" },
+        { "unit_code": "max", "base_qty_per_unit": "1000000000" },
+        { "unit_code": "min", "base_qty_per_unit": "0.000000001" },
+        { "unit_code": "oz", "base_qty_per_unit": "28.349523125" },
+        { "unit_code": "t", "base_qty_per_unit": "1000000" },
+    ]);
+
+    let reply = node
+        .create(&json!({
+            "command_id": cmd(1), "code": "FLOUR", "name": "面粉", "base_unit": "g",
+            "category": "RAW", "units": units, "active": true,
+        }))
+        .await;
+
+    let item = &assert_success(&reply)["item"];
+    let id = item["item_id"].as_str().unwrap().to_owned();
+    assert_eq!(item["units"], canonical);
+    assert_eq!(node.payloads().unwrap()[0]["snapshot"]["units"], canonical);
+    assert_eq!(
+        node.units().unwrap(),
+        [
+            (id.clone(), "kg".into(), 1_000_000_000_000),
+            (id.clone(), "max".into(), 1_000_000_000_000_000_000),
+            (id.clone(), "min".into(), 1),
+            (id.clone(), "oz".into(), 28_349_523_125),
+            (id.clone(), "t".into(), 1_000_000_000_000_000),
+        ]
+    );
+
+    let mut same = canonical.clone();
+    same[0]["base_qty_per_unit"] = json!("1000.0");
+    same[4]["base_qty_per_unit"] = json!("1000000.000000000");
+    let reply = node
+        .update(
+            &id,
+            &json!({
+                "command_id": cmd(2), "base_revision": 1, "name": "面粉", "category": "RAW",
+                "units": same, "active": true,
+            }),
+        )
+        .await;
+    let item = &assert_success(&reply)["item"];
+    assert_eq!(item["units"], canonical);
+    assert_eq!(item["revision"], json!(1));
+    assert_eq!(node.counts(), (1, 2));
 }

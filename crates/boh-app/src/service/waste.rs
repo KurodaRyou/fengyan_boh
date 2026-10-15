@@ -3,6 +3,7 @@
 use axum::http::StatusCode;
 use boh_domain::inventory::Allocation;
 use boh_domain::lot::LotId;
+use boh_domain::quantity::Quantity;
 use boh_domain::time::{CaptureTimes, business_date, calibrate};
 use boh_domain::waste::{
     LogWaste, PrecheckWaste, WasteEffect, WasteLine, WasteLogged, WasteRecord, WasteRequestLine,
@@ -150,10 +151,10 @@ struct LineBook {
     item_id: AggregateId,
     #[serde(skip_serializing_if = "Option::is_none")]
     lot_id: Option<LotId>,
-    qty: i64,
-    item_book_qty: i64,
+    qty: Quantity,
+    item_book_qty: Quantity,
     #[serde(skip_serializing_if = "Option::is_none")]
-    lot_book_qty: Option<i64>,
+    lot_book_qty: Option<Quantity>,
 }
 
 struct CalculatedLine {
@@ -211,7 +212,7 @@ fn calculate(
         };
         let needs_confirmation =
             qty > balance.book() || lot_book_qty.is_some_and(|book| qty > book);
-        let alloc = super::inventory::allocate(balance, lot_index, qty)?;
+        let alloc = super::inventory::allocate(balance, lot_index, qty, index, line.item_id)?;
         let logged = WasteLine {
             item_id: line.item_id,
             lot_id: line.lot_id.clone(),
@@ -237,7 +238,7 @@ fn validate_references(
     index: usize,
     line: &WasteRequestLine,
 ) -> Result<(), ApiError> {
-    super::item_units::validate_item(conn, index, line.item_id, &line.input)?;
+    super::item_units::validate_item(conn, Some(index), line.item_id, &line.input)?;
     let reason_exists: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM waste_reasons WHERE code = ?1)",

@@ -114,12 +114,12 @@ async fn http_shared_structs_require_objects_before_idempotency() {
     let node = node(true).await;
     let item = item_body(1);
     let mut bad_item = item.clone();
-    bad_item["units"][0] = json!(["bag", 25000]);
+    bad_item["units"][0] = json!(["bag", "25000"]);
     let created = reject_then_accept(&node, Method::POST, "/api/v1/items", item, &[bad_item]).await;
     let item_id = created["data"]["item"]["item_id"].as_str().unwrap();
     let recipe = recipe_body(item_id);
     let mut bad_recipe = recipe.clone();
-    bad_recipe["lines"][0] = json!([item_id, 4]);
+    bad_recipe["lines"][0] = json!([item_id, recipe["lines"][0]["input"]]);
     let created = reject_then_accept(
         &node,
         Method::POST,
@@ -131,10 +131,10 @@ async fn http_shared_structs_require_objects_before_idempotency() {
     let recipe_id = created["data"]["recipe"]["recipe_id"].as_str().unwrap();
     let version = json!({
         "command_id": master_command_id(3), "base_revision": 1,
-        "output_qty_per_batch": 3, "lines": [{"item_id": item_id, "qty_per_batch": 6}]
+        "output_input": {"qty": "3", "unit_code": "g", "base_qty_per_unit": "1"}, "lines": [{"item_id": item_id, "input": {"qty": "6", "unit_code": "g", "base_qty_per_unit": "1"}}]
     });
     let mut bad_version = version.clone();
-    bad_version["lines"][0] = json!([item_id, 6]);
+    bad_version["lines"][0] = json!([item_id, version["lines"][0]["input"]]);
     reject_then_accept(
         &node,
         Method::POST,
@@ -157,12 +157,12 @@ async fn http_shared_structs_require_objects_before_idempotency() {
         "command_id": master_command_id(5), "supplier_id": supplier_id,
         "captured_at": 1_791_248_400_000_i64, "sent_at": 1_791_248_400_000_i64,
         "lines": [{
-            "item_id": item_id, "input": {"qty": 5, "unit_code": "g", "base_qty_per_unit": 1},
+            "item_id": item_id, "input": {"qty": "5", "unit_code": "g", "base_qty_per_unit": "1"},
             "produced_on": "2026-10-01", "expires_on": "2026-10-20", "line_cost_cents": 1000
         }]
     });
     let mut bad_receipt = receipt.clone();
-    bad_receipt["lines"][0]["input"] = json!([5, "g", 1]);
+    bad_receipt["lines"][0]["input"] = json!(["5", "g", "1"]);
     reject_then_accept(
         &node,
         Method::POST,

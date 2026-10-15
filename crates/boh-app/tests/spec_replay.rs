@@ -384,7 +384,8 @@ async fn write(router: &axum::Router, method: &str, uri: &str, body: Value) -> V
     assert_success(&reply).clone()
 }
 
-// 物料、配方、供应商、报损原因混合的账本（含修改、追加版本、删除单位与联系电话、内容不变的修改）：
+// 物料、配方、供应商、报损原因混合的账本（含修改、追加版本、删除单位与联系电话、内容不变的修改；小数换算系数 28.349523125、
+// 20000.5，配方用料以 oz、bag 录入，快照带 input）：
 // 在线写入后篡改主数据投影并在库存投影中插入多余的行，重建后全部投影与在线写入逐行一致——库存投影在本切片没有事件写入，重建后为空；
 // 账本、processed_commands 和 store_meta 不变；重建可重复执行；重建后的投影能继续支撑新的写命令。
 #[tokio::test]
@@ -401,8 +402,8 @@ async fn rebuild_restores_master_data_projections() {
             "command_id": cmd(1), "code": "FLOUR", "name": "高筋面粉", "base_unit": "g",
             "category": "RAW", "default_shelf_life_ms": 15_552_000_000_i64,
             "units": [
-                { "unit_code": "bag", "base_qty_per_unit": 25000 },
-                { "unit_code": "cup", "base_qty_per_unit": 120 },
+                { "unit_code": "bag", "base_qty_per_unit": "25000" },
+                { "unit_code": "oz", "base_qty_per_unit": "28.349523125" },
             ],
             "active": true,
         }),
@@ -430,8 +431,12 @@ async fn rebuild_restores_master_data_projections() {
         "/api/v1/recipes",
         json!({
             "command_id": cmd(3), "code": "R-TOAST", "name": "吐司", "output_item_id": toast,
-            "active": true, "output_qty_per_batch": 12,
-            "lines": [{ "item_id": flour, "qty_per_batch": 3000 }],
+            "active": true,
+            "output_input": { "qty": "12", "unit_code": "pcs", "base_qty_per_unit": "1" },
+            "lines": [{
+                "item_id": flour,
+                "input": { "qty": "1.25", "unit_code": "oz", "base_qty_per_unit": "28.349523125" },
+            }],
         }),
     )
     .await["recipe"]["recipe_id"]
@@ -444,7 +449,7 @@ async fn rebuild_restores_master_data_projections() {
         &format!("/api/v1/items/{flour}"),
         json!({
             "command_id": cmd(4), "base_revision": 1, "name": "高筋面粉", "category": "RAW",
-            "units": [{ "unit_code": "bag", "base_qty_per_unit": 20000 }], "active": false,
+            "units": [{ "unit_code": "bag", "base_qty_per_unit": "20000.5" }], "active": false,
         }),
     )
     .await;
@@ -453,10 +458,11 @@ async fn rebuild_restores_master_data_projections() {
         "POST",
         &format!("/api/v1/recipes/{recipe}/versions"),
         json!({
-            "command_id": cmd(5), "base_revision": 1, "output_qty_per_batch": 10,
+            "command_id": cmd(5), "base_revision": 1,
+            "output_input": { "qty": "10", "unit_code": "pcs", "base_qty_per_unit": "1" },
             "lines": [
-                { "item_id": toast, "qty_per_batch": 1 },
-                { "item_id": flour, "qty_per_batch": 2800 },
+                { "item_id": toast, "input": { "qty": "1", "unit_code": "pcs", "base_qty_per_unit": "1" } },
+                { "item_id": flour, "input": { "qty": "0.5", "unit_code": "bag", "base_qty_per_unit": "20000.5" } },
             ],
         }),
     )
@@ -530,14 +536,17 @@ async fn rebuild_restores_master_data_projections() {
     writer
         .execute_batch(&format!(
             "DELETE FROM item_units;
-             INSERT INTO item_units (item_id, unit_code, base_qty_per_unit) VALUES ('{toast}', 'box', 6);
+             INSERT INTO item_units (item_id, unit_code, base_qty_per_unit) VALUES ('{toast}', 'box', 6000000000);
              UPDATE items SET name = 'tampered', default_shelf_life_ms = 1 WHERE id = '{flour}';
-             UPDATE recipe_lines SET qty_per_batch = 1 WHERE version = 2;
+             UPDATE recipe_lines SET qty_per_batch = 1, input_qty = 1, input_base_qty_per_unit = 1 WHERE version = 2;
              DELETE FROM recipe_lines WHERE version = 1;
-             INSERT INTO recipe_versions (recipe_id, version, output_qty_per_batch) VALUES ('{recipe}', 9, 1);
+             UPDATE recipe_versions SET output_input_unit_code = 'box' WHERE version = 1;
+             INSERT INTO recipe_versions (recipe_id, version, output_qty_per_batch, output_input_qty,
+                                          output_input_unit_code, output_input_base_qty_per_unit)
+                 VALUES ('{recipe}', 9, 1, 1, 'pcs', 1000000000);
              UPDATE suppliers SET contact_phone = '000';
              DELETE FROM waste_reasons;
-             INSERT INTO inventory_unallocated (item_id, qty) VALUES ('{flour}', -5);"
+             INSERT INTO inventory_unallocated (item_id, qty) VALUES ('{flour}', -5000);"
         ))
         .unwrap();
     assert_ne!(projections(&db_path).unwrap(), online);
@@ -646,8 +655,14 @@ async fn hq_package_master_data_rebuilds_like_local_changes() {
     );
 }
 
-/// 收货请求的一行：`qty` 个 `unit_code`（每个 `factor` 个基本单位），到期日 `expires_on`。
-fn receipt_line(item_id: &str, qty: i64, unit_code: &str, factor: i64, expires_on: &str) -> Value {
+/// 收货请求的一行：`qty` 个 `unit_code`（每个 `factor` 个基本单位，都是小数字符串），到期日 `expires_on`。
+fn receipt_line(
+    item_id: &str,
+    qty: &str,
+    unit_code: &str,
+    factor: &str,
+    expires_on: &str,
+) -> Value {
     json!({
         "item_id": item_id,
         "input": { "qty": qty, "unit_code": unit_code, "base_qty_per_unit": factor },
@@ -676,7 +691,8 @@ async fn receive(
     reply
 }
 
-// 收货的账本（同一物料两行、带生产商批号、单位换算、负 lag 的警告、前一营业日）：在线写入后篡改库存投影
+// 收货的账本（同一物料两行、带生产商批号、单位换算（0.125 bag = 3125 g）、小数数量（5.25 g）、负 lag 的警告、前一营业日）：
+// 在线写入后篡改库存投影
 // （删批次及其流水、改余量与来源行序、改流水数量），重建后全部投影与在线写入逐行一致，账本、processed_commands 和 store_meta 不变；
 // 重建可重复执行。验收用例「批次号重建」：同次收货的 A、B 重建后仍为 RAW-FLOUR-20261006-001、…-002，source_line_no 仍为 0、1；
 // occurred_at 为 10-06 03:00 的黄油批次属于前一营业日，批次日期仍是当地日历日期 10-06（RAW-BUTTER-20261006-002）。
@@ -698,7 +714,7 @@ async fn rebuild_restores_receipt_projections() {
             "/api/v1/items",
             json!({
                 "command_id": cmd(1), "code": "FLOUR", "name": "面粉", "base_unit": "g",
-                "category": "RAW", "units": [{ "unit_code": "bag", "base_qty_per_unit": 25000 }],
+                "category": "RAW", "units": [{ "unit_code": "bag", "base_qty_per_unit": "25000" }],
                 "active": true,
             }),
         )
@@ -736,8 +752,8 @@ async fn rebuild_restores_receipt_projections() {
         &cmd(4),
         &supplier,
         vec![
-            receipt_line(&flour, 5, "g", 1, "2026-10-20"),
-            receipt_line(&flour, 10, "g", 1, "2026-10-25"),
+            receipt_line(&flour, "5.25", "g", "1", "2026-10-20"),
+            receipt_line(&flour, "10", "g", "1", "2026-10-25"),
         ],
         0,
         SENT,
@@ -751,11 +767,11 @@ async fn rebuild_restores_receipt_projections() {
         .as_str()
         .unwrap()
         .to_owned();
-    let mut with_lot_no = receipt_line(&butter, 2, "g", 1, "2026-10-15");
+    let mut with_lot_no = receipt_line(&butter, "2", "g", "1", "2026-10-15");
     with_lot_no["manufacturer_lot_no"] = json!("L-1");
     let lines = vec![
         with_lot_no,
-        receipt_line(&flour, 1, "bag", 25000, "2026-10-22"),
+        receipt_line(&flour, "0.125", "bag", "25000", "2026-10-22"),
     ];
     let second = receive(&router, &cmd(5), &supplier, lines.clone(), -60_000, SENT).await;
     assert_eq!(
@@ -783,7 +799,7 @@ async fn rebuild_restores_receipt_projections() {
         &router,
         &cmd(6),
         &supplier,
-        vec![receipt_line(&butter, 3, "g", 1, "2026-10-20")],
+        vec![receipt_line(&butter, "3", "g", "1", "2026-10-20")],
         6 * 3_600_000,
         SENT,
     )
@@ -868,8 +884,8 @@ async fn rebuild_restores_receipt_projections() {
         &cmd(7),
         &supplier,
         vec![
-            receipt_line(&flour, 1, "g", 1, "2026-10-18"),
-            receipt_line(&butter, 1, "g", 1, "2026-10-25"),
+            receipt_line(&flour, "1", "g", "1", "2026-10-18"),
+            receipt_line(&butter, "1", "g", "1", "2026-10-25"),
         ],
         0,
         SENT,
@@ -904,7 +920,7 @@ async fn rebuild_refuses_goods_received_v1() {
         "/api/v1/items",
         json!({
             "command_id": cmd(1), "code": "FLOUR", "name": "面粉", "base_unit": "g",
-            "category": "RAW", "units": [{ "unit_code": "袋", "base_qty_per_unit": 25000 }],
+            "category": "RAW", "units": [{ "unit_code": "袋", "base_qty_per_unit": "25000" }],
             "active": true,
         }),
     )
@@ -926,7 +942,7 @@ async fn rebuild_refuses_goods_received_v1() {
         &router,
         &cmd(3),
         &supplier,
-        vec![receipt_line(&flour, 5, "g", 1, "2026-10-20")],
+        vec![receipt_line(&flour, "5", "g", "1", "2026-10-20")],
         0,
         SENT,
     )
@@ -965,11 +981,11 @@ async fn rebuild_refuses_goods_received_v1() {
     assert_eq!(ledger(&db_path).unwrap(), ledger_before);
 }
 
-/// 报损请求的一行：`qty` 克，原因 EXPIRED，不指定批次；`lot_id`、`confirm` 由调用方给出。
-fn waste_line(item_id: &str, qty: i64, lot_id: Option<&str>, confirm: bool) -> Value {
+/// 报损请求的一行：`qty` 克（小数字符串），原因 EXPIRED，不指定批次；`lot_id`、`confirm` 由调用方给出。
+fn waste_line(item_id: &str, qty: &str, lot_id: Option<&str>, confirm: bool) -> Value {
     let mut line = json!({
         "item_id": item_id,
-        "input": { "qty": qty, "unit_code": "g", "base_qty_per_unit": 1 },
+        "input": { "qty": qty, "unit_code": "g", "base_qty_per_unit": "1" },
         "reason_code": "EXPIRED",
     });
     if let Some(lot_id) = lot_id {
@@ -999,7 +1015,7 @@ async fn waste(
     reply
 }
 
-/// 物料（RAW，基本单位 g）与报损原因 EXPIRED；返回物料 ID。
+/// 物料（RAW，基本单位 g，单位 kg = 1000 g）与报损原因 EXPIRED；返回物料 ID。
 #[allow(clippy::unwrap_used)] // 测试夹具：写入前置状态的请求失败时，后续步骤没有意义，直接终止测试。
 async fn item_and_reason(
     router: &axum::Router,
@@ -1013,7 +1029,8 @@ async fn item_and_reason(
         "/api/v1/items",
         json!({
             "command_id": cmd(item_cmd), "code": code, "name": code, "base_unit": "g",
-            "category": "RAW", "units": [], "active": true,
+            "category": "RAW", "units": [{ "unit_code": "kg", "base_qty_per_unit": "1000" }],
+            "active": true,
         }),
     )
     .await["item"]["item_id"]
@@ -1055,11 +1072,12 @@ fn lot_balances(db_path: &Path) -> Result<Vec<(String, i64)>, Box<dyn Error>> {
     Ok(rows)
 }
 
-// 报损的账本（不指定批次的 FIFO、指定批次使批次变负、账外缺口新建与累加、两个物料、一个命令多行）：在线写入后篡改库存投影
+// 报损的账本（不指定批次的 FIFO、指定批次使批次变负、账外缺口新建与累加、两个物料、一个命令多行、小数数量）：在线写入后篡改库存投影
 // （删账外缺口、改批次余量、删流水），重建后全部投影与在线写入逐行一致，账本、processed_commands 和 store_meta 不变；
 // 重建可重复执行。
 // 重建不影响幂等回执：之后用原 command_id、原内容（含确认标记，sent_at 不同）重发，原样返回首次响应，不新增事件。
-// 重建后的投影能继续支撑新的写命令：面粉 A −2、B 10，净账面 8，报 8 g 不需要确认，FIFO 跳过 A，分配 B 8。
+// 重建后的投影能继续支撑新的写命令：面粉 A −1.75、B 10，净账面 8.25，报 8 g 不需要确认，FIFO 跳过 A，分配 B 8。
+// 批次余量是千分之一克（A −1750）。
 #[tokio::test]
 async fn rebuild_restores_waste_projections() {
     let dir = tempfile::tempdir().unwrap();
@@ -1086,9 +1104,9 @@ async fn rebuild_restores_waste_projections() {
         &cmd(5),
         &supplier,
         vec![
-            receipt_line(&flour, 5, "g", 1, "2026-10-20"),
-            receipt_line(&flour, 10, "g", 1, "2026-10-20"),
-            receipt_line(&sugar, 4, "g", 1, "2026-10-20"),
+            receipt_line(&flour, "5", "g", "1", "2026-10-20"),
+            receipt_line(&flour, "10", "g", "1", "2026-10-20"),
+            receipt_line(&sugar, "4", "g", "1", "2026-10-20"),
         ],
         0,
         SENT,
@@ -1104,25 +1122,25 @@ async fn rebuild_restores_waste_projections() {
     waste(
         &router,
         &cmd(6),
-        vec![waste_line(&flour, 3, None, false)],
+        vec![waste_line(&flour, "2.75", None, false)],
         SENT,
     )
     .await;
     let lines = vec![
-        waste_line(&flour, 4, Some(&a), true),
-        waste_line(&sugar, 6, None, true),
+        waste_line(&flour, "4", Some(&a), true),
+        waste_line(&sugar, "6", None, true),
     ];
     let second = waste(&router, &cmd(7), lines.clone(), SENT).await;
     waste(
         &router,
         &cmd(8),
-        vec![waste_line(&sugar, 1, None, true)],
+        vec![waste_line(&sugar, "1", None, true)],
         SENT,
     )
     .await;
     assert_eq!(
         lot_balances(&db_path).unwrap(),
-        [(a.clone(), -2), (b.clone(), 10), (s.clone(), 0)]
+        [(a.clone(), -1_750), (b.clone(), 10_000), (s.clone(), 0)]
     );
 
     let online = projections(&db_path).unwrap();
@@ -1158,15 +1176,15 @@ async fn rebuild_restores_waste_projections() {
     let reply = waste(
         &router,
         &cmd(9),
-        vec![waste_line(&flour, 8, None, false)],
+        vec![waste_line(&flour, "8", None, false)],
         SENT,
     )
     .await;
     let line = &reply.body["data"]["waste_record"]["lines"][0];
-    assert_eq!(line["item_book_qty"], json!(8));
+    assert_eq!(line["item_book_qty"], json!("8.25"));
     assert_eq!(
         line["alloc"],
-        json!([{ "lot_id": b, "qty": 8, "source": "FIFO" }])
+        json!([{ "lot_id": b, "qty": "8", "source": "FIFO" }])
     );
     assert_eq!(reply.body["warnings"], json!([]));
 }
@@ -1186,8 +1204,8 @@ async fn rebuilt_lots_keep_their_fifo_order() {
         &cmd(4),
         &supplier,
         vec![
-            receipt_line(&flour, 5, "g", 1, "2026-10-20"),
-            receipt_line(&flour, 10, "g", 1, "2026-10-20"),
+            receipt_line(&flour, "5", "g", "1", "2026-10-20"),
+            receipt_line(&flour, "10", "g", "1", "2026-10-20"),
         ],
         0,
         SENT,
@@ -1208,22 +1226,22 @@ async fn rebuilt_lots_keep_their_fifo_order() {
     let reply = waste(
         &router,
         &cmd(5),
-        vec![waste_line(&flour, 8, None, false)],
+        vec![waste_line(&flour, "8", None, false)],
         SENT,
     )
     .await;
     assert_eq!(
         reply.body["data"]["waste_record"]["lines"][0]["alloc"],
         json!([
-            { "lot_id": "RAW-FLOUR-20261006-001", "qty": 5, "source": "FIFO" },
-            { "lot_id": "RAW-FLOUR-20261006-002", "qty": 3, "source": "FIFO" },
+            { "lot_id": "RAW-FLOUR-20261006-001", "qty": "5", "source": "FIFO" },
+            { "lot_id": "RAW-FLOUR-20261006-002", "qty": "3", "source": "FIFO" },
         ])
     );
     assert_eq!(
         lot_balances(&db_path).unwrap(),
         [
             ("RAW-FLOUR-20261006-001".to_owned(), 0),
-            ("RAW-FLOUR-20261006-002".to_owned(), 7),
+            ("RAW-FLOUR-20261006-002".to_owned(), 7_000),
         ]
     );
 }
@@ -1232,7 +1250,7 @@ async fn rebuilt_lots_keep_their_fifo_order() {
 const GOLDEN_WASTE_ITEM_ID: &str = "01890a5d-ac96-774b-bcce-b302099a8501";
 const GOLDEN_ABSORBER_ID: &str = "01890a5d-ac96-774b-bcce-b302099a8701";
 
-/// 建一个账本：面粉、供应商、报损原因 EXPIRED，一次收货面粉 25000 g（…-001）、3000 g（…-002），共 4 个事件。
+/// 建一个账本：面粉、供应商、报损原因 EXPIRED，一次收货面粉 25 kg = 25000 g（…-001）、3000 g（…-002），共 4 个事件。
 /// 返回 (物料 ID, 收货事件 ID)；收货事件作为被吸收行的 absorbed_by_event_id（吸收它的盘点事件本期还不能写入）。
 #[allow(clippy::unwrap_used)] // 测试夹具：写入前置状态失败时，后续步骤没有意义，直接终止测试。
 async fn waste_ledger(db_path: &Path) -> (String, String) {
@@ -1244,8 +1262,8 @@ async fn waste_ledger(db_path: &Path) -> (String, String) {
         &cmd(4),
         &supplier,
         vec![
-            receipt_line(&flour, 25000, "g", 1, "2026-10-20"),
-            receipt_line(&flour, 3000, "g", 1, "2026-10-20"),
+            receipt_line(&flour, "25", "kg", "1000", "2026-10-20"),
+            receipt_line(&flour, "3000", "g", "1", "2026-10-20"),
         ],
         0,
         SENT,
@@ -1337,6 +1355,7 @@ fn waste_movements(db_path: &Path) -> Result<Vec<WasteMovement>, Box<dyn Error>>
 // lot_id 为 NULL（指定了批次的行也一样）、nominal_qty = −qty、qty_delta = 0、absorbed_by_event_id 取自 payload，
 // 不查其他事件；不改动批次余量，不产生账外缺口。
 // 同一事件中被吸收的行和正常分配的行可以并存：流水按行序、alloc 顺序从 0 连续编号。重建可重复执行。
+// payload 中的小数字符串换算成千分之一克：被吸收的 1000.5 g 记 nominal_qty −1000500；FIFO 500.25 g 记 −500250。
 #[tokio::test]
 async fn absorbed_waste_lines_rebuild() {
     let dir = tempfile::tempdir().unwrap();
@@ -1348,7 +1367,7 @@ async fn absorbed_waste_lines_rebuild() {
             .replace(GOLDEN_ABSORBER_ID, &absorber)
     };
     let mixed = format!(
-        r#"{{"lines":[{{"item_id":"{flour}","qty":1000,"input":{{"qty":1000,"unit_code":"g","base_qty_per_unit":1}},"reason_code":"EXPIRED","item_book_qty":28000,"absorbed_by_event_id":"{absorber}"}},{{"item_id":"{flour}","qty":500,"input":{{"qty":500,"unit_code":"g","base_qty_per_unit":1}},"reason_code":"EXPIRED","item_book_qty":28000,"alloc":[{{"lot_id":"RAW-FLOUR-20261006-001","qty":500,"source":"FIFO"}}]}}]}}"#
+        r#"{{"lines":[{{"item_id":"{flour}","qty":"1000.5","input":{{"qty":"1000.5","unit_code":"g","base_qty_per_unit":"1"}},"reason_code":"EXPIRED","item_book_qty":"28000","absorbed_by_event_id":"{absorber}"}},{{"item_id":"{flour}","qty":"500.25","input":{{"qty":"500.25","unit_code":"g","base_qty_per_unit":"1"}},"reason_code":"EXPIRED","item_book_qty":"28000","alloc":[{{"lot_id":"RAW-FLOUR-20261006-001","qty":"500.25","source":"FIFO"}}]}}]}}"#
     );
     let mut writer = spec_support::writer(&db_path).unwrap();
     insert_waste(
@@ -1385,17 +1404,17 @@ async fn absorbed_waste_lines_rebuild() {
         assert_eq!(
             waste_movements(&db_path).unwrap(),
             [
-                absorbed(5, 0, 2000),
-                absorbed(6, 0, 4000),
-                absorbed(7, 0, 1000),
+                absorbed(5, 0, 2_000_000),
+                absorbed(6, 0, 4_000_000),
+                absorbed(7, 0, 1_000_500),
                 (
                     7,
                     1,
                     flour.clone(),
                     Some("RAW-FLOUR-20261006-001".into()),
                     "FIFO".into(),
-                    -500,
-                    -500,
+                    -500_250,
+                    -500_250,
                     None,
                     NOW.0,
                     "2026-10-06".into(),
@@ -1405,8 +1424,8 @@ async fn absorbed_waste_lines_rebuild() {
         assert_eq!(
             lot_balances(&db_path).unwrap(),
             [
-                ("RAW-FLOUR-20261006-001".to_owned(), 24500),
-                ("RAW-FLOUR-20261006-002".to_owned(), 3000),
+                ("RAW-FLOUR-20261006-001".to_owned(), 24_499_750),
+                ("RAW-FLOUR-20261006-002".to_owned(), 3_000_000),
             ]
         );
         let unallocated = spec_support::count(&writer, "inventory_unallocated").unwrap();
@@ -1416,16 +1435,18 @@ async fn absorbed_waste_lines_rebuild() {
 }
 
 // docs/domain.md「事件目录」WASTE_LOGGED 的行结构：alloc 与 absorbed_by_event_id 恰有一个出现；lot_book_qty 与 lot_id
-// 同时出现。每组用两个账本对照：只差这一处结构的合法报损照常重建（说明事件类型已被识别、引用都在），违反结构的报损
+// 同时出现；数量是小数字符串，不是 JSON 数字（「数量」）。每组用两个账本对照：只差这一处结构的合法报损照常重建（说明事件类型已被识别、引用都在），违反结构的报损
 // （由测试经 open_writer 直接写入）重建返回错误，全部投影保持重建前的状态，账本不变。
 #[tokio::test]
 async fn rebuild_refuses_malformed_waste_lines() {
-    let fifo = r#","alloc":[{"lot_id":"RAW-FLOUR-20261006-001","qty":1,"source":"FIFO"}]"#;
+    let fifo = r#","alloc":[{"lot_id":"RAW-FLOUR-20261006-001","qty":"1","source":"FIFO"}]"#;
+    let numeric_fifo = r#","alloc":[{"lot_id":"RAW-FLOUR-20261006-001","qty":1,"source":"FIFO"}]"#;
     let specified =
-        r#","alloc":[{"lot_id":"RAW-FLOUR-20261006-001","qty":1,"source":"SPECIFIED"}]"#;
+        r#","alloc":[{"lot_id":"RAW-FLOUR-20261006-001","qty":"1","source":"SPECIFIED"}]"#;
     let absorbed = r#","absorbed_by_event_id":"ABSORBER""#;
     let lot_id = r#","lot_id":"RAW-FLOUR-20261006-001""#;
-    let lot_book = r#","lot_book_qty":25000"#;
+    let lot_book = r#","lot_book_qty":"25000""#;
+    let numeric_lot_book = r#","lot_book_qty":25000"#;
     // (名称, 违反结构的 (lot 字段, lot_book_qty 字段, 结尾), 合法对照的 (lot 字段, lot_book_qty 字段, 结尾))
     let both = format!("{fifo}{absorbed}");
     let cases = [
@@ -1449,6 +1470,16 @@ async fn rebuild_refuses_malformed_waste_lines() {
             (lot_id, "", specified),
             (lot_id, lot_book, specified),
         ),
+        (
+            "alloc qty as number",
+            ("", "", numeric_fifo),
+            ("", "", fifo),
+        ),
+        (
+            "lot_book_qty as number",
+            (lot_id, numeric_lot_book, specified),
+            (lot_id, lot_book, specified),
+        ),
     ];
     for (name, malformed, valid) in cases {
         for ((lot, book, tail), ok) in [(valid, true), (malformed, false)] {
@@ -1456,7 +1487,7 @@ async fn rebuild_refuses_malformed_waste_lines() {
             let db_path = dir.path().join("boh.db");
             let (flour, absorber) = waste_ledger(&db_path).await;
             let payload = format!(
-                r#"{{"lines":[{{"item_id":"{flour}"{lot},"qty":1,"input":{{"qty":1,"unit_code":"g","base_qty_per_unit":1}},"reason_code":"EXPIRED","item_book_qty":28000{book}{tail}}}]}}"#
+                r#"{{"lines":[{{"item_id":"{flour}"{lot},"qty":"1","input":{{"qty":"1","unit_code":"g","base_qty_per_unit":"1"}},"reason_code":"EXPIRED","item_book_qty":"28000"{book}{tail}}}]}}"#
             )
             .replace("ABSORBER", &absorber);
             let mut writer = spec_support::writer(&db_path).unwrap();

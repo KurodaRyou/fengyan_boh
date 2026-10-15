@@ -25,7 +25,7 @@
 | Projection | 投影 | 由事件推导出的当前状态表（库存余量、主数据表等），在写事件的同一事务内更新，可以从账本完整重建 | AGENTS「只追加」 |
 | Replay / rebuild | 重放 / 重建 | 清空投影后按 `seq` 把全部事件重新 `projections::apply` 一遍，结果必须与原投影逐行一致 | AGENTS「只追加」 |
 | Aggregate | 聚合 | 一组相关事件共用的标识（`aggregate_type` + 聚合 ID），`aggregate_version` 给出组内顺序。只是事件上的字段，不是代码中的类层次 | domain「事件目录」 |
-| Upcast | upcast | 读取旧 `schema_version` 的 payload 时，把它转换成当前结构的函数 | AGENTS「只追加」 |
+| Upcast | upcast | 读取旧 `schema_version` 的 payload 时，把它转换成当前结构的函数；与单位换算无关 | AGENTS「只追加」 |
 | Idempotency | 幂等 | 同一 `command_id` 重复提交时返回原结果、不重复执行；内容不同时返回 `409 IDEMPOTENCY_CONFLICT` | AGENTS「幂等」 |
 | Canonical request | 规范化请求 | 命令反序列化成强类型结构体后再序列化、剥离 `command_id` 和 `sent_at` 得到的文本，用于幂等比对；含 PIN 或授权秘密的命令另有例外，见 auth「敏感命令的幂等」 | AGENTS「幂等」 |
 | Envelope | 信封 | 所有 HTTP 响应共用的外层结构：`success`、`data`、`warnings`、`error` | AGENTS「HTTP 约定」 |
@@ -39,6 +39,10 @@
 | Business date | 营业日 | 门店当地日期，早于日切时刻（必填配置 `business_day_cutoff`，如 `04:00`）的发生时间算前一营业日 | domain「时间」 |
 | Relative calibration | 相对校准 | 用平板同一时钟算出 `lag = sent_at − captured_at`，以节点的 `recorded_at − lag` 作为 `occurred_at`，抵消平板时钟偏差 | domain「时间」 |
 | Backfill | 补录 | 经显式入口直接提交过去的 `occurred_at`，不走相对校准 | domain「时间」 |
+| Fixed-point quantity | 定点数量 | 基本单位的数量，最多 3 位小数；存千分之一基本单位的整数，接口和 payload 中写成小数字符串 | domain「数量」 |
+| Unit conversion | 单位换算 | 录入数量乘换算系数得到基本单位数量（`convert_unit`），四舍五入到 0.001 基本单位 | domain「单位」 |
+| Entry limit | 录入上限 | 每次录入在所选单位下的数字绝对值不超过 9999.999 | domain「数量」 |
+| Stock state limit | 库存状态上限 | 任何写入之后，物料净账面、批次余量、账外缺口的绝对值不超过 10^9 个基本单位 | domain「数量」 |
 | Lot | 批次 | 一次收货行或生产产出形成的一份库存，以批次号标识 | domain「批次」 |
 | Lot number | 批次号 | 批次的唯一标识 `lot_id`，格式 `类型-编码-YYYYMMDD-流水号`，印在标签上，人和程序都用它识别同一批实物；生成后不变 | domain「批次」 |
 | Manufacturer lot number | 生产商批号 | 包装上由生产商印的批号（`manufacturer_lot_no`），可选，不作批次主键；不是供应商的批号 | domain「批次」 |

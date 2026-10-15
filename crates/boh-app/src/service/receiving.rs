@@ -71,11 +71,16 @@ pub async fn create(
                         });
                     }
                     let mut earlier_expiries: BTreeMap<AggregateId, UnixMillis> = BTreeMap::new();
+                    let mut balances = super::inventory::WorkingSet::default();
                     let mut lot_numbers = super::inventory::LotNumbers::new(calendar_date);
                     let mut lines = Vec::with_capacity(command.lines.len());
                     for (index, line) in command.lines.into_iter().enumerate() {
-                        let (code, category) =
-                            super::item_units::validate_item(tx, index, line.item_id, &line.input)?;
+                        let (code, category) = super::item_units::validate_item(
+                            tx,
+                            Some(index),
+                            line.item_id,
+                            &line.input,
+                        )?;
                         // Both strings are canonical YYYY-MM-DD dates, so their
                         // ordering equals calendar ordering, including year 0000.
                         let reason = if line.produced_on.as_str() > lot_numbers.calendar_date() {
@@ -102,6 +107,14 @@ pub async fn create(
                         let expires_at = end_of_local_date(expires_on, &state.timezone)?;
                         let lot_id =
                             lot_numbers.allocate(tx, index, line.item_id, category, &code)?;
+                        let qty = line.input.base_qty().map_err(|_| ApiError::validation())?;
+                        super::inventory::receive(
+                            balances.get(tx, line.item_id)?,
+                            lot_id.clone(),
+                            qty,
+                            index,
+                            line.item_id,
+                        )?;
                         let serial = lot_id.serial();
                         let older_expires_later: bool = tx
                             .query_row(
@@ -140,7 +153,7 @@ pub async fn create(
                             .or_insert(expires_at);
                         lines.push(ReceivedLine {
                             item_id: line.item_id,
-                            qty: line.input.base_qty().map_err(|_| ApiError::validation())?,
+                            qty,
                             input: line.input,
                             lot_id,
                             manufacturer_lot_no: line.manufacturer_lot_no,

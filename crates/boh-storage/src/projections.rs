@@ -231,8 +231,11 @@ pub(crate) fn rebuild(tx: &Transaction<'_>) -> Result<u64, StorageError> {
 #[cfg(test)]
 mod tests {
     use super::{PROJECTION_TABLES, equipment_payload, receipt_payload, temperature_payload};
+    use crate::ledger::{self, Command, Event, ExecuteError};
     use crate::tests::assert_strict_payload;
     use crate::{StorageError, open};
+    use boh_domain::{AggregateId, CommandId, EventId, UnixMillis};
+    use serde_json::json;
     use std::num::NonZeroUsize;
 
     #[test]
@@ -286,7 +289,7 @@ mod tests {
 
     #[test]
     fn receipt_decoder_rejects_coerced_types_nulls_duplicates_and_unknown_fields() {
-        let good = r#"{"supplier_id":"01890a5d-ac96-774b-bcce-b302099a8601","lines":[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8602","qty":5,"input":{"qty":5,"unit_code":"g","base_qty_per_unit":1},"lot_id":"RAW-FLOUR-20261006-001","manufacturer_lot_no":"M1","produced_on":"2026-10-01","expires_on":"2026-10-20","expires_at":1792511999999,"line_cost_cents":0}]}"#;
+        let good = r#"{"supplier_id":"01890a5d-ac96-774b-bcce-b302099a8601","lines":[{"item_id":"01890a5d-ac96-774b-bcce-b302099a8602","qty":"5","input":{"qty":"5","unit_code":"g","base_qty_per_unit":"1"},"lot_id":"RAW-FLOUR-20261006-001","manufacturer_lot_no":"M1","produced_on":"2026-10-01","expires_on":"2026-10-20","expires_at":1792511999999,"line_cost_cents":0}]}"#;
         assert_strict_payload(
             receipt_payload,
             good,
@@ -294,16 +297,16 @@ mod tests {
             "解析收货事件 payload",
         );
         for json in [
-            good.replace(r#""qty":5,"input""#, r#""qty":6,"input""#),
+            good.replace(r#""qty":"5","input""#, r#""qty":"6","input""#),
             good.replace(r#""lines":["#, r#""lines":["text","#),
             good.replace(r#""lines":["#, r#""lines":[null,"#),
-            good.replace(r#"{"qty":5,"unit_code":"g","base_qty_per_unit":1}"#, r#"[5,"g",1]"#),
-            good.replace(r#"{"item_id":"01890a5d-ac96-774b-bcce-b302099a8602","qty":5,"input":{"qty":5,"unit_code":"g","base_qty_per_unit":1},"lot_id":"RAW-FLOUR-20261006-001","manufacturer_lot_no":"M1","produced_on":"2026-10-01","expires_on":"2026-10-20","expires_at":1792511999999,"line_cost_cents":0}"#, r#"["01890a5d-ac96-774b-bcce-b302099a8602",5,{"qty":5,"unit_code":"g","base_qty_per_unit":1},"RAW-FLOUR-20261006-001","M1","2026-10-01","2026-10-20",1792511999999,0]"#),
+            good.replace(r#"{"qty":"5","unit_code":"g","base_qty_per_unit":"1"}"#, r#"["5","g","1"]"#),
+            good.replace(r#"{"item_id":"01890a5d-ac96-774b-bcce-b302099a8602","qty":"5","input":{"qty":"5","unit_code":"g","base_qty_per_unit":"1"},"lot_id":"RAW-FLOUR-20261006-001","manufacturer_lot_no":"M1","produced_on":"2026-10-01","expires_on":"2026-10-20","expires_at":1792511999999,"line_cost_cents":0}"#, r#"["01890a5d-ac96-774b-bcce-b302099a8602","5",{"qty":"5","unit_code":"g","base_qty_per_unit":"1"},"RAW-FLOUR-20261006-001","M1","2026-10-01","2026-10-20",1792511999999,0]"#),
             format!(r#"["01890a5d-ac96-774b-bcce-b302099a8601",{}]"#, serde_json::from_str::<serde_json::Value>(good).unwrap()["lines"]),
             good.replace("RAW-FLOUR-20261006-001", "RAW-FLOUR-20261006-000"),
             good.replace("2026-10-01", "2026-10-21"),
             good.replace("M1", " M1"),
-            good.replace(r#""base_qty_per_unit":1"#, r#""base_qty_per_unit":9223372036854775807"#),
+            good.replace(r#""base_qty_per_unit":"1""#, r#""base_qty_per_unit":"9223372036854775807""#),
             good.replace(r#""line_cost_cents":0"#, r#""line_cost_cents":-1"#),
         ] {
             assert!(receipt_payload(&json).is_err(), "{json}");
@@ -345,5 +348,96 @@ mod tests {
             tables, expected,
             "rebuild must clear every projection table"
         );
+    }
+
+    #[tokio::test]
+    async fn decimal_inventory_and_factors_replay_with_identical_storage_units() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = open(&dir.path().join("boh.db"), NonZeroUsize::MIN).unwrap();
+        storage.writer.call(|tx| -> Result<(), StorageError> {
+            let item_id = "01890a5d-ac96-774b-bcce-b302099a8601";
+            let supplier_id = "01890a5d-ac96-774b-bcce-b302099a8602";
+            let receipt_id = "01890a5d-ac96-774b-bcce-b302099a8603";
+            let waste_id = "01890a5d-ac96-774b-bcce-b302099a8604";
+            let lot_id = "RAW-FLOUR-20261006-001";
+            for (id, event_type, schema_version, aggregate_type, payload) in [
+                (item_id, "MASTER_DATA_CHANGED", 1, "ITEM", json!({
+                    "entity": "ITEM", "source": "LOCAL", "snapshot": {
+                        "code": "FLOUR", "name": "Flour", "base_unit": "g", "category": "RAW",
+                        "units": [{"unit_code": "oz", "base_qty_per_unit": "28.349523125"}], "active": true
+                    }
+                })),
+                (supplier_id, "MASTER_DATA_CHANGED", 1, "SUPPLIER", json!({
+                    "entity": "SUPPLIER", "source": "LOCAL", "snapshot": {
+                        "code": "S1", "name": "Supplier", "active": true
+                    }
+                })),
+                (receipt_id, "GOODS_RECEIVED", 2, "RECEIPT", json!({
+                    "supplier_id": supplier_id, "lines": [{
+                        "item_id": item_id, "qty": "0.003",
+                        "input": {"qty": "2.5", "unit_code": "mg", "base_qty_per_unit": "0.001"},
+                        "lot_id": lot_id, "produced_on": "2026-10-01", "expires_on": "2026-10-20",
+                        "expires_at": 1792511999999_i64, "line_cost_cents": 0
+                    }]
+                })),
+                (waste_id, "WASTE_LOGGED", 1, "WASTE_RECORD", json!({
+                    "lines": [{
+                        "item_id": item_id, "lot_id": lot_id, "qty": "0.004",
+                        "input": {"qty": "3.5", "unit_code": "mg", "base_qty_per_unit": "0.001"},
+                        "reason_code": "EXPIRED", "item_book_qty": "0.003", "lot_book_qty": "0.003",
+                        "alloc": [{"lot_id": lot_id, "qty": "0.004", "source": "SPECIFIED"}]
+                    }, {
+                        "item_id": item_id, "qty": "0.002",
+                        "input": {"qty": "1.5", "unit_code": "mg", "base_qty_per_unit": "0.001"},
+                        "reason_code": "EXPIRED", "item_book_qty": "-0.001",
+                        "alloc": [{"qty": "0.002", "source": "SHORTFALL"}]
+                    }]
+                })),
+            ] {
+                let event = Event {
+                    id: EventId::parse(id)?, event_type: event_type.into(), schema_version,
+                    aggregate_type: aggregate_type.into(), aggregate_id: AggregateId::parse(id)?,
+                    aggregate_version: 1, command_id: CommandId::parse(id)?,
+                    actor_id: AggregateId::parse(item_id)?, device_id: AggregateId::parse(item_id)?,
+                    business_date: "2026-10-06".into(), occurred_at: UnixMillis(0), recorded_at: UnixMillis(0),
+                    payload: payload.to_string(),
+                };
+                ledger::execute::<ExecuteError, _>(tx, Command {
+                    id: event.command_id, command_type: event_type, request: "{}", recorded_at: event.recorded_at,
+                }, |ledger| {
+                    ledger.append(&event)?;
+                    Ok("{}".into())
+                }).map_err(|error| StorageError::external("写入小数测试事件", error))?;
+            }
+            for replay in [false, true] {
+                if replay {
+                    assert_eq!(super::rebuild(tx)?, 4);
+                }
+                let balances: (i64, i64, i64, i64) = tx.query_row(
+                    "SELECT l.remaining_qty, u.qty, h.qty, f.base_qty_per_unit
+                     FROM inventory_lots l JOIN inventory_unallocated u USING (item_id)
+                     JOIN inventory_on_hand h USING (item_id) JOIN item_units f USING (item_id)
+                     WHERE l.lot_id = ?1", [lot_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                ).map_err(|error| StorageError::sqlite("读取小数库存投影", error))?;
+                assert_eq!(balances, (-1, -2, -3, 28_349_523_125));
+                let mut statement = tx.prepare(
+                    "SELECT event_seq, movement_no, nominal_qty, qty_delta, lot_id
+                     FROM inventory_movements ORDER BY event_seq, movement_no"
+                ).map_err(|error| StorageError::sqlite("准备读取小数库存流水", error))?;
+                let rows = statement.query_map([], |row| Ok((
+                    row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?, row.get::<_, Option<String>>(4)?,
+                ))).map_err(|error| StorageError::sqlite("查询小数库存流水", error))?
+                    .collect::<Result<Vec<_>, _>>().map_err(|error| StorageError::sqlite("读取小数库存流水", error))?;
+                assert_eq!(rows, [
+                    (3, 0, 3, 3, Some(lot_id.into())),
+                    (4, 0, -4, -4, Some(lot_id.into())),
+                    (4, 1, -2, -2, None),
+                ]);
+            }
+            Ok(())
+        }).await.unwrap();
+        storage.writer_handle.shutdown().await.unwrap();
     }
 }

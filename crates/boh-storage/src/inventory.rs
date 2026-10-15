@@ -2,6 +2,7 @@
 
 use boh_domain::inventory::Allocation;
 use boh_domain::lot::LotId;
+use boh_domain::quantity::Quantity;
 use boh_domain::{AggregateId, EventId, UnixMillis};
 use rusqlite::{OptionalExtension, Transaction, params};
 
@@ -41,7 +42,7 @@ pub(crate) struct NewLot<'a> {
     pub(crate) item_id: AggregateId,
     pub(crate) source_line_no: i64,
     pub(crate) origin: LotOrigin,
-    pub(crate) qty: i64,
+    pub(crate) qty: Quantity,
     pub(crate) expires_at: Option<UnixMillis>,
     pub(crate) manufacturer_lot_no: Option<&'a str>,
 }
@@ -90,7 +91,7 @@ impl<'a, 'conn> Movements<'a, 'conn> {
                 line.lot_id.serial(),
                 self.seq,
                 line.source_line_no,
-                line.qty,
+                line.qty.milli(),
                 line.expires_at.map(|time| time.0),
                 line.manufacturer_lot_no,
                 line.origin.as_str()
@@ -114,12 +115,12 @@ impl<'a, 'conn> Movements<'a, 'conn> {
     ) -> Result<(), StorageError> {
         for part in alloc {
             if let Some(lot_id) = &part.lot_id {
-                let current: i64 = self
+                let current = self
                     .tx
                     .query_row(
                         "SELECT remaining_qty FROM inventory_lots WHERE lot_id = ?1",
                         [lot_id.to_string()],
-                        |row| row.get(0),
+                        |row| Ok(Quantity::from_milli(row.get(0)?)),
                     )
                     .map_err(|error| StorageError::sqlite("查询库存批次余量", error))?;
                 let remaining = current
@@ -128,21 +129,21 @@ impl<'a, 'conn> Movements<'a, 'conn> {
                 self.tx
                     .execute(
                         "UPDATE inventory_lots SET remaining_qty = ?2 WHERE lot_id = ?1",
-                        params![lot_id.to_string(), remaining],
+                        params![lot_id.to_string(), remaining.milli()],
                     )
                     .map_err(|error| StorageError::sqlite("扣减库存批次余量", error))?;
             } else {
-                let current: Option<i64> = self
+                let current = self
                     .tx
                     .query_row(
                         "SELECT qty FROM inventory_unallocated WHERE item_id = ?1",
                         [item_id.to_string()],
-                        |row| row.get(0),
+                        |row| Ok(Quantity::from_milli(row.get(0)?)),
                     )
                     .optional()
                     .map_err(|error| StorageError::sqlite("查询库存账外缺口", error))?;
                 let remaining = current
-                    .unwrap_or(0)
+                    .unwrap_or(Quantity::ZERO)
                     .checked_sub(part.qty)
                     .ok_or_else(|| invalid("inventory unallocated quantity overflow"))?;
                 match current {
@@ -150,7 +151,7 @@ impl<'a, 'conn> Movements<'a, 'conn> {
                         self.tx
                             .execute(
                                 "UPDATE inventory_unallocated SET qty = ?2 WHERE item_id = ?1",
-                                params![item_id.to_string(), remaining],
+                                params![item_id.to_string(), remaining.milli()],
                             )
                             .map_err(|error| StorageError::sqlite("扣减库存账外缺口", error))?;
                     }
@@ -158,7 +159,7 @@ impl<'a, 'conn> Movements<'a, 'conn> {
                         self.tx
                             .execute(
                                 "INSERT INTO inventory_unallocated (item_id, qty) VALUES (?1, ?2)",
-                                params![item_id.to_string(), remaining],
+                                params![item_id.to_string(), remaining.milli()],
                             )
                             .map_err(|error| StorageError::sqlite("插入库存账外缺口", error))?;
                     }
@@ -183,7 +184,7 @@ impl<'a, 'conn> Movements<'a, 'conn> {
     pub(crate) fn absorbed(
         &mut self,
         item_id: AggregateId,
-        qty: i64,
+        qty: Quantity,
         absorber: EventId,
     ) -> Result<(), StorageError> {
         let nominal = qty
@@ -199,12 +200,17 @@ impl<'a, 'conn> Movements<'a, 'conn> {
     }
 
     fn insert(&mut self, row: Movement<'_>) -> Result<(), StorageError> {
+        let delta = if row.absorber.is_some() {
+            Quantity::ZERO
+        } else {
+            row.nominal
+        };
         self.tx.execute(
             "INSERT INTO inventory_movements (event_seq, movement_no, item_id, lot_id, kind, alloc_source,
                  nominal_qty, qty_delta, absorbed_by_event_id, physical_at, business_date)
              VALUES (?1, ?2, ?3, ?4, ?11, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![self.seq, self.number, row.item_id.to_string(), row.lot_id.map(ToString::to_string), row.source,
-                row.nominal, if row.absorber.is_some() { 0 } else { row.nominal }, row.absorber.map(|id| id.to_string()),
+                row.nominal.milli(), delta.milli(), row.absorber.map(|id| id.to_string()),
                 self.event.occurred_at.0, self.event.business_date, self.kind.as_str()],
         ).map_err(|error| StorageError::sqlite("插入库存流水", error))?;
         self.number = self
@@ -219,7 +225,7 @@ struct Movement<'a> {
     item_id: AggregateId,
     lot_id: Option<&'a LotId>,
     source: &'static str,
-    nominal: i64,
+    nominal: Quantity,
     absorber: Option<EventId>,
 }
 
