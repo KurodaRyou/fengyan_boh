@@ -109,7 +109,7 @@ pub async fn create(
                             lot_numbers.allocate(tx, index, line.item_id, category, &code)?;
                         let qty = line.input.base_qty().map_err(|_| ApiError::validation())?;
                         super::inventory::receive(
-                            balances.get(tx, index, line.item_id)?,
+                            balances.get(tx, line.item_id)?,
                             lot_id.clone(),
                             qty,
                             index,

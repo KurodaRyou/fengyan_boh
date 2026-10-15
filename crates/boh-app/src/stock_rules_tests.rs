@@ -188,6 +188,44 @@ async fn waste_references_precede_stock_limit_and_stock_limit_precedes_later_lin
 }
 
 #[tokio::test]
+async fn stored_state_outside_the_stock_limit_is_an_internal_error_not_a_line_conflict() {
+    let node = node(true).await;
+    let (item, supplier) = seed(&node).await;
+    assert_eq!(
+        send(
+            node.router.clone(),
+            Method::POST,
+            RECEIPTS,
+            receipt(&item, &supplier, 2)
+        )
+        .await
+        .0,
+        200
+    );
+    // Each lot is within its CHECK constraint, but the net book is 2L. Only a
+    // projection fault can store that; no request line caused it.
+    node.storage
+        .writer
+        .call(|tx| -> Result<(), StorageError> {
+            tx.execute(
+                "UPDATE inventory_lots SET remaining_qty = 1000000000000",
+                [],
+            )
+            .map_err(|e| StorageError::sqlite("设置越界投影夹具", e))?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_waste_error(&node, vec![waste(&item)], 500, "INTERNAL_ERROR", json!({})).await;
+    let mut again = receipt(&item, &supplier, 1);
+    again["command_id"] = json!(master_command_id(5));
+    let (status, reply) = send(node.router.clone(), Method::POST, RECEIPTS, again).await;
+    assert_eq!(status, 500, "{reply}");
+    assert_eq!(reply["error"]["code"], "INTERNAL_ERROR", "{reply}");
+    node.storage.writer_handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn waste_accepts_intermediate_sum_above_stock_limit_and_updates_the_next_line() {
     let node = node(true).await;
     let (item, supplier) = seed(&node).await;

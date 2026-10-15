@@ -339,8 +339,9 @@ pub struct CreateRecipe {
 }
 
 impl CreateRecipe {
-    pub fn validate(&self) -> Result<(), DomainError> {
-        self.snapshot().map(|_| ())
+    /// Validate the request and return the converted snapshot, so callers convert once.
+    pub fn validate(&self) -> Result<RecipeSnapshot, DomainError> {
+        self.snapshot()
     }
     pub fn snapshot(&self) -> Result<RecipeSnapshot, DomainError> {
         text(&self.code, "code")?;
@@ -381,9 +382,11 @@ pub struct AddRecipeVersion {
 }
 
 impl AddRecipeVersion {
-    pub fn validate(&self) -> Result<(), DomainError> {
+    /// Validate the request and return the converted version, numbered 1 until the
+    /// writer assigns the real number.
+    pub fn validate(&self) -> Result<RecipeVersion, DomainError> {
         positive(self.base_revision, "base_revision")?;
-        self.version(1).map(|_| ())
+        self.version(1)
     }
 
     pub fn version(&self, number: i64) -> Result<RecipeVersion, DomainError> {

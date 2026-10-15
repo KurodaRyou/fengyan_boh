@@ -180,7 +180,7 @@ fn calculate(
     let mut result = Vec::with_capacity(requests.len());
     for (index, line) in requests.iter().enumerate() {
         validate_references(conn, index, line)?;
-        let balance = balances.get(conn, index, line.item_id)?;
+        let balance = balances.get(conn, line.item_id)?;
         if balance.lots().is_empty() {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,

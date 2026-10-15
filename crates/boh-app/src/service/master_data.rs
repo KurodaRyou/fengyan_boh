@@ -266,8 +266,8 @@ pub async fn create_recipe(
     state: AppState,
     actor: Actor,
     command: CreateRecipe,
+    snapshot: RecipeSnapshot,
 ) -> Result<Value, ApiError> {
-    let snapshot = command.snapshot().map_err(|_| ApiError::validation())?;
     let request = normalized(&command, None)?;
     execute(
         state,
@@ -345,11 +345,8 @@ pub async fn add_recipe_version(
     actor: Actor,
     id: AggregateId,
     command: AddRecipeVersion,
+    mut proposed: RecipeVersion,
 ) -> Result<Value, ApiError> {
-    if command.base_revision <= 0 {
-        return Err(ApiError::validation());
-    }
-    let mut proposed = command.version(1).map_err(|_| ApiError::validation())?;
     let request = normalized(&command, Some(("recipe_id", id)))?;
     execute(
         state,

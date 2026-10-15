@@ -143,13 +143,12 @@ impl WorkingSet {
     pub(super) fn get(
         &mut self,
         conn: &Connection,
-        index: usize,
         item_id: AggregateId,
     ) -> Result<&mut ItemBalance, ApiError> {
         use std::collections::btree_map::Entry;
         Ok(match self.balances.entry(item_id) {
             Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => entry.insert(load_balance(conn, index, item_id)?),
+            Entry::Vacant(entry) => entry.insert(load_balance(conn, item_id)?),
         })
     }
 }
@@ -203,11 +202,7 @@ fn stock_error(
     }
 }
 
-fn load_balance(
-    conn: &Connection,
-    index: usize,
-    item_id: AggregateId,
-) -> Result<ItemBalance, ApiError> {
+fn load_balance(conn: &Connection, item_id: AggregateId) -> Result<ItemBalance, ApiError> {
     let mut statement = conn.prepare(
         "SELECT lot_id, remaining_qty FROM inventory_lots WHERE item_id = ?1 ORDER BY lot_date, lot_serial",
     ).map_err(|error| StorageError::sqlite("准备查询库存批次", error))?;
@@ -237,8 +232,10 @@ fn load_balance(
         .optional()
         .map_err(|error| StorageError::sqlite("查询库存账外缺口", error))?
         .unwrap_or(Quantity::ZERO);
+    // Stored state outside the limits is a projection fault, not a conflict caused
+    // by the current request line.
     ItemBalance::new(lots, unallocated)
-        .map_err(|error| stock_error(error, "读取库存工作集", index, item_id))
+        .map_err(|error| ApiError::from(StorageError::external("读取库存工作集", error)))
 }
 
 /// One command's serials for its single, calibrated lot date.
