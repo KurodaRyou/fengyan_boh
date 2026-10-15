@@ -19,7 +19,7 @@
 | 9 | 账面不足 | 报损先提示，员工确认实际数量后入账：指定批次的差额留在该批次（余量可为负），未指定批次的差额记入账外缺口；下次盘点处理。纠错时批次已被消耗的处理见「纠错」 | 批次、纠错 |
 | 10 | 营业日 | 时区 `Asia/Shanghai`，日切 `04:00` | 时间 |
 | 11 | 操作人 | 员工在已注册的平板上用 PIN 登录；平板安装时注册一次；会话按班次有效 | [auth.md](auth.md)、待确认问题 |
-| 12 | 总部 | 本期不开发。主数据由总部维护统一的 JSON 主数据包，`code` 和 UUID 全部门店统一 | 主数据 |
+| 12 | 总部与主数据归属 | 总部本期不开发，第一版只有一家门店。全部主数据属于连锁，`code` 和 UUID 全连锁统一；第一版由店长在门店节点维护，接入总部后由总部经主数据包下发，门店只能提交修改申请 | 主数据 |
 | 13 | 不存在的业务 | 调拨、套餐、半批生产本期都不存在 | 未来功能 |
 | 14 | 数量 | 最多 3 位小数；每次录入不超过 9999.999，库存状态不超过 10^9 个基本单位；换算系数最多 9 位小数，换算结果四舍五入到 0.001 基本单位 | 数量、单位 |
 
@@ -79,6 +79,13 @@ occurred_at = recorded_at − lag
 | `WASTE_REASON` | 报损原因；初始化时预置 `EXPIRED`、`DAMAGED`、`PRODUCTION_DEFECT`、`TASTING`、`OTHER` | `boh_domain::master_data::WasteReasonSnapshot` |
 | `EQUIPMENT` | 设备 | `boh_domain::equipment::EquipmentSnapshot` |
 
+- **归属**：上表全部实体都属于连锁层面，UUID 和 `code` 全连锁统一，不按门店划分。
+  - 第一版只有一家门店、没有总部：门店节点暂代主数据来源，由店长经主数据写接口维护（`source = LOCAL`）。总部上线之前不开第二家门店。
+  - 接入总部后：主数据全部由总部所有，只经主数据包进入门店（`source = HQ_PACKAGE`）；门店节点关闭主数据写接口，门店只能提交修改申请。总部以这家门店现有的主数据作为初始数据，UUID 和 `code` 不变。
+  - 接入总部后，`init` 不再写入预置报损原因，由主数据包提供。
+  - 门店不自建物料，不自找供应商；总部可以按区域、按门店下发不同的物料。员工调动由总部执行。
+  - 理由：物料的 `code` 写进批次号、印在标签上，也用于销售导入，创建后不能修改；门店自建的主数据接入总部后无法与总部统一。
+
 - 已落地实体的样本在 `crates/boh-app/tests/golden/MASTER_DATA_CHANGED@1/`。
 
 - 快照是该行变更后的完整内容，不是差量。行的主键是事件的 `aggregate_id`，`revision` 是 `aggregate_version`，都不重复写进快照。`active` 是布尔值。
@@ -95,7 +102,7 @@ occurred_at = recorded_at − lag
 - 每行带 `revision`，每次变更 +1。主数据只停用（`active = 0`），不删除。
 - HTTP 修改命令携带客户端看到的 `base_revision`，与当前 `revision` 不等时返回 `409 REVISION_CONFLICT`（`details` 为 `{"current_revision": n}`），不写事件或 `processed_commands`。新建命令不带 `base_revision`；主数据包导入按快照逐行比对，不适用此规则。
 - 命令引用已停用的主数据照常受理，停用只在界面上隐藏。
-- 主数据写接口只允许 `MANAGER`。
+- 主数据写接口只允许 `MANAGER`；接入总部后关闭（见「归属」）。
 - `EMPLOYEE` 的权限提升、最后一名店长和认证状态表见 [auth.md](auth.md)「员工主数据」。
 - 每次变更写一条 `MASTER_DATA_CHANGED`：聚合类型是实体名，聚合 ID 是行的主键，`aggregate_version` 是变更后的 `revision`；payload 是 `{entity, source, snapshot}`，`source`（`LOCAL` / `HQ_PACKAGE`）。主数据表是投影，可以从事件流重建。
 - 内容没有变化的变更不写事件（导入主数据包时逐行比对快照）。
