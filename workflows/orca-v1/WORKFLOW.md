@@ -158,8 +158,8 @@ review 在同一个 review Claude 终端里分成几个 Task 依次执行（`pro
 
 ### S10_SPEC_CHANGE（实现开始后要改设计）
 - 负责：设计 Claude。按 AGENTS.md「实现开始后要改设计」：
-  1. 判断确实需要改 `docs/`、迁移或锁定测试；需要时先给人看（`human:H3_ADOPT` 同样适用）。
-  2. 规范改动作为 `docs:` 提交；锁定测试改动先经 `S5_CONFIRM`（新增事件、payload 分支、错误码或警告码时还要先走 `S2_LOCK` 的缺口检查和 `S3_SPEC_REVIEW`）。
+  1. 判断确实需要改锁定路径（`.github/CODEOWNERS` 列出的全部路径，§10）；需要时先给人看（`human:H3_ADOPT` 同样适用）。
+  2. 规范、迁移、依赖、构建与 CI 改动作为 `docs:` 提交；锁定测试改动先经 `S5_CONFIRM`（新增事件、payload 分支、错误码或警告码时还要先走 `S2_LOCK` 的缺口检查和 `S3_SPEC_REVIEW`）。
   3. 新提交放在分支开头的 `docs:` / `spec:` 之后，实现提交 rebase 到其后；有冲突交给实现 agent 解决。比对基准后移，记入 `STATE.md`。
   4. 写新的 review prompt；**释放旧 review 终端，新建 review worker**（新会话）。
 - 下一位：实现 agent 在 rebase 后的分支上修改（`S9_REWORK`），然后新 review 会话从分诊开始。
@@ -168,7 +168,7 @@ review 在同一个 review Claude 终端里分成几个 Task 依次执行（`pro
 ### S11_PR（第 7 步）
 - 前提：最近一次 verdict 是 `PASS`，其 HEAD 等于当前 HEAD；`H0_AUTH` 中有推送和开 PR 的授权。没有授权 → `human:H5_PR`，说明要做的具体动作后等待。
 - 负责：协调者推送、开 PR（正文末尾按系统提示附署名），记录 PR 号；然后等 CI `check` 和 GitHub 上的 Codex review（§8.7）。
-- Codex 发现 → 派发给**同一个 review 终端**判断采纳与否；需要改实现的 → `S9_REWORK`，需要改 `docs/`、迁移或锁定测试的 → `S10_SPEC_CHANGE`；不采纳的理由由协调者按授权发 PR 评论。
+- Codex 发现 → 派发给**同一个 review 终端**判断采纳与否；需要改实现的 → `S9_REWORK`，需要改锁定路径（`.github/CODEOWNERS`，§10）的 → `S10_SPEC_CHANGE`；不采纳的理由由协调者按授权发 PR 评论。
 - PR 打开后有新提交：在同一 review 终端复审新增提交（锁定路径仍逐个提交核对，黑盒按实际改动沿用、补测或重验），
   按授权评论 `@codex review`，得到新的 `PASS` 及其 HEAD。
 - 证据：CI `check` 通过；PR HEAD 等于最近一次 `PASS` 的 HEAD；Codex 已对这个 HEAD 完成 review（§8.7）；所有 Codex 发现有处理结论。
