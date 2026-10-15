@@ -2,6 +2,7 @@
 
 由 review Claude 在分诊时写好（CLAUDE.md「开发顺序第 6 步需要进程级黑盒验收时」：只写涉及五项中的哪几项、要读的规范章节和构建命令）。
 协调者原样派发，不增删内容；worker 进入副本的方法见 WORKFLOW.md §7.1。
+spec 中不写 `/boost`：协调者发送时在整段 preamble 前加 `/boost `。
 
 ```text
 Fengyan_BOH 切片「<切片>」进程级黑盒验收。你的身份与约束见当前目录的 AGENTS.md「测试分工」。

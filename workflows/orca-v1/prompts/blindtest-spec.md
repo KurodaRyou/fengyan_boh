@@ -2,6 +2,7 @@
 
 内容要求见 CLAUDE.md「开发顺序第 4.1 步写完后」：只写被测对象、要读的规范章节、要对照的锁定测试文件和场景覆盖面。
 角色约束由 AGENTS.md「测试分工」规定（副本里有 AGENTS.md），这里不改写。副本准备与 worker 进入副本的方法见 WORKFLOW.md §7.1。
+spec 中不写 `/boost`：协调者发送时在整段 preamble 前加 `/boost `。
 
 ```text
 Fengyan_BOH 切片「<切片>」独立测试审查，第一阶段（规范审查）。你的身份与约束见当前目录的 AGENTS.md「测试分工」。

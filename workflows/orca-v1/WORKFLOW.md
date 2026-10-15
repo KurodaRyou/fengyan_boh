@@ -13,7 +13,7 @@
 | 协调者兼设计 Claude | 用户启动工作流的 Claude Code 会话，运行在主检出（见 §2）的 Orca 终端里 | 整个切片一个会话；退出后按 §9 恢复 | `docs:` / `spec:` 提交（AGENTS.md「协作分工」允许 Claude 的范围）、`workdocs/`、Run 与 Task | 担任本切片的 review Claude；确认预期值；合入；未经授权推送、开 PR、发评论 |
 | 实现 agent | Orca worker，默认 `--agent codex` | 一个终端，返修时复用 | 非锁定路径的实现提交 | 修改锁定路径；读取或引用 `workdocs/` |
 | review Claude | Orca worker，`--agent claude`，新终端 | 一个 review 会话：分诊、正文、黑盒核对、返修复审、第 7 步复审都在同一终端复用；规范变更后换新终端 | `workdocs/orca/<切片>/review-*.md`、黑盒副本与留存（CLAUDE.md 第 6 步） | 修改仓库中的任何跟踪文件；提交 |
-| 测试 agent | Orca worker，Gemini；不可用时按 §8.4 换 Codex | 每个副本一个终端，用完释放 | 副本中的 `blindtest/` | 见 AGENTS.md「测试分工」 |
+| 测试 agent | Antigravity CLI（`agy`），以 boost 模式运行（§7.1）；不可用时按 §8.4 换 Codex | 每个副本一个终端，用完关闭 | 副本中的 `blindtest/` | 见 AGENTS.md「测试分工」 |
 
 - **协调者兼设计 Claude 的理由**：AGENTS.md 规定设计由「人 + Claude」完成，是与人的对话。把设计放进另一个 worker，人的每次回答都要经协调者转述。
   协调者因此看过设计意图，所以 review 一律交给不继承这个会话的 review worker。
@@ -82,7 +82,7 @@ review 结论及对应 HEAD；黑盒副本的来源提交与报告位置；已�
 ### S0_INIT
 - 输入：用户的入口 prompt（切片名、范围、授权）。负责：协调者。
 - 证据：`orca status` 正常；主检出在切片分支上，`git status` 只有已知的未跟踪文件；`STATE.md` 已建；Run 已建或已绑定（§9）；
-  工具检查已记入 `STATE.md`：`claude`、实现 agent、测试 agent（`command -v gemini`，不可用时 §8.4）。
+  工具检查已记入 `STATE.md`：`claude`、实现 agent、测试 agent（`command -v agy`，不可用时 §8.4）。
 - 下一位：设计 Claude（`S1_DESIGN`）；从中途恢复时按 `STATE.md` 跳到对应阶段。
 - 等人：`human:H0_AUTH`。入口 prompt 没写授权范围时，问一次推送、开 PR、发 PR 评论（含 `@codex review` 和不采纳理由）是否授权，记入 `STATE.md`，之后复用。
 - 失败：Orca 不可用或主检出有未知改动 → `blocked`，报告，不动这些改动。
@@ -199,17 +199,27 @@ review 在同一个 review Claude 终端里分成几个 Task 依次执行（`pro
 ## 7. 派发方法
 
 ### 7.1 测试 agent 的副本（第 4.2 步和第 6 步）
-副本内容与命名按 CLAUDE.md。Orca 不能从 CLI 把一个普通文件夹注册成工作区（`project setup-existing-folder --kind folder` 报
-`Imported folder does not match the selected project identity.`），所以 worker 用下面的方式进入副本：
+副本内容与命名按 CLAUDE.md。测试 agent 是 Antigravity CLI，要以 boost 模式运行：发给它的第一行必须以 `/boost ` 开头。
+`worker-start` 注入的 prompt 以 Orca 的 preamble 开头、Task spec 在 `=== TASK ===` 之后，写在 spec 里的 `/boost` 不会生效（已实测，见 validation.md）。
+另外，Orca 不能从 CLI 把普通文件夹注册成工作区（`project setup-existing-folder --kind folder` 报 `Imported folder does not match the selected project identity.`）。
+所以测试 agent 不用 `worker-start`，按下面的低层方式派发：
 
 ```text
-orca terminal create --worktree current --title "<切片>-<阶段>-blindtest" --command "cd '<副本绝对路径>' && <测试 agent 命令>" --json
+# 1. 在副本里启动 agy（终端挂在主检出名下，工作目录是副本）
+orca terminal create --worktree current --title "<切片>-<阶段>-blindtest" --command "cd '<副本绝对路径>' && agy --dangerously-skip-permissions" --json
 orca terminal wait --terminal <handle> --for tui-idle --timeout-ms 60000 --json
-# satisfied:false 且 blockedReason = agent-trust-workspace → H7_TRUST，等人在该终端处理后重新 wait
-orca orchestration worker-start --task <task_id> --terminal <handle> --worktree current --json
+#    satisfied:false 且 blockedReason = agent-trust-workspace → H7_TRUST；人在该终端处理后重新 wait，satisfied:true 才继续
+# 2. 建 Task，取得 preamble（不注入）
+orca orchestration task-create --task-title "<切片>/blindtest-<阶段>" --spec "<prompts/blindtest-*.md 填好的 spec，不含 /boost>" --json
+orca orchestration dispatch --task <task_id> --to <handle> --return-preamble --json      # 回执 injected:false，result.preamble 含 TASK 块
+# 3. 以 /boost 开头发送整段 preamble
+orca terminal send --terminal <handle> --text "/boost <result.preamble 全文>" --enter --json
 ```
 
-终端挂在主检出名下，agent 的工作目录是副本。测试 agent 的 Task spec 用 `prompts/blindtest-spec.md` 或 `prompts/blindtest-accept.md`。
+- 发送后用 `terminal read` 确认 agy 已开始运行（`send` 回执对 agy 只能证明输入被接受）；没开始就再读，不重发。
+- 这条通道在 Orca 中是 `unsupervised`：`worker_done`、`ask`、heartbeat 照常工作并结算 Task / Dispatch，
+  但 `worker-release` 回执为 `retained`（`no_owned_resource`），`worker-stop` 也不会关进程。核对完 `worker_done` 后由协调者 `orca terminal close --terminal <handle>`。
+- 测试 agent 的 Task spec 用 `prompts/blindtest-spec.md` 或 `prompts/blindtest-accept.md`。
 
 ### 7.2 其他 worker
 ```text
@@ -243,17 +253,18 @@ orca orchestration check --wait --types "worker_done,escalation,question" --time
 - 同一 Task 连续三次失败，Orca 会让该 Task 失败（circuit break）：不另开 Run 或换 Task 绕过，转 `blocked` 报告给人。
 
 ### 8.3 目录信任提示
-新目录（尤其是黑盒副本）首次启动 Claude Code 或 Codex 时会弹出信任提示，`worker-start` 报 `Agent startup blocked: agent-trust-workspace`，
+新目录（尤其是黑盒副本）首次启动 Claude Code、Codex 或 Antigravity CLI 时都会弹出信任提示（三者均已实测），`worker-start` 报 `Agent startup blocked: agent-trust-workspace`，
 `terminal wait` 报 `blockedReason: agent-trust-workspace`。协调者不代按按键：按回执的 `recovery` 释放失败的启动，进入 `H7_TRUST`，
-请人在 Orca 中打开该终端自行选择；或改用 §7.1 的方式先建终端，等人处理完提示后再 `worker-start --terminal`。
+请人在 Orca 中打开该终端自行选择；或改用 §7.1 的方式先建终端，等人处理完提示、`terminal wait` 为 `satisfied:true` 后，Claude / Codex 用 `worker-start --terminal` 接管，测试 agent 按 §7.1 第 2–3 步派发。
 
 ### 8.4 测试 agent 不可用
-`command -v gemini` 失败或 Gemini 额度不够时，测试 agent 改用 Codex，前提是已关闭 Codex 的记忆（由人确认，记入 `STATE.md`）。
+`command -v agy` 失败或 Antigravity 额度不够时，测试 agent 改用 Codex，并关闭 Codex 的记忆（全局配置开着记忆，新对话也会加载项目历史，审查就不独立了）：
+§7.1 第 1 步的命令换成 `codex -c memories.use_memories=false -c memories.generate_memories=false`，第 3 步不加 `/boost`。换用记入 `STATE.md`。
 两者都不可用 → `blocked`；不用 Claude worker 代替测试 agent（AGENTS.md 指定的独立审查方不是 Claude）。
 
 ### 8.5 终端的保留与释放
 启动本工作流即表示用户要求：实现终端和 review 终端在等待下一轮期间保留（`worker-retain`），以便返修和复审在同一会话中继续。
-测试 agent 的终端在报告核对后释放。复用过的终端，最后一次 `worker-release` 回执为 `retained`：确认 `worker-list --run <run>` 中没有该终端的活动 Dispatch 后，
+测试 agent 的终端在报告核对后关闭（§7.1）。复用过的终端，最后一次 `worker-release` 回执为 `retained`：确认 `worker-list --run <run>` 中没有该终端的活动 Dispatch 后，
 用 `orca terminal close --terminal <handle>` 关闭。结束前 `worker-list --run <run> --terminal-state reclaimable` 必须为空。
 
 ### 8.6 超时、存活不明

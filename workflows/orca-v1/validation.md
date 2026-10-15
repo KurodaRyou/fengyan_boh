@@ -9,7 +9,7 @@
 | Orca CLI | `/Applications/Orca.app/Contents/Resources/bin/orca`，1.4.224；`orca status` 为 `ready`；`skills get orchestration` 可用 |
 | Claude Code | 2.1.300，Orca 以 `claude --dangerously-skip-permissions` 启动 worker（来自用户的 Orca 设置） |
 | Codex | codex-cli 0.162.1；在新目录中被信任提示挡住（见 §2） |
-| Gemini | `command -v gemini` 无结果：**本机不可用**，测试 agent 只能按 WORKFLOW.md §8.4 换成 Codex |
+| Antigravity CLI | `agy` 1.3.5（`~/.local/bin/agy`）；Orca agent id `antigravity`；`/boost` 是交互式斜杠命令，只在 prompt 开头生效 |
 | 本仓库在 Orca 中 | 已注册，主检出为主 worktree；setup 钩子为 `pnpm install`、run-by-default |
 
 ## 2. 实际演练
@@ -35,7 +35,16 @@
 另做了一项放置测试（未作为 Task 运行）：
 - `project setup-existing-folder --kind folder` 无法把普通文件夹注册为工作区（`Imported folder does not match the selected project identity.`）。
 - 改用 `terminal create --command "cd <副本> && claude …"`：Claude Code 停在目录信任提示（`blockedReason: agent-trust-workspace`）。
-  演练中**没有代为选择信任**，关闭了该终端。因此 WORKFLOW.md §7.1 中「信任后 `worker-start --terminal` 接管」这一步**未实测**。
+  演练中**没有代为选择信任**，关闭了该终端。因此「人处理信任提示后，在副本中派发」这一步**未实测**；派发通道本身（上表 drill-agy-boost2）已在已信任目录实测。
+
+Antigravity 测试 agent（同一 Run）：
+
+| Task | Dispatch | 方式 | 结果 |
+|---|---|---|---|
+| `task_c63b3d34bc86` drill-agy-boost | `ctx_3566c89d0cf6` | `worker-start --agent antigravity`，spec 以 `/boost` 开头 | `worker_done` succeeded，文件正确；但 agy 历史记录中该 prompt 以 `You are working inside Orca…` 开头：`/boost` 在 TASK 块里，**没有触发 boost 模式** |
+| `task_0da56fe6ac21` drill-agy-boost2 | `ctx_dde5d8506c94` | `terminal create --command "agy --dangerously-skip-permissions"` → `dispatch --return-preamble`（`injected: false`）→ `terminal send --text "/boost <preamble>" --enter` | agy 历史记录以 `/boost You are working inside Orca…` 开头；`worker_done` succeeded（`msg_da5896c82054`），文件正确；`worker-release` 回执 `retained / no_owned_resource`，手动 `terminal close` |
+
+另外：`cd <副本> && agy --dangerously-skip-permissions` 在新文件夹中同样停在信任提示（`blockedReason: agent-trust-workspace`），未代为选择，已关闭。
 
 证据原始 JSON 保存在本次会话的 scratchpad（`drill-evidence/`），未提交进仓库。
 
@@ -66,5 +75,5 @@ WORKFLOW.md §10 的锁定路径命令已在真实历史上试过：`spec:` 提�
 - 协调者会话结束后没有任何东西会自动推进下一阶段；Orca 只保存 Run 和消息。
 - Orca 不会因 GitHub 事件唤醒协调者；CI 和 Codex review 靠协调者在自己的回合里轮询。
 - 新目录的 agent 信任提示需要人处理，黑盒副本每次都是新目录。
-- 本机没有 Gemini CLI。
+- 测试 agent 走 `dispatch --return-preamble` + `terminal send` 的低层通道，Orca 不托管其终端，需协调者手动关闭。
 - Orca 启动的 Claude worker 带 `--dangerously-skip-permissions`：实现 agent 和测试 agent 的写入边界只靠规则和 review 约束，没有沙箱。

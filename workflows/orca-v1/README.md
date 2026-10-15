@@ -23,7 +23,7 @@
 ## 前提
 
 - Orca 已运行（`orca status --json`），本仓库已在 Orca 中注册；协调者是在**主检出**的 Orca 终端里运行的 Claude Code。
-- 本机有 `claude` 和实现 agent（默认 `codex`）；测试 agent 用 Gemini，不可用时按 WORKFLOW.md §8.4。
+- 本机有 `claude` 和实现 agent（默认 `codex`）；测试 agent 用 Antigravity CLI（`agy`，boost 模式），不可用时按 WORKFLOW.md §8.4。
 - 黑盒副本等新目录第一次启动 agent 时会弹出信任提示，需要人在 Orca 终端里自己选择（关口 `H7_TRUST`）。
 
 ## 启动

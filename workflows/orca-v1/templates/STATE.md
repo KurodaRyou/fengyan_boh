@@ -8,7 +8,7 @@
 - 分支: slice/<切片>　主检出: <绝对路径>　Orca worktree id: <repoId>::<路径>
 - Run: <run_id>　协调者终端: <coordinator_handle>
 - 授权（H0_AUTH，原话 + 时间）: 推送 <是/否>；开 PR <是/否>；PR 评论 <是/否>
-- 工具: claude <版本>；实现 agent <codex 版本>；测试 agent <gemini|codex（记忆已关闭：人确认原话）>
+- 工具: claude <版本>；实现 agent <codex 版本>；测试 agent <agy 版本（boost）| codex（关闭记忆）及换用原因>
 
 ## 当前
 - stage: <S0_INIT … S13_CLOSE>
