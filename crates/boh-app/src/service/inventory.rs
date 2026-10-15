@@ -163,7 +163,7 @@ pub(super) fn allocate(
 ) -> Result<Vec<Allocation>, ApiError> {
     balance
         .allocate(specified, qty)
-        .map_err(|error| stock_error(error, index, item_id))
+        .map_err(|error| stock_error(error, "分配库存", index, item_id))
 }
 
 pub(super) fn receive(
@@ -175,23 +175,31 @@ pub(super) fn receive(
 ) -> Result<(), ApiError> {
     balance
         .receive(lot_id, qty)
-        .map_err(|error| stock_error(error, index, item_id))
+        .map_err(|error| stock_error(error, "收货入库", index, item_id))
 }
 
-fn stock_error(error: DomainError, index: usize, item_id: AggregateId) -> ApiError {
-    if let DomainError::StockLimitExceeded { lot_id } = error {
-        let mut details = json!({ "line": index, "item_id": item_id });
-        if let Some(lot_id) = lot_id {
-            details["lot_id"] = json!(lot_id);
+fn stock_error(
+    error: DomainError,
+    operation: &'static str,
+    index: usize,
+    item_id: AggregateId,
+) -> ApiError {
+    match error {
+        DomainError::StockLimitExceeded { lot_id } => {
+            let mut details = json!({ "line": index, "item_id": item_id });
+            if let Some(lot_id) = lot_id {
+                details["lot_id"] = json!(lot_id);
+            }
+            ApiError::new(
+                StatusCode::CONFLICT,
+                "STOCK_LIMIT_EXCEEDED",
+                "inventory state exceeds the stock limit",
+            )
+            .with_details(details)
         }
-        ApiError::new(
-            StatusCode::CONFLICT,
-            "STOCK_LIMIT_EXCEEDED",
-            "inventory state exceeds the stock limit",
-        )
-        .with_details(details)
-    } else {
-        ApiError::from(StorageError::from(error))
+        DomainError::InvalidId(_) | DomainError::InvalidField(_) => {
+            ApiError::from(StorageError::external(operation, error))
+        }
     }
 }
 
@@ -229,7 +237,8 @@ fn load_balance(
         .optional()
         .map_err(|error| StorageError::sqlite("查询库存账外缺口", error))?
         .unwrap_or(Quantity::ZERO);
-    ItemBalance::new(lots, unallocated).map_err(|error| stock_error(error, index, item_id))
+    ItemBalance::new(lots, unallocated)
+        .map_err(|error| stock_error(error, "读取库存工作集", index, item_id))
 }
 
 /// One command's serials for its single, calibrated lot date.

@@ -303,20 +303,23 @@ impl RecipeSnapshot {
             if version.version != expected {
                 return Err(DomainError::InvalidField("versions"));
             }
-            if version.output_qty_per_batch != version.output_input.base_qty()? {
-                return Err(DomainError::InvalidField("output_qty_per_batch"));
-            }
-            if version.lines.is_empty() {
-                return Err(DomainError::InvalidField("lines"));
-            }
-            let mut ids = std::collections::BTreeMap::new();
-            for line in &version.lines {
-                if line.qty_per_batch != line.input.base_qty()? {
-                    return Err(DomainError::InvalidField("qty_per_batch"));
-                }
-                if ids.insert(line.item_id, ()).is_some() {
-                    return Err(DomainError::InvalidField("lines"));
-                }
+            let lines: Vec<_> = version
+                .lines
+                .iter()
+                .map(|line| RecipeInputLine {
+                    item_id: line.item_id,
+                    input: line.input.clone(),
+                })
+                .collect();
+            let converted = recipe_version(version.version, &version.output_input, &lines)?;
+            if &converted != version {
+                return Err(DomainError::InvalidField(
+                    if converted.output_qty_per_batch != version.output_qty_per_batch {
+                        "output_qty_per_batch"
+                    } else {
+                        "qty_per_batch"
+                    },
+                ));
             }
         }
         Ok(())

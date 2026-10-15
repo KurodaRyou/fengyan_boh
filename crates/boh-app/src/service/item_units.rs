@@ -34,10 +34,13 @@ pub(super) fn validate_item(
         .map_err(|error| StorageError::sqlite("查询物料", error))?;
     let (base_unit, factor, code, category) =
         current.ok_or_else(|| missing_reference("ITEM", item_id))?;
-    let mut details = json!({ "item_id": item_id, "unit_code": input.unit_code });
-    if let Some(index) = index {
-        details["line"] = json!(index);
-    }
+    let details = || {
+        let mut details = json!({ "item_id": item_id, "unit_code": input.unit_code });
+        if let Some(index) = index {
+            details["line"] = json!(index);
+        }
+        details
+    };
     let factor = if input.unit_code == base_unit {
         UnitFactor::ONE
     } else {
@@ -47,10 +50,11 @@ pub(super) fn validate_item(
                 "UNKNOWN_UNIT",
                 "unit is not configured",
             )
-            .with_details(details.clone())
+            .with_details(details())
         })?
     };
     if factor != input.base_qty_per_unit {
+        let mut details = details();
         details["base_qty_per_unit"] = json!(factor);
         return Err(ApiError::new(
             StatusCode::CONFLICT,

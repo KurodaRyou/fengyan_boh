@@ -267,6 +267,7 @@ pub async fn create_recipe(
     actor: Actor,
     command: CreateRecipe,
 ) -> Result<Value, ApiError> {
+    let snapshot = command.snapshot().map_err(|_| ApiError::validation())?;
     let request = normalized(&command, None)?;
     execute(
         state,
@@ -284,7 +285,7 @@ pub async fn create_recipe(
             )?;
             let row = Recipe {
                 recipe_id: write.id()?,
-                snapshot: command.snapshot().map_err(|_| ApiError::validation())?,
+                snapshot,
                 revision: 1,
             };
             write.append(
@@ -345,6 +346,10 @@ pub async fn add_recipe_version(
     id: AggregateId,
     command: AddRecipeVersion,
 ) -> Result<Value, ApiError> {
+    if command.base_revision <= 0 {
+        return Err(ApiError::validation());
+    }
+    let mut proposed = command.version(1).map_err(|_| ApiError::validation())?;
     let request = normalized(&command, Some(("recipe_id", id)))?;
     execute(
         state,
@@ -370,9 +375,7 @@ pub async fn add_recipe_version(
             // Compare the full converted snapshot, including input and line order.
             // Use the current version number for the comparison so an unchanged
             // command does not need to allocate another version.
-            let mut proposed = command
-                .version(latest.version)
-                .map_err(|_| ApiError::validation())?;
+            proposed.version = latest.version;
             if &proposed != latest {
                 proposed.version = next(latest.version)?;
                 row.revision = next(row.revision)?;

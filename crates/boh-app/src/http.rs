@@ -365,7 +365,6 @@ async fn create_recipe(
     body: Result<Json<CreateRecipe>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Json(command) = body.map_err(|_| ApiError::validation())?;
-    command.validate().map_err(|_| ApiError::validation())?;
     Ok(Json(
         master_data::create_recipe(state, actor, command).await?,
     ))
@@ -467,7 +466,6 @@ async fn add_recipe_version(
     let Path(id) = path.map_err(|_| ApiError::validation())?;
     let id = AggregateId::parse(&id).map_err(|_| ApiError::validation())?;
     let Json(command) = body.map_err(|_| ApiError::validation())?;
-    command.validate().map_err(|_| ApiError::validation())?;
     Ok(Json(
         master_data::add_recipe_version(state, actor, id, command).await?,
     ))

@@ -111,6 +111,21 @@ fn stock_quantity(value: i128, lot_id: Option<&LotId>) -> Result<Quantity, Domai
         .map_err(|_| exceeded())
 }
 
+fn adjust_stock(
+    current: Quantity,
+    qty: Quantity,
+    operation: fn(i128, i128) -> Option<i128>,
+    lot_id: Option<&LotId>,
+) -> Result<Quantity, DomainError> {
+    let total =
+        operation(i128::from(current.milli()), i128::from(qty.milli())).ok_or_else(|| {
+            DomainError::StockLimitExceeded {
+                lot_id: lot_id.cloned(),
+            }
+        })?;
+    stock_quantity(total, lot_id)
+}
+
 impl ItemBalance {
     pub fn new(lots: Vec<LotBalance>, unallocated: Quantity) -> Result<Self, DomainError> {
         // Check existing lots first so a lot violation retains its identity.
@@ -148,10 +163,7 @@ impl ItemBalance {
             return Err(DomainError::InvalidField("qty"));
         }
         stock_quantity(i128::from(qty.milli()), None)?;
-        let book = i128::from(self.book.milli())
-            .checked_add(i128::from(qty.milli()))
-            .ok_or(DomainError::StockLimitExceeded { lot_id: None })?;
-        let book = stock_quantity(book, None)?;
+        let book = adjust_stock(self.book, qty, i128::checked_add, None)?;
         let index = self.lots.partition_point(|lot| {
             (lot.lot_id.date(), lot.lot_id.serial()) <= (lot_id.date(), lot_id.serial())
         });
@@ -180,12 +192,7 @@ impl ItemBalance {
                 .lots
                 .get(index)
                 .ok_or(DomainError::InvalidField("lot_id"))?;
-            let remaining = i128::from(lot.remaining.milli())
-                .checked_sub(i128::from(qty.milli()))
-                .ok_or_else(|| DomainError::StockLimitExceeded {
-                    lot_id: Some(lot.lot_id.clone()),
-                })?;
-            let remaining = stock_quantity(remaining, Some(&lot.lot_id))?;
+            let remaining = adjust_stock(lot.remaining, qty, i128::checked_sub, Some(&lot.lot_id))?;
             let book = self.book_after_deduction(qty)?;
             let lot_id = lot.lot_id.clone();
             self.lots[index].remaining = remaining;
@@ -226,10 +233,7 @@ impl ItemBalance {
         }
         let mut unallocated = self.unallocated;
         if remaining > Quantity::ZERO {
-            let total = i128::from(self.unallocated.milli())
-                .checked_sub(i128::from(remaining.milli()))
-                .ok_or(DomainError::StockLimitExceeded { lot_id: None })?;
-            unallocated = stock_quantity(total, None)?;
+            unallocated = adjust_stock(self.unallocated, remaining, i128::checked_sub, None)?;
             alloc.push(Allocation {
                 lot_id: None,
                 qty: remaining,
@@ -245,10 +249,7 @@ impl ItemBalance {
     }
 
     fn book_after_deduction(&self, qty: Quantity) -> Result<Quantity, DomainError> {
-        let total = i128::from(self.book.milli())
-            .checked_sub(i128::from(qty.milli()))
-            .ok_or(DomainError::StockLimitExceeded { lot_id: None })?;
-        stock_quantity(total, None)
+        adjust_stock(self.book, qty, i128::checked_sub, None)
     }
 }
 
