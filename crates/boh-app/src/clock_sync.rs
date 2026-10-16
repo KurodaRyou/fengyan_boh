@@ -21,25 +21,48 @@ pub struct NtpServer {
 
 impl NtpServer {
     pub fn parse(value: &str) -> Result<Self, StorageError> {
-        let invalid = || StorageError::Message("invalid NTP server address");
-        if value.is_empty() || value.chars().any(char::is_whitespace) {
-            return Err(invalid());
+        if value.is_empty() {
+            return Err(StorageError::Message(
+                "NTP server address must not be empty",
+            ));
+        }
+        if value.chars().any(char::is_whitespace) {
+            return Err(StorageError::Message(
+                "NTP server address must not contain whitespace",
+            ));
         }
         let (host, port) = if let Some(rest) = value.strip_prefix('[') {
-            let (host, rest) = rest.split_once(']').ok_or_else(invalid)?;
-            host.parse::<Ipv6Addr>().map_err(|_| invalid())?;
+            let (host, rest) = rest
+                .split_once(']')
+                .ok_or(StorageError::Message("IPv6 address requires a closing ']'"))?;
+            host.parse::<Ipv6Addr>().map_err(|_| {
+                StorageError::Message("bracketed host must be a valid IPv6 address")
+            })?;
             let port = if rest.is_empty() {
                 None
             } else {
-                Some(rest.strip_prefix(':').ok_or_else(invalid)?)
+                Some(
+                    rest.strip_prefix(':')
+                        .ok_or(StorageError::Message("only ':port' may appear after ']'"))?,
+                )
             };
             (host, port)
         } else {
+            if value.matches(':').count() > 1 {
+                return Err(StorageError::Message(
+                    "IPv6 addresses require square brackets",
+                ));
+            }
             let (host, port) = value
                 .split_once(':')
                 .map_or((value, None), |(h, p)| (h, Some(p)));
-            if host.is_empty() || host.contains(['[', ']', '/', ':']) {
-                return Err(invalid());
+            if host.is_empty() {
+                return Err(StorageError::Message("NTP host must not be empty"));
+            }
+            if host.contains(['[', ']', '/']) {
+                return Err(StorageError::Message(
+                    "NTP host must not contain '[', ']' or '/'",
+                ));
             }
             (host, port)
         };
@@ -49,8 +72,12 @@ impl NtpServer {
                 .parse::<u16>()
                 .ok()
                 .filter(|p| *p != 0)
-                .ok_or_else(invalid)?,
-            Some(_) => return Err(invalid()),
+                .ok_or(StorageError::Message("NTP port must be in 1..=65535"))?,
+            Some(_) => {
+                return Err(StorageError::Message(
+                    "NTP port must be a decimal integer in 1..=65535",
+                ));
+            }
         };
         Ok(Self {
             host: host.to_owned(),
@@ -73,8 +100,12 @@ impl std::fmt::Display for NtpServersError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Empty => write!(f, "ntp_servers must not be empty"),
-            Self::InvalidEntry { index, value, .. } => {
-                write!(f, "invalid ntp_servers[{index}]: {value:?}")
+            Self::InvalidEntry {
+                index,
+                value,
+                source,
+            } => {
+                write!(f, "invalid ntp_servers[{index}]: {value:?}: {source}")
             }
         }
     }
@@ -201,14 +232,19 @@ fn sync_directory(path: &Path) -> Result<(), StorageError> {
 }
 
 fn persist(path: &Path, time: UnixMillis) -> Result<(), StorageError> {
-    // Checks are serial: reuse a crash leftover instead of accumulating PID files.
+    // Checks are serial. Unlink a crash leftover so its owner/permissions cannot
+    // prevent creating a fresh temporary file under the service user's identity.
     let mut name = path.as_os_str().to_owned();
     name.push(".tmp");
     let temp = PathBuf::from(name);
+    match std::fs::remove_file(&temp) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(StorageError::io("删除残留节点校时临时文件", error)),
+    }
     let mut file = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .open(&temp)
         .map_err(|error| StorageError::io("创建节点校时临时文件", error))?;
     let result = (|| {
@@ -300,6 +336,7 @@ enum CheckResult {
     NoReply,
 }
 
+#[tracing::instrument(skip_all, fields(host = %server.host, port = server.port))]
 async fn query(server: &NtpServer, clock: &Clock) -> Result<CheckResult, sntpc::Error> {
     let addresses = tokio::net::lookup_host((server.host.as_str(), server.port))
         .await
@@ -318,12 +355,15 @@ async fn query_addresses(
             Ok(result) => return Ok(result),
             // KoD applies to the server name, not just this resolved address.
             Err(error @ sntpc::Error::KissOfDeath(_)) => return Err(error),
+            // The socket adapter already recorded the I/O error with its source.
+            Err(sntpc::Error::Network) => {}
             Err(error) => tracing::debug!(?error, %addr, "no valid NTP reply from address"),
         }
     }
     Ok(CheckResult::NoReply)
 }
 
+#[tracing::instrument(skip_all, fields(%addr))]
 async fn query_address(addr: SocketAddr, clock: &Clock) -> Result<CheckResult, sntpc::Error> {
     let bind = if addr.is_ipv4() {
         "0.0.0.0:0"
@@ -406,6 +446,8 @@ impl Checker {
                     tracing::warn!(host = %server.host, port = server.port, code = code.as_str(), "NTP server retired for this process");
                     self.retired.push(server.clone());
                 }
+                // DNS I/O errors are recorded where their source is still available.
+                Err(sntpc::Error::Network) => {}
                 Err(error) => tracing::debug!(?error, host = %server.host, "no valid NTP reply"),
             }
         }
@@ -586,6 +628,36 @@ async fn run_schedule(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing::instrument::WithSubscriber;
+
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogCapture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl LogCapture {
+        fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
+            let capture = self.clone();
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_writer(move || capture.clone())
+                .with_ansi(false)
+                .without_time()
+                .finish()
+        }
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
 
     async fn reply_once(
         kod: Option<[u8; 4]>,
@@ -700,16 +772,107 @@ mod tests {
     }
 
     #[test]
-    fn persistence_reuses_a_crash_leftover_and_truncates_it() {
+    fn persistence_replaces_an_unwritable_crash_leftover() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("boh.db-clock-sync");
         let temp = dir.path().join("boh.db-clock-sync.tmp");
         std::fs::write(&path, "123456789\n").unwrap();
         std::fs::write(&temp, "interrupted incomplete write\n").unwrap();
+        // Keep an alias to prove the old inode is replaced even in a root test run.
+        let alias = dir.path().join("leftover-alias");
+        std::fs::hard_link(&temp, &alias).unwrap();
+        let mut permissions = std::fs::metadata(&temp).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&temp, permissions).unwrap();
         persist(&path, UnixMillis(42)).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"42\n");
+        assert_eq!(
+            std::fs::read(&alias).unwrap(),
+            b"interrupted incomplete write\n"
+        );
+        std::fs::remove_file(alias).unwrap();
         assert!(!temp.exists());
         persist(&path, UnixMillis(43)).unwrap();
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_leftover_removal_keeps_the_old_signal_and_logs_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("boh.db");
+        let path = state_path(&db);
+        let temp = dir.path().join("boh.db-clock-sync.tmp");
+        let previous = UnixMillis(1_792_137_600_000);
+        let clock = boh_storage::clock::ManualClock::new(UnixMillis(1_792_137_601_000));
+        let signal = ClockSignal::new(Some(previous));
+        std::fs::write(&path, format!("{}\n", previous.0)).unwrap();
+        std::fs::create_dir(&temp).unwrap();
+        let (server, reply) = reply_once(None, 0).await;
+        let mut checker = Checker::new(
+            &db,
+            clock.clock(),
+            vec![NtpServer::parse(&server.to_string()).unwrap()],
+            signal.clone(),
+        );
+        let capture = LogCapture::default();
+        assert!(
+            checker
+                .check(None)
+                .with_subscriber(capture.subscriber())
+                .await
+        );
+        reply.await.unwrap();
+        assert_eq!(signal.snapshot(), Some(previous));
+        assert_eq!(read_state(&path), Some(previous));
+        assert!(temp.is_dir());
+        let text = capture.text();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        for part in [
+            "ERROR",
+            "删除残留节点校时临时文件",
+            "caused by",
+            "clock_sync.rs:",
+        ] {
+            assert!(text.contains(part), "missing {part}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn network_failures_emit_one_complete_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = boh_storage::clock::ManualClock::new(UnixMillis(1_792_137_600_000));
+        // Broadcast sends fail immediately; a NUL fails lookup before external DNS.
+        for (server, operation) in [
+            ("255.255.255.255:123", "发送 NTP 查询"),
+            ("bad\0host", "解析 NTP 服务器地址"),
+        ] {
+            let mut checker = Checker::new(
+                &dir.path().join("boh.db"),
+                clock.clock(),
+                vec![NtpServer::parse(server).unwrap()],
+                ClockSignal::new(None),
+            );
+            let capture = LogCapture::default();
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    checker.check(None).with_subscriber(capture.subscriber())
+                )
+                .await
+                .unwrap()
+            );
+            let text = capture.text();
+            assert_eq!(text.lines().count(), 1, "{text}");
+            for part in [
+                operation,
+                "caused by",
+                "clock_sync.rs:",
+                "host=",
+                "port=",
+                "NTP network unavailable",
+            ] {
+                assert!(text.contains(part), "missing {part}: {text}");
+            }
+        }
     }
 }

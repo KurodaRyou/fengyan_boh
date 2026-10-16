@@ -138,14 +138,30 @@ ntp_servers = ["ntp.aliyun.com"]
     }
 
     #[test]
-    fn ntp_error_identifies_the_invalid_entry() {
-        let text = VALID.replace(
-            "[\"ntp.aliyun.com\"]",
-            "[\"ntp.aliyun.com\", \"bad.example:0\"]",
-        );
-        let error = parse_config(&text).unwrap_err().to_string();
-        assert!(error.contains("ntp_servers[1]"), "{error}");
-        assert!(error.contains("bad.example:0"), "{error}");
+    fn ntp_error_identifies_the_invalid_entry_and_reason() {
+        for (entry, reason) in [
+            ("", "must not be empty"),
+            ("bad host", "whitespace"),
+            ("[::1", "closing ']'"),
+            ("[bad]:123", "valid IPv6"),
+            ("[::1]tail", "after ']'"),
+            ("::1", "square brackets"),
+            (":123", "host must not be empty"),
+            ("bad/host", "host must not contain"),
+            ("host:0", "1..=65535"),
+            ("host:65536", "1..=65535"),
+            ("host:abc", "decimal integer"),
+            ("host:", "decimal integer"),
+        ] {
+            let text = VALID.replace(
+                "[\"ntp.aliyun.com\"]",
+                &format!("[\"ntp.aliyun.com\", {entry:?}]"),
+            );
+            let error = parse_config(&text).unwrap_err().to_string();
+            assert!(error.contains("ntp_servers[1]"), "{error}");
+            assert!(error.contains(&format!("{entry:?}")), "{error}");
+            assert!(error.contains(reason), "missing {reason}: {error}");
+        }
     }
 
     #[test]
