@@ -36,7 +36,7 @@ fn request(n: u16, supplier_id: &str, item_id: &str, expiries: &[&str]) -> Value
         .collect();
     json!({
         "command_id": master_command_id(n), "supplier_id": supplier_id, "lines": lines,
-        "captured_at": NOW + 60_000, "sent_at": NOW
+        "occurred_at": NOW + 60_000, "clock_synced_at": NOW
     })
 }
 
@@ -78,11 +78,11 @@ async fn concurrent_retries_share_lots_and_preserve_warnings_at_an_invalid_clock
     );
     assert_eq!(first.0, 200, "{first:?}");
     assert_eq!(first, second);
-    assert_eq!(first.1["warnings"].as_array().unwrap().len(), 2);
+    assert_eq!(first.1["warnings"].as_array().unwrap().len(), 1);
     assert_eq!(receipt_counts(&node).await, (3, 3, 2, 2, 3));
     node.clock.set(UnixMillis(i64::MAX));
     let mut retry = original;
-    retry["sent_at"] = json!(i64::MIN);
+    retry["clock_synced_at"] = json!(i64::MIN);
     assert_eq!(
         send(node.router.clone(), Method::POST, URI, retry).await,
         first
@@ -177,8 +177,7 @@ async fn expiry_warnings_skip_depleted_and_undated_lots_and_do_not_look_ahead() 
     )
     .await;
     assert_eq!(next.0, 200);
-    assert_eq!(next.1["warnings"].as_array().unwrap().len(), 1);
-    assert_eq!(next.1["warnings"][0]["code"], "CAPTURE_TIME_ADJUSTED");
+    assert_eq!(next.1["warnings"], json!([]));
     node.storage
         .writer
         .call(move |tx| -> Result<(), StorageError> {
@@ -204,8 +203,8 @@ async fn expiry_warnings_skip_depleted_and_undated_lots_and_do_not_look_ahead() 
     )
     .await;
     assert_eq!(last.0, 200);
-    assert_eq!(last.1["warnings"].as_array().unwrap().len(), 2);
-    assert_eq!(last.1["warnings"][1]["details"]["line"], 2);
+    assert_eq!(last.1["warnings"].as_array().unwrap().len(), 1);
+    assert_eq!(last.1["warnings"][0]["details"]["line"], 2);
     node.storage.writer_handle.shutdown().await.unwrap();
 }
 
@@ -217,6 +216,7 @@ async fn receipt_dates_use_configured_timezone_and_replay_preserves_the_saved_ex
         writer: node.storage.writer.clone(),
         readers: node.storage.readers.clone(),
         clock: node.clock.clock(),
+        clock_signal: crate::clock_sync::ClockSignal::new(Some(node.clock.clock().now())),
         timezone: parse_timezone("America/Los_Angeles").unwrap(),
         business_day_cutoff: parse_business_day_cutoff("04:00").unwrap(),
         dev_actor_stub: true,
@@ -279,7 +279,7 @@ async fn expiry_past_9998_is_a_value_error_checked_before_idempotency() {
 
 #[tokio::test]
 async fn concurrent_receipts_get_distinct_serials_even_when_the_clock_moves_backwards() {
-    let node = node(true).await;
+    let mut node = node(true).await;
     let (item, supplier) = seed(&node).await;
     let (first, second) = tokio::join!(
         send(
@@ -308,13 +308,11 @@ async fn concurrent_receipts_get_distinct_serials_even_when_the_clock_moves_back
     lots.sort_unstable();
     assert_eq!(lots, ["RAW-FLOUR-20261006-001", "RAW-FLOUR-20261006-002"]);
     node.clock.set(UnixMillis(NOW - 60_000));
-    let third = send(
-        node.router.clone(),
-        Method::POST,
-        URI,
-        request(5, &supplier, &item, &["2026-10-20"]),
-    )
-    .await;
+    node.router = router_synced_at(&node, UnixMillis(NOW - 60_000));
+    let mut third_request = request(5, &supplier, &item, &["2026-10-20"]);
+    third_request["occurred_at"] = json!(NOW);
+    third_request["clock_synced_at"] = json!(NOW - 60_000);
+    let third = send(node.router.clone(), Method::POST, URI, third_request).await;
     assert_eq!(third.0, 200, "{third:?}");
     assert_eq!(
         third.1["data"]["receipt"]["lines"][0]["lot_id"],
@@ -371,7 +369,7 @@ async fn inventory_includes_negative_lots_and_shortfalls_and_lookup_retains_zero
         negative,
         &json!({
             "lot_id": "RAW-FLOUR-20261006-002", "origin": "RECEIPT", "remaining_qty": "-3",
-            "source_occurred_at": NOW,
+            "source_occurred_at": NOW + 60_000,
         })
     );
     let (status, lookup) = send(

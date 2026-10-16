@@ -14,7 +14,7 @@ use boh_domain::equipment::{
 use boh_domain::temperature::{
     LogTemperature, TemperatureLogged, TemperatureQuery, TemperatureReading,
 };
-use boh_domain::time::{CaptureTimes, business_date, calibrate};
+use boh_domain::time::{CaptureTimes, business_date, check_capture_times};
 use boh_domain::{AggregateId, CommandId, EventId, UnixMillis};
 use boh_storage::StorageError;
 use boh_storage::ledger::{self, Command, Event, ExecuteError, Ledger};
@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 use crate::{
     AppState,
     actor::Actor,
-    http::{ApiError, WarningBody, ok},
+    http::{ApiError, ok},
 };
 
 impl From<ExecuteError> for ApiError {
@@ -63,6 +63,7 @@ pub async fn create(
                     recorded_at,
                 },
                 |ledger| {
+                    check_node_clock(&state, recorded_at)?;
                     let existing: Option<String> = tx
                         .query_row(
                             "SELECT id FROM equipment WHERE code = ?1",
@@ -120,6 +121,7 @@ pub async fn update(
                     recorded_at,
                 },
                 |ledger| {
+                    check_node_clock(&state, recorded_at)?;
                     let current = tx
                         .query_row(
                             "SELECT id, code, name, equipment_type, active, revision
@@ -203,17 +205,18 @@ pub async fn log_temperature(
                     recorded_at,
                 },
                 |ledger| {
-                    let calibrated = calibrate(
+                    check_node_clock(&state, recorded_at)?;
+                    check_capture_times(
                         CaptureTimes {
-                            captured_at: command.captured_at,
-                            sent_at: command.sent_at,
-                            started_captured_at: None,
+                            occurred_at: command.occurred_at,
+                            clock_synced_at: command.clock_synced_at,
+                            started_at: None,
                         },
                         recorded_at,
                     )
                     .map_err(ApiError::from)?;
                     let date = business_date(
-                        calibrated.occurred_at,
+                        command.occurred_at,
                         &state.timezone,
                         state.business_day_cutoff,
                     )
@@ -244,7 +247,7 @@ pub async fn log_temperature(
                         celsius_x10: command.celsius_x10,
                         note: command.note,
                         business_date: date.to_string(),
-                        occurred_at: calibrated.occurred_at,
+                        occurred_at: command.occurred_at,
                         recorded_at,
                         actor_id: actor.employee_id,
                         device_id: actor.device_id,
@@ -263,16 +266,11 @@ pub async fn log_temperature(
                         business_date: row.business_date.clone(),
                         occurred_at: row.occurred_at,
                         recorded_at,
+                        clock_synced_at: Some(command.clock_synced_at),
                         payload,
                     })?;
-                    let mut response = ok(json!({ "temperature_reading": row })).0;
-                    if calibrated.capture_time_adjusted {
-                        response.warnings.push(WarningBody {
-                            code: "CAPTURE_TIME_ADJUSTED",
-                            message: "capture time adjusted to the receiving time".into(),
-                            details: Default::default(),
-                        });
-                    }
+                    let response = ok(json!({ "temperature_reading": row })).0;
+
                     // Save the entire envelope so retries preserve the original warning and times.
                     serde_json::to_string(&response).map_err(|error| {
                         ApiError::from(StorageError::external("保存温度命令响应", error))
@@ -385,7 +383,7 @@ fn normalized(
         .map_err(|error| ApiError::from(StorageError::external(operation, error)))?;
     let object = value.as_object_mut().ok_or_else(ApiError::validation)?;
     object.remove("command_id");
-    object.remove("sent_at");
+    object.remove("clock_synced_at");
     if let Some(id) = id {
         object.insert("equipment_id".into(), json!(id));
     }
@@ -433,7 +431,16 @@ fn append(
         business_date: date.to_string(),
         occurred_at: recorded_at,
         recorded_at,
+        clock_synced_at: None,
         payload,
     })?;
     Ok(())
+}
+
+fn check_node_clock(state: &AppState, recorded_at: UnixMillis) -> Result<(), ApiError> {
+    if state.clock_signal.valid(recorded_at) {
+        Ok(())
+    } else {
+        Err(ApiError::clock_not_synced())
+    }
 }

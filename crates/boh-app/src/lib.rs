@@ -2,6 +2,7 @@
 
 pub mod actor;
 pub mod background;
+pub mod clock_sync;
 pub mod http;
 mod invariant_check;
 pub use invariant_check::InvariantCheckHealth;
@@ -33,6 +34,7 @@ pub struct AppState {
     pub writer: Writer,
     pub readers: Readers,
     pub clock: Clock,
+    pub clock_signal: clock_sync::ClockSignal,
     pub timezone: StoreTimeZone,
     pub business_day_cutoff: BusinessDayCutoff,
     pub dev_actor_stub: bool,
@@ -43,7 +45,11 @@ pub struct AppState {
 
 /// 构造与生产入口共用路由的 HTTP 黑盒测试入口。
 #[doc(hidden)]
-pub fn test_router(db_path: &Path, clock: Clock) -> Result<Router, StorageError> {
+pub fn test_router(
+    db_path: &Path,
+    clock: Clock,
+    clock_synced_at: Option<boh_domain::UnixMillis>,
+) -> Result<Router, StorageError> {
     let storage = boh_storage::open(db_path, NonZeroUsize::MIN)?;
     let store_id = StoreId::parse("01890a5d-ac96-774b-bcce-b302099a8050")?;
     let created_at = clock.now();
@@ -62,6 +68,7 @@ pub fn test_router(db_path: &Path, clock: Clock) -> Result<Router, StorageError>
         writer: storage.writer,
         readers: storage.readers,
         clock,
+        clock_signal: clock_sync::ClockSignal::new(clock_synced_at),
         timezone,
         business_day_cutoff,
         dev_actor_stub: true,
@@ -77,6 +84,7 @@ pub struct TestNodeConfig {
     pub backup_keep_count: NonZeroU32,
     pub timezone: String,
     pub closing_backup_time: String,
+    pub ntp_servers: Vec<String>,
 }
 
 #[doc(hidden)]
@@ -84,6 +92,7 @@ pub struct TestNode {
     pub router: Router,
     backup: Backup,
     tasks: background::BackupTasks,
+    clock_tasks: clock_sync::ClockTasks,
     writer_handle: boh_storage::WriterHandle,
     writer: Writer,
 }
@@ -106,10 +115,22 @@ impl TestNode {
         self.tasks.hold_invariant_checks()
     }
 
+    pub async fn wait_clock_checks(&self, count: u64) {
+        self.clock_tasks.wait_checks(count).await;
+    }
+
+    pub async fn wait_clock_ticks(&self, count: u64) {
+        self.clock_tasks.wait_ticks(count).await;
+    }
+
     pub async fn shutdown(self) -> Result<(), StorageError> {
         drop(self.router);
+        self.clock_tasks.stop_handle().stop();
+        self.tasks.stop_handle().stop();
+        let clock_stopped = self.clock_tasks.shutdown().await;
         let stopped = self.tasks.shutdown().await;
         let closed = self.writer_handle.shutdown().await;
+        clock_stopped?;
         stopped?;
         closed
     }
@@ -124,6 +145,14 @@ pub async fn test_node(
     let store_id = StoreId::parse("01890a5d-ac96-774b-bcce-b302099a8050")?;
     let timezone = parse_timezone(&config.timezone)?;
     let closing = parse_closing_backup_time(&config.closing_backup_time)?;
+    if config.ntp_servers.is_empty() {
+        return Err(StorageError::Message("ntp_servers must not be empty"));
+    }
+    let servers = config
+        .ntp_servers
+        .iter()
+        .map(|s| clock_sync::NtpServer::parse(s))
+        .collect::<Result<Vec<_>, _>>()?;
     let backup = Backup::prepare(
         db_path,
         &config.backup_dir,
@@ -157,10 +186,14 @@ pub async fn test_node(
             return Err(error);
         }
     };
+    let clock_signal = clock_sync::ClockSignal::load(db_path).await;
+    let clock_tasks =
+        clock_sync::ClockTasks::start(db_path, clock.clone(), servers, clock_signal.clone()).await;
     let router = http::router(AppState {
         writer: storage.writer.clone(),
         readers: storage.readers,
         clock,
+        clock_signal,
         timezone,
         business_day_cutoff: parse_business_day_cutoff("04:00")?,
         dev_actor_stub: true,
@@ -172,6 +205,7 @@ pub async fn test_node(
         router,
         backup,
         tasks,
+        clock_tasks,
         writer_handle: storage.writer_handle,
         writer: storage.writer,
     })

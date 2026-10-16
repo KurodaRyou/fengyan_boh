@@ -4,6 +4,8 @@
 store_id = "01890a5d-ac96-774b-bcce-b302099a8050"
 timezone = "Asia/Shanghai"
 business_day_cutoff = "04:00"
+# 按顺序核对；init 无有效校时状态时需要能访问其中一个服务器。
+ntp_servers = ["ntp.aliyun.com", "ntp.tencent.com"]
 db_path = "boh-dev.db"
 backup_dir = "boh-dev-backups"
 listen_addr = "127.0.0.1:8080"

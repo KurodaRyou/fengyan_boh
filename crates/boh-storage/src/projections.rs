@@ -187,6 +187,7 @@ fn read_event(row: &Row<'_>) -> rusqlite::Result<Event> {
         occurred_at: UnixMillis(row.get(10)?),
         recorded_at: UnixMillis(row.get(11)?),
         payload: row.get(12)?,
+        clock_synced_at: row.get::<_, Option<i64>>(14)?.map(UnixMillis),
     })
 }
 
@@ -197,7 +198,7 @@ pub(crate) fn rebuild(tx: &Transaction<'_>) -> Result<u64, StorageError> {
     }
     let mut statement = tx.prepare(
         "SELECT id, event_type, schema_version, aggregate_type, aggregate_id, aggregate_version,
-                command_id, actor_id, device_id, business_date, occurred_at, recorded_at, payload, seq
+                command_id, actor_id, device_id, business_date, occurred_at, recorded_at, payload, seq, clock_synced_at
          FROM store_events ORDER BY seq",
     ).map_err(|error| StorageError::sqlite("准备查询事件账本", error))?;
     let mut rows = statement
@@ -400,6 +401,7 @@ mod tests {
                     aggregate_version: 1, command_id: CommandId::parse(id)?,
                     actor_id: AggregateId::parse(item_id)?, device_id: AggregateId::parse(item_id)?,
                     business_date: "2026-10-06".into(), occurred_at: UnixMillis(0), recorded_at: UnixMillis(0),
+                    clock_synced_at: None,
                     payload: payload.to_string(),
                 };
                 ledger::execute::<ExecuteError, _>(tx, Command {

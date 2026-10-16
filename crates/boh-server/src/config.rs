@@ -9,6 +9,8 @@ use boh_domain::time::{
 };
 use serde::{Deserialize, Deserializer};
 
+pub use boh_app::clock_sync::NtpServer;
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -28,6 +30,19 @@ pub struct Config {
     pub backup_keep_count: NonZeroU32,
     #[serde(default, deserialize_with = "closing_backup_time")]
     pub closing_backup_time: ClosingBackupTime,
+    #[serde(deserialize_with = "ntp_servers")]
+    pub ntp_servers: Vec<NtpServer>,
+}
+
+fn ntp_servers<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<NtpServer>, D::Error> {
+    let values = Vec::<String>::deserialize(de)?;
+    if values.is_empty() {
+        return Err(serde::de::Error::custom("ntp_servers must not be empty"));
+    }
+    values
+        .iter()
+        .map(|value| NtpServer::parse(value).map_err(serde::de::Error::custom))
+        .collect()
 }
 
 fn default_backup_keep_count() -> NonZeroU32 {
@@ -74,6 +89,7 @@ listen_addr = "127.0.0.1:8080"
 timezone = "Asia/Shanghai"
 business_day_cutoff = "04:00"
 backup_dir = "backups"
+ntp_servers = ["ntp.aliyun.com"]
 "#;
 
     #[test]

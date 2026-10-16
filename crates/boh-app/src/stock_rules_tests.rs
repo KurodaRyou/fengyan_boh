@@ -35,7 +35,7 @@ fn receipt(item: &str, supplier: &str, count: usize) -> Value {
     let line = json!({"item_id": item, "input": {"qty":"5", "unit_code": "g", "base_qty_per_unit":"1"},
         "produced_on": "2026-10-01", "expires_on": "2026-10-20", "line_cost_cents": 0});
     json!({"command_id": master_command_id(3), "supplier_id": supplier, "lines": vec![line; count],
-        "captured_at": NOW, "sent_at": NOW})
+        "occurred_at": NOW, "clock_synced_at": NOW})
 }
 
 fn waste(item: &str) -> Value {
@@ -53,7 +53,7 @@ async fn assert_waste_error(
         ("/api/v1/waste-records/precheck", json!({"lines": lines})),
         (
             WASTE,
-            json!({"command_id": master_command_id(4), "lines": lines, "captured_at": NOW, "sent_at": NOW}),
+            json!({"command_id": master_command_id(4), "lines": lines, "occurred_at": NOW, "clock_synced_at": NOW}),
         ),
     ] {
         let (actual, reply) = send(node.router.clone(), Method::POST, uri, body).await;
@@ -265,7 +265,7 @@ async fn waste_accepts_intermediate_sum_above_stock_limit_and_updates_the_next_l
     )
     .await;
     assert_eq!(precheck.0, 200, "{precheck:?}");
-    let logged = send(node.router.clone(), Method::POST, WASTE, json!({"command_id": master_command_id(4), "lines": lines, "captured_at": NOW, "sent_at": NOW})).await;
+    let logged = send(node.router.clone(), Method::POST, WASTE, json!({"command_id": master_command_id(4), "lines": lines, "occurred_at": NOW, "clock_synced_at": NOW})).await;
     assert_eq!(logged.0, 200, "{logged:?}");
     for (index, qty) in ["1000000000", "999999999"].into_iter().enumerate() {
         assert_eq!(precheck.1["data"]["lines"][index]["item_book_qty"], qty);
@@ -350,7 +350,7 @@ async fn receipt_validation_order_and_command_local_serial_exhaustion_are_preser
         reply.1["error"]["details"],
         json!({"entity": "SUPPLIER", "id": UNKNOWN})
     );
-    body["captured_at"] = json!(NOW - 259_200_001);
+    body["occurred_at"] = json!(NOW - 259_200_001);
     let reply = send(node.router.clone(), Method::POST, RECEIPTS, body).await;
     assert_eq!(reply.1["error"]["code"], "CAPTURE_TOO_OLD");
     node.storage.writer_handle.shutdown().await.unwrap();
@@ -383,7 +383,7 @@ async fn interleaved_items_keep_separate_balances_and_serials() {
     first["lot_id"] = json!("RAW-FLOUR-20261006-001");
     first["input"]["qty"] = json!("6");
     first["confirm_shortage"] = json!(true);
-    let command = json!({"command_id": master_command_id(4), "lines": [first, waste(sugar), waste(&flour)], "captured_at": NOW, "sent_at": NOW});
+    let command = json!({"command_id": master_command_id(4), "lines": [first, waste(sugar), waste(&flour)], "occurred_at": NOW, "clock_synced_at": NOW});
     let reply = send(node.router.clone(), Method::POST, WASTE, command).await;
     assert_eq!(reply.0, 200, "{reply:?}");
     for (index, book) in ["10", "5", "4"].into_iter().enumerate() {
@@ -423,18 +423,18 @@ async fn normalized_requests_and_saved_responses_keep_their_exact_text() {
     let node = node(true).await;
     let (item, supplier) = seed(&node).await;
     let mut command = receipt(&item, &supplier, 2);
-    command["captured_at"] = json!(NOW + 60_000);
+    command["occurred_at"] = json!(NOW + 60_000);
     command["lines"][1]["expires_on"] = json!("2026-10-15");
     let received = send(node.router.clone(), Method::POST, RECEIPTS, command.clone()).await;
     assert_eq!(received.0, 200, "{received:?}");
     let saved = saved_command(&node, master_command_id(3)).await;
     let request = format!(
-        r#"{{"captured_at":{},"lines":[{{"expires_on":"2026-10-20","input":{{"base_qty_per_unit":"1","qty":"5","unit_code":"g"}},"item_id":"{item}","line_cost_cents":0,"produced_on":"2026-10-01"}},{{"expires_on":"2026-10-15","input":{{"base_qty_per_unit":"1","qty":"5","unit_code":"g"}},"item_id":"{item}","line_cost_cents":0,"produced_on":"2026-10-01"}}],"supplier_id":"{supplier}"}}"#,
+        r#"{{"lines":[{{"expires_on":"2026-10-20","input":{{"base_qty_per_unit":"1","qty":"5","unit_code":"g"}},"item_id":"{item}","line_cost_cents":0,"produced_on":"2026-10-01"}},{{"expires_on":"2026-10-15","input":{{"base_qty_per_unit":"1","qty":"5","unit_code":"g"}},"item_id":"{item}","line_cost_cents":0,"produced_on":"2026-10-01"}}],"occurred_at":{},"supplier_id":"{supplier}"}}"#,
         NOW + 60_000
     );
     assert_eq!(saved.0, request);
     let warnings = format!(
-        r#"[{{"code":"CAPTURE_TIME_ADJUSTED","message":"capture time adjusted to the receiving time","details":{{}}}},{{"code":"EXPIRES_BEFORE_OLDER_STOCK","message":"new lot expires before stock used first","details":{{"item_id":"{item}","line":1,"lot_id":"RAW-FLOUR-20261006-002"}}}}]"#
+        r#"[{{"code":"EXPIRES_BEFORE_OLDER_STOCK","message":"new lot expires before stock used first","details":{{"item_id":"{item}","line":1,"lot_id":"RAW-FLOUR-20261006-002"}}}}]"#
     );
     assert_eq!(
         saved.1,
@@ -443,7 +443,7 @@ async fn normalized_requests_and_saved_responses_keep_their_exact_text() {
             received.1["data"]
         )
     );
-    command["sent_at"] = json!(i64::MIN);
+    command["clock_synced_at"] = json!(i64::MIN);
     assert_eq!(
         send(node.router.clone(), Method::POST, RECEIPTS, command).await,
         received
@@ -452,14 +452,14 @@ async fn normalized_requests_and_saved_responses_keep_their_exact_text() {
 
     let mut line = waste(&item);
     line["confirm_shortage"] = json!(false);
-    let mut command = json!({"command_id": master_command_id(4), "lines": [line], "captured_at": NOW, "sent_at": NOW});
+    let mut command = json!({"command_id": master_command_id(4), "lines": [line], "occurred_at": NOW, "clock_synced_at": NOW});
     let logged = send(node.router.clone(), Method::POST, WASTE, command.clone()).await;
     assert_eq!(logged.0, 200, "{logged:?}");
     let saved = saved_command(&node, master_command_id(4)).await;
     assert_eq!(
         saved.0,
         format!(
-            r#"{{"captured_at":{NOW},"lines":[{{"input":{{"base_qty_per_unit":"1","qty":"1","unit_code":"g"}},"item_id":"{item}","reason_code":"EXPIRED"}}]}}"#
+            r#"{{"lines":[{{"input":{{"base_qty_per_unit":"1","qty":"1","unit_code":"g"}},"item_id":"{item}","reason_code":"EXPIRED"}}],"occurred_at":{NOW}}}"#
         )
     );
     assert_eq!(
@@ -473,7 +473,7 @@ async fn normalized_requests_and_saved_responses_keep_their_exact_text() {
         .as_object_mut()
         .unwrap()
         .remove("confirm_shortage");
-    command["sent_at"] = json!(i64::MIN);
+    command["clock_synced_at"] = json!(i64::MIN);
     assert_eq!(
         send(node.router.clone(), Method::POST, WASTE, command).await,
         logged

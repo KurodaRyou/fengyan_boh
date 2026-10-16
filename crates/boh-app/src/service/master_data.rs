@@ -142,6 +142,7 @@ impl Write<'_> {
             business_date: date.to_string(),
             occurred_at: self.recorded_at,
             recorded_at: self.recorded_at,
+            clock_synced_at: None,
             payload: serde_json::to_string(&payload).map_err(|error| {
                 ApiError::from(StorageError::external("序列化主数据事件", error))
             })?,
@@ -174,6 +175,7 @@ where
                     recorded_at,
                 },
                 |ledger| {
+                    super::check_node_clock(&state, recorded_at)?;
                     run(&Write {
                         tx,
                         ledger,
@@ -720,6 +722,7 @@ pub async fn initialize_store(
     clock: Clock,
     timezone: StoreTimeZone,
     cutoff: BusinessDayCutoff,
+    signal: crate::clock_sync::ClockSignal,
 ) -> Result<(), ExecuteError> {
     writer
         .call(move |tx| {
@@ -736,6 +739,9 @@ pub async fn initialize_store(
                     recorded_at,
                 },
                 |ledger| -> Result<String, ExecuteError> {
+                    if !signal.valid(recorded_at) {
+                        return Err(StorageError::Message("node clock is not synchronized").into());
+                    }
                     boh_storage::store::initialize(tx, store_id, recorded_at)?;
                     let date = business_date(recorded_at, &timezone, cutoff)
                         .map_err(|error| StorageError::external("计算门店初始化营业日", error))?;
@@ -776,6 +782,7 @@ pub async fn initialize_store(
                             business_date: date.to_string(),
                             occurred_at: recorded_at,
                             recorded_at,
+                            clock_synced_at: None,
                             payload: serde_json::to_string(&payload).map_err(|error| {
                                 StorageError::external("序列化预置报损原因事件", error)
                             })?,

@@ -138,6 +138,7 @@ async fn enqueued_failure_still_logs_once_after_the_caller_drops_its_future() {
         writer: node.storage.writer.clone(),
         readers: node.storage.readers.clone(),
         clock: node.clock.clock(),
+        clock_signal: crate::clock_sync::ClockSignal::new(Some(node.clock.clock().now())),
         timezone: boh_domain::time::parse_timezone("Asia/Shanghai").unwrap(),
         business_day_cutoff: boh_domain::time::parse_business_day_cutoff("04:00").unwrap(),
         dev_actor_stub: true,

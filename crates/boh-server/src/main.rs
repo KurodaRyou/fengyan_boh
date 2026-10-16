@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use boh_app::background::BackupTasks;
+use boh_app::clock_sync::{ClockSignal, ClockTasks, ensure_synchronized};
 use boh_app::{AppState, InvariantCheckHealth, http};
 use boh_server::config::{Config, parse_config};
 use boh_storage::backup::{Backup, BackupHealth};
@@ -66,12 +67,16 @@ async fn run(
     let clock = Clock::system();
     let store_id = config.store_id;
     if operation == Operation::Init {
+        let clock_signal = ensure_synchronized(&config.db_path, clock.clone(), config.ntp_servers)
+            .await
+            .context("synchronize node clock before initialization")?;
         boh_app::initialize_store(
             writer,
             store_id,
             clock,
             config.timezone,
             config.business_day_cutoff,
+            clock_signal,
         )
         .await
         .context("initialize store")?;
@@ -83,13 +88,11 @@ async fn run(
         .await
         .context("verify store identity; run init for a new node")?;
     if operation == Operation::Rebuild {
-        tracing::info!(
-            replayed = writer
-                .rebuild_projections()
-                .await
-                .context("rebuild projections")?,
-            "projections rebuilt"
-        );
+        let replayed = writer
+            .rebuild_projections()
+            .await
+            .context("rebuild projections")?;
+        tracing::info!(replayed, "projections rebuilt");
         return Ok(());
     }
 
@@ -117,19 +120,32 @@ async fn run(
         invariant_health.clone(),
     )
     .context("start backup scheduler and submit startup invariant check")?;
+    let clock_signal = ClockSignal::load(&config.db_path).await;
+    let clock_tasks = ClockTasks::start(
+        &config.db_path,
+        clock.clone(),
+        config.ntp_servers,
+        clock_signal.clone(),
+    )
+    .await;
     let stop_backups = tasks.stop_handle();
+    let stop_clock = clock_tasks.stop_handle();
+    let signal_stop_backups = stop_backups.clone();
+    let signal_stop_clock = stop_clock.clone();
     let shutdown = async move {
         tokio::select! {
             _ = sigterm.recv() => {}
             _ = sigint.recv() => {}
         }
-        stop_backups.stop();
+        signal_stop_backups.stop();
+        signal_stop_clock.stop();
         tracing::info!("shutdown signal received");
     };
     let app = http::router(AppState {
         writer,
         readers,
         clock,
+        clock_signal,
         timezone: config.timezone,
         business_day_cutoff: config.business_day_cutoff,
         dev_actor_stub: config.dev_actor_stub,
@@ -143,14 +159,14 @@ async fn run(
         .await
         .context("http server");
 
-    tracing::info!("http stopped, draining backups and invariant checks");
-    let stopped = tasks
-        .shutdown()
-        .await
-        .context("drain and stop backups, closing flows and invariant checks");
+    stop_backups.stop();
+    stop_clock.stop();
+    tracing::info!("http stopped, draining background tasks");
+    let (backups_stopped, clock_stopped) = tokio::join!(tasks.shutdown(), clock_tasks.shutdown());
     tracing::info!("background tasks stopped, draining writer");
     served?;
-    stopped?;
+    backups_stopped.context("drain and stop backups, closing flows and invariant checks")?;
+    clock_stopped.context("drain clock state persistence and stop clock checks")?;
     Ok(())
 }
 
@@ -165,11 +181,32 @@ fn cli(args: &[String]) -> anyhow::Result<(Operation, PathBuf)> {
     let (operation, path) = match args {
         [] => (Operation::Serve, DEFAULT_CONFIG_PATH),
         [command] if command == "init" => (Operation::Init, DEFAULT_CONFIG_PATH),
-        [command] if command == "rebuild-projections" => (Operation::Rebuild, DEFAULT_CONFIG_PATH),
-        [path] => (Operation::Serve, path.as_str()),
+        [path] if path != "rebuild-projections" => (Operation::Serve, path.as_str()),
         [command, path] if command == "init" => (Operation::Init, path.as_str()),
         [command, path] if command == "rebuild-projections" => (Operation::Rebuild, path.as_str()),
         _ => anyhow::bail!("usage: boh-server [init | rebuild-projections] [config file]"),
     };
     Ok((operation, PathBuf::from(path)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rebuild_requires_exactly_one_explicit_config_path() {
+        for args in [
+            vec!["rebuild-projections"],
+            vec!["rebuild-projections", "config.toml", "extra"],
+            vec!["rebuild-projection", "config.toml"],
+        ] {
+            let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+            assert!(cli(&args).is_err(), "{args:?}");
+        }
+        let args = ["rebuild-projections".to_owned(), "config.toml".to_owned()];
+        assert!(matches!(
+            cli(&args),
+            Ok((Operation::Rebuild, path)) if path == std::path::Path::new("config.toml")
+        ));
+    }
 }
