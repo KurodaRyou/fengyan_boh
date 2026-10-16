@@ -16,8 +16,8 @@ pub struct LogTemperature {
         deserialize_with = "crate::present"
     )]
     pub note: Option<String>,
-    pub captured_at: UnixMillis,
-    pub sent_at: UnixMillis,
+    pub occurred_at: UnixMillis,
+    pub clock_synced_at: UnixMillis,
 }
 
 impl LogTemperature {

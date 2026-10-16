@@ -1,4 +1,4 @@
-//! 相对校准与门店营业日；不读取系统时间或宿主时区。
+//! 发生时间校验、校时信号与门店营业日；不读取系统时间或宿主时区。
 
 use std::fmt;
 
@@ -10,23 +10,20 @@ use jiff::tz::{TimeZone, TimeZoneDatabase};
 use crate::UnixMillis;
 
 const MAX_CAPTURE_LAG_MS: i64 = 259_200_000;
+const MAX_CLOCK_LEAD_MS: i64 = 60_000;
+const CLOCK_SIGNAL_VALID_MS: i64 = 604_800_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CaptureTimes {
-    pub captured_at: UnixMillis,
-    pub sent_at: UnixMillis,
-    pub started_captured_at: Option<UnixMillis>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Calibrated {
     pub occurred_at: UnixMillis,
     pub started_at: Option<UnixMillis>,
-    pub capture_time_adjusted: bool,
+    pub clock_synced_at: UnixMillis,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum TimeError {
+    #[error("client clock is not synchronized")]
+    ClientClockNotSynced,
     #[error("capture is more than 72 hours old")]
     CaptureTooOld,
     #[error("production start is after completion")]
@@ -35,55 +32,48 @@ pub enum TimeError {
     OutOfRange,
 }
 
-/// 按生产顺序、差值溢出、72 小时上限、负值归零、换算溢出的顺序判定。
-pub fn calibrate(times: CaptureTimes, recorded_at: UnixMillis) -> Result<Calibrated, TimeError> {
+/// 只校验前端给出的时间，不推算或调整；i64 极值仍按数学上的整数比较。
+pub fn check_capture_times(times: CaptureTimes, recorded_at: UnixMillis) -> Result<(), TimeError> {
+    // 超出 i64 的界限对 i64 输入不可达，截到对应端点不改变比较结果。
+    let latest = recorded_at
+        .0
+        .checked_add(MAX_CLOCK_LEAD_MS)
+        .unwrap_or(i64::MAX);
+    let earliest_sync = recorded_at
+        .0
+        .checked_sub(CLOCK_SIGNAL_VALID_MS)
+        .unwrap_or(i64::MIN);
+    if !(earliest_sync..=latest).contains(&times.clock_synced_at.0)
+        || times.occurred_at.0 > latest
+        || times.started_at.is_some_and(|start| start.0 > latest)
+    {
+        return Err(TimeError::ClientClockNotSynced);
+    }
+    let earliest_capture = recorded_at
+        .0
+        .checked_sub(MAX_CAPTURE_LAG_MS)
+        .unwrap_or(i64::MIN);
+    if times.occurred_at.0 < earliest_capture
+        || times
+            .started_at
+            .is_some_and(|start| start.0 < earliest_capture)
+    {
+        return Err(TimeError::CaptureTooOld);
+    }
     if times
-        .started_captured_at
-        .is_some_and(|start| start > times.captured_at)
+        .started_at
+        .is_some_and(|start| start > times.occurred_at)
     {
         return Err(TimeError::InvalidProductionTime);
     }
-    let lag = times
-        .sent_at
-        .0
-        .checked_sub(times.captured_at.0)
-        .ok_or(TimeError::OutOfRange)?;
-    let start_lag = times
-        .started_captured_at
-        .map(|start| {
-            times
-                .sent_at
-                .0
-                .checked_sub(start.0)
-                .ok_or(TimeError::OutOfRange)
-        })
-        .transpose()?;
-    if lag > MAX_CAPTURE_LAG_MS || start_lag.is_some_and(|lag| lag > MAX_CAPTURE_LAG_MS) {
-        return Err(TimeError::CaptureTooOld);
-    }
-    let capture_time_adjusted = lag < 0 || start_lag.is_some_and(|lag| lag < 0);
-    let lag = lag.max(0);
-    let start_lag = start_lag.map(|lag| lag.max(0));
-    let occurred_at = UnixMillis(
-        recorded_at
-            .0
-            .checked_sub(lag)
-            .ok_or(TimeError::OutOfRange)?,
-    );
-    let started_at = start_lag
-        .map(|lag| {
-            recorded_at
-                .0
-                .checked_sub(lag)
-                .map(UnixMillis)
-                .ok_or(TimeError::OutOfRange)
-        })
-        .transpose()?;
-    Ok(Calibrated {
-        occurred_at,
-        started_at,
-        capture_time_adjusted,
-    })
+    Ok(())
+}
+
+/// 节点信号没有前端的 1 分钟领先容差；回拨到上次校时之前即无效。
+pub fn clock_signal_valid(last_synced_at: UnixMillis, now: UnixMillis) -> bool {
+    now.0
+        .checked_sub(last_synced_at.0)
+        .is_some_and(|age| (0..=CLOCK_SIGNAL_VALID_MS).contains(&age))
 }
 
 #[derive(Debug, Clone)]

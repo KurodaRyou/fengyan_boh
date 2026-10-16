@@ -4,6 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use boh_domain::UnixMillis;
 use tokio::sync::watch;
+use tokio::time::Instant;
 
 #[derive(Clone, Debug)]
 pub struct Clock {
@@ -12,8 +13,14 @@ pub struct Clock {
 
 #[derive(Clone, Debug)]
 enum Source {
-    System,
-    Manual(watch::Sender<UnixMillis>),
+    System(Instant),
+    Manual(watch::Sender<ManualTime>),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ManualTime {
+    wall: UnixMillis,
+    monotonic: Duration,
 }
 
 impl Clock {
@@ -22,7 +29,7 @@ impl Clock {
         ClockChanges {
             clock: self.clone(),
             manual: match &self.source {
-                Source::System => None,
+                Source::System(_) => None,
                 Source::Manual(time) => Some(time.subscribe()),
             },
         }
@@ -30,22 +37,51 @@ impl Clock {
 
     pub fn system() -> Clock {
         Self {
-            source: Source::System,
+            source: Source::System(Instant::now()),
         }
     }
 
     /// 取原始 UTC Unix 毫秒，不做单调钳制。超出 i64 范围时取对应边界。
     pub fn now(&self) -> UnixMillis {
         match &self.source {
-            Source::System => system_now(),
-            Source::Manual(time) => *time.borrow(),
+            Source::System(_) => system_now(),
+            Source::Manual(time) => time.borrow().wall,
+        }
+    }
+
+    /// 自共享起点经过的单调时长；系统时钟的克隆共享起点，测试时钟从零开始。
+    pub fn monotonic(&self) -> Duration {
+        match &self.source {
+            Source::System(origin) => origin.elapsed(),
+            Source::Manual(time) => time.borrow().monotonic,
+        }
+    }
+
+    /// 按单调时间等待，墙钟跳变不改变等待时长。
+    pub async fn sleep(&self, duration: Duration) {
+        if duration.is_zero() {
+            return;
+        }
+        match &self.source {
+            Source::System(_) => tokio::time::sleep(duration).await,
+            Source::Manual(time) => {
+                let mut changes = time.subscribe();
+                let start = changes.borrow_and_update().monotonic;
+                loop {
+                    let elapsed = changes.borrow_and_update().monotonic.saturating_sub(start);
+                    if elapsed >= duration {
+                        return;
+                    }
+                    let _ = changes.changed().await;
+                }
+            }
         }
     }
 
     /// 每次醒来重新检查墙钟；回拨时继续等待。
     pub async fn sleep_until(&self, deadline: UnixMillis) {
         match &self.source {
-            Source::System => loop {
+            Source::System(_) => loop {
                 let wait = system_wait_duration(self.now(), Some(deadline));
                 if wait.is_zero() {
                     return;
@@ -56,7 +92,7 @@ impl Clock {
             Source::Manual(time) => {
                 let mut changes = time.subscribe();
                 loop {
-                    if *changes.borrow_and_update() >= deadline {
+                    if changes.borrow_and_update().wall >= deadline {
                         return;
                     }
                     // self 持有发送端，等待期间通道不会关闭。订阅先于读取，避免丢失唤醒。
@@ -69,7 +105,7 @@ impl Clock {
 
 pub struct ClockChanges {
     clock: Clock,
-    manual: Option<watch::Receiver<UnixMillis>>,
+    manual: Option<watch::Receiver<ManualTime>>,
 }
 
 impl ClockChanges {
@@ -78,7 +114,7 @@ impl ClockChanges {
     pub async fn changed(&mut self, deadline: Option<UnixMillis>) -> UnixMillis {
         if let Some(time) = &mut self.manual {
             let _ = time.changed().await;
-            *time.borrow_and_update()
+            time.borrow_and_update().wall
         } else {
             let now = self.clock.now();
             let wait = system_wait_duration(now, deadline);
@@ -121,12 +157,15 @@ fn system_time_millis(time: SystemTime) -> UnixMillis {
 
 #[derive(Clone, Debug)]
 pub struct ManualClock {
-    time: watch::Sender<UnixMillis>,
+    time: watch::Sender<ManualTime>,
 }
 
 impl ManualClock {
     pub fn new(start: UnixMillis) -> ManualClock {
-        let (time, _) = watch::channel(start);
+        let (time, _) = watch::channel(ManualTime {
+            wall: start,
+            monotonic: Duration::ZERO,
+        });
         Self { time }
     }
 
@@ -137,16 +176,20 @@ impl ManualClock {
     }
 
     pub fn set(&self, now: UnixMillis) {
-        self.time.send_replace(now);
+        self.time.send_modify(|time| time.wall = now);
     }
 
-    /// 丢弃 Duration 的不足 1ms 部分；换算或相加超出范围时停在 i64::MAX。
+    /// 墙钟丢弃不足 1ms 部分，超出范围时停在 i64::MAX；单调时间保留完整精度，
+    /// 超出 Duration 范围时停在 Duration::MAX。
     /// 更新在同一个 watch 写锁内完成，并通知所有等待者；不发生 panic。
     pub fn advance(&self, by: Duration) {
         let millis = i128::try_from(by.as_millis()).unwrap_or(i128::MAX);
         self.time.send_modify(|time| {
-            let advanced = i128::from(time.0).checked_add(millis).unwrap_or(i128::MAX);
-            time.0 = i64::try_from(advanced).unwrap_or(i64::MAX);
+            let advanced = i128::from(time.wall.0)
+                .checked_add(millis)
+                .unwrap_or(i128::MAX);
+            time.wall.0 = i64::try_from(advanced).unwrap_or(i64::MAX);
+            time.monotonic = time.monotonic.checked_add(by).unwrap_or(Duration::MAX);
         });
     }
 }
@@ -239,6 +282,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_sleep_ignores_wall_clock_jumps_and_wakes_all_clones() {
+        let manual = ManualClock::new(UnixMillis(100));
+        let first = manual.clock();
+        let second = first.clone();
+        assert_eq!(first.monotonic(), Duration::ZERO);
+        manual.advance(Duration::from_millis(50));
+        let mut wait_a = Box::pin(first.sleep(Duration::from_millis(100)));
+        let mut wait_b = Box::pin(second.sleep(Duration::from_millis(100)));
+        assert_pending(wait_a.as_mut()).await;
+        assert_pending(wait_b.as_mut()).await;
+        for wall in [i64::MAX, i64::MIN] {
+            manual.set(UnixMillis(wall));
+            assert_eq!(first.now(), UnixMillis(wall));
+            assert_eq!(second.monotonic(), Duration::from_millis(50));
+            assert_pending(wait_a.as_mut()).await;
+            assert_pending(wait_b.as_mut()).await;
+        }
+        manual.advance(Duration::from_millis(99));
+        assert_pending(wait_a.as_mut()).await;
+        assert_pending(wait_b.as_mut()).await;
+        manual.advance(Duration::from_millis(1));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(wait_a, wait_b);
+        })
+        .await
+        .unwrap();
+        assert_eq!(first.monotonic(), Duration::from_millis(150));
+        assert_eq!(first.now(), UnixMillis(i64::MIN + 100));
+    }
+
+    #[tokio::test]
+    async fn manual_sleep_keeps_submillisecond_precision() {
+        let manual = ManualClock::new(UnixMillis(100));
+        let clock = manual.clock();
+        let mut wait = Box::pin(clock.sleep(Duration::from_micros(500)));
+        assert_pending(wait.as_mut()).await;
+        manual.advance(Duration::from_micros(499));
+        assert_pending(wait.as_mut()).await;
+        manual.advance(Duration::from_micros(1));
+        tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .unwrap();
+        assert_eq!(clock.monotonic(), Duration::from_micros(500));
+        assert_eq!(clock.now(), UnixMillis(100));
+    }
+
+    #[tokio::test]
+    async fn zero_duration_sleep_is_immediately_ready_for_both_clocks() {
+        for clock in [Clock::system(), ManualClock::new(UnixMillis(0)).clock()] {
+            let mut wait = Box::pin(clock.sleep(Duration::ZERO));
+            std::future::poll_fn(|cx| {
+                assert!(wait.as_mut().poll(cx).is_ready());
+                Poll::Ready(())
+            })
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn system_sleep_and_clones_use_the_same_monotonic_origin() {
+        let clock = Clock::system();
+        let before = clock.monotonic();
+        clock.sleep(Duration::from_millis(1)).await;
+        let clone = clock.clone();
+        let elapsed = clone.monotonic();
+        assert!(elapsed >= before + Duration::from_millis(1));
+        assert!(clock.monotonic() >= elapsed);
+    }
+
+    #[tokio::test]
     async fn manual_wait_finishes_only_at_deadline_and_wakes_all_clocks() {
         let manual = ManualClock::new(UnixMillis(100));
         let first = manual.clock();
@@ -317,6 +430,7 @@ mod tests {
         assert_eq!(manual.clock().now(), UnixMillis(i64::MAX));
         manual.advance(Duration::from_millis(1));
         assert_eq!(manual.clock().now(), UnixMillis(i64::MAX));
+        assert_eq!(manual.clock().monotonic(), Duration::MAX);
     }
 
     #[test]

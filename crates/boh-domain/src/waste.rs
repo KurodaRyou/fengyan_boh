@@ -62,8 +62,8 @@ impl WasteCommandLine {
 pub struct LogWaste {
     pub command_id: CommandId,
     pub lines: Vec<WasteCommandLine>,
-    pub captured_at: UnixMillis,
-    pub sent_at: UnixMillis,
+    pub occurred_at: UnixMillis,
+    pub clock_synced_at: UnixMillis,
 }
 object_serde!(LogWaste);
 
@@ -342,7 +342,7 @@ mod tests {
             assert!(serde_json::from_value::<PrecheckWaste>(json!({ "lines": lines })).is_err());
             assert!(
                 serde_json::from_value::<LogWaste>(json!({
-                    "command_id": command, "lines": lines, "captured_at": 0, "sent_at": 0,
+                    "command_id": command, "lines": lines, "occurred_at": 0, "clock_synced_at": 0,
                 }))
                 .is_err()
             );

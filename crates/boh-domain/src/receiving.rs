@@ -71,8 +71,8 @@ pub struct CreateReceipt {
     pub command_id: CommandId,
     pub supplier_id: AggregateId,
     pub lines: Vec<ReceiptLine>,
-    pub captured_at: UnixMillis,
-    pub sent_at: UnixMillis,
+    pub occurred_at: UnixMillis,
+    pub clock_synced_at: UnixMillis,
 }
 
 impl CreateReceipt {
