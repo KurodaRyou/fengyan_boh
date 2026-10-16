@@ -36,13 +36,7 @@ pub struct Config {
 
 fn ntp_servers<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<NtpServer>, D::Error> {
     let values = Vec::<String>::deserialize(de)?;
-    if values.is_empty() {
-        return Err(serde::de::Error::custom("ntp_servers must not be empty"));
-    }
-    values
-        .iter()
-        .map(|value| NtpServer::parse(value).map_err(serde::de::Error::custom))
-        .collect()
+    boh_app::clock_sync::parse_ntp_servers(&values).map_err(serde::de::Error::custom)
 }
 
 fn default_backup_keep_count() -> NonZeroU32 {
@@ -141,6 +135,17 @@ ntp_servers = ["ntp.aliyun.com"]
     #[test]
     fn rejects_unknown_fields() {
         assert!(parse_config(&format!("{VALID}\nunknown = true")).is_err());
+    }
+
+    #[test]
+    fn ntp_error_identifies_the_invalid_entry() {
+        let text = VALID.replace(
+            "[\"ntp.aliyun.com\"]",
+            "[\"ntp.aliyun.com\", \"bad.example:0\"]",
+        );
+        let error = parse_config(&text).unwrap_err().to_string();
+        assert!(error.contains("ntp_servers[1]"), "{error}");
+        assert!(error.contains("bad.example:0"), "{error}");
     }
 
     #[test]

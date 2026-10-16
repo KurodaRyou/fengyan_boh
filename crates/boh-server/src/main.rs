@@ -2,6 +2,7 @@
 //! 收到 SIGTERM / SIGINT 后优雅关闭。
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::Context;
 use boh_app::background::BackupTasks;
@@ -15,14 +16,31 @@ use tracing_subscriber::EnvFilter;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/boh/config.toml";
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
+    run_runtime(main_async())
+}
+
+fn run_runtime(
+    future: impl std::future::Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build runtime")?;
+    let result = runtime.block_on(future);
+    // HTTP, backup/check tasks, state persistence and the writer checkpoint have
+    // already drained, including on init failure. Only abandoned DNS may remain.
+    runtime.shutdown_timeout(Duration::from_millis(100));
+    result
+}
+
+async fn main_async() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (operation, config_path) = cli(&args)?;
     let text = std::fs::read_to_string(&config_path)
@@ -67,6 +85,10 @@ async fn run(
     let clock = Clock::system();
     let store_id = config.store_id;
     if operation == Operation::Init {
+        readers
+            .call(boh_storage::store::ensure_uninitialized)
+            .await
+            .context("check store before initialization")?;
         let clock_signal = ensure_synchronized(&config.db_path, clock.clone(), config.ntp_servers)
             .await
             .context("synchronize node clock before initialization")?;
@@ -192,6 +214,95 @@ fn cli(args: &[String]) -> anyhow::Result<(Operation, PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_drains_awaited_work_but_leaves_abandoned_blocking_tasks() {
+        for fail in [false, true] {
+            let (abandoned_release, abandoned_wait) = std::sync::mpsc::channel();
+            let (durable_release, durable_wait) = std::sync::mpsc::channel();
+            let (ready, started) = std::sync::mpsc::channel();
+            let (finished, completion) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                let result = run_runtime(async move {
+                    let (dns_started, dns_ready) = tokio::sync::oneshot::channel();
+                    // Models getaddrinfo after its async query has been cancelled.
+                    drop(tokio::task::spawn_blocking(move || {
+                        dns_started.send(()).unwrap();
+                        abandoned_wait.recv().unwrap();
+                    }));
+                    dns_ready.await.unwrap();
+                    tokio::task::spawn_blocking(move || {
+                        ready.send(()).unwrap();
+                        durable_wait.recv().unwrap();
+                    })
+                    .await
+                    .unwrap();
+                    if fail {
+                        anyhow::bail!("init failed");
+                    }
+                    Ok(())
+                });
+                finished.send(result).unwrap();
+            });
+            started.recv_timeout(Duration::from_secs(2)).unwrap();
+            // A short runtime timeout must not interrupt awaited persistence.
+            assert!(matches!(
+                completion.recv_timeout(Duration::from_millis(200)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            durable_release.send(()).unwrap();
+            let result = completion.recv_timeout(Duration::from_secs(2));
+            // Release the simulated DNS thread even if the deadline assertion fails.
+            abandoned_release.send(()).unwrap();
+            thread.join().unwrap();
+            let result = result.expect("abandoned DNS must not hold runtime shutdown");
+            assert_eq!(result.is_err(), fail);
+            if let Err(error) = result {
+                assert_eq!(error.to_string(), "init failed");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_init_rejects_before_ntp_or_state_file_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("boh.db");
+        let state = dir.path().join("boh.db-clock-sync");
+        std::fs::write(&state, "1\n").unwrap();
+        let ntp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        ntp.set_nonblocking(true).unwrap();
+        let mut config = parse_config(include_str!("../../../deploy/config.example.toml")).unwrap();
+        config.db_path = db.clone();
+        config.ntp_servers = vec![
+            boh_server::config::NtpServer::parse(&ntp.local_addr().unwrap().to_string()).unwrap(),
+        ];
+        let storage = boh_storage::open(&db, std::num::NonZeroUsize::MIN).unwrap();
+        let store_id = config.store_id;
+        storage
+            .writer
+            .call(move |tx| boh_storage::store::initialize(tx, store_id, boh_domain::UnixMillis(1)))
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run(Operation::Init, config, storage.writer, storage.readers),
+        )
+        .await;
+        storage.writer_handle.shutdown().await.unwrap();
+        let error = result
+            .expect("already initialized must not wait for NTP")
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<boh_storage::StorageError>(),
+            Some(boh_storage::StorageError::StoreAlreadyInitialized)
+        ));
+        assert_eq!(std::fs::read(&state).unwrap(), b"1\n");
+        let mut buf = [0; 48];
+        assert_eq!(
+            ntp.recv_from(&mut buf).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
 
     #[test]
     fn rebuild_requires_exactly_one_explicit_config_path() {

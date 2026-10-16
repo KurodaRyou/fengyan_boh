@@ -145,14 +145,8 @@ pub async fn test_node(
     let store_id = StoreId::parse("01890a5d-ac96-774b-bcce-b302099a8050")?;
     let timezone = parse_timezone(&config.timezone)?;
     let closing = parse_closing_backup_time(&config.closing_backup_time)?;
-    if config.ntp_servers.is_empty() {
-        return Err(StorageError::Message("ntp_servers must not be empty"));
-    }
-    let servers = config
-        .ntp_servers
-        .iter()
-        .map(|s| clock_sync::NtpServer::parse(s))
-        .collect::<Result<Vec<_>, _>>()?;
+    let servers = clock_sync::parse_ntp_servers(&config.ntp_servers)
+        .map_err(|error| StorageError::external("解析 NTP 服务器列表", error))?;
     let backup = Backup::prepare(
         db_path,
         &config.backup_dir,

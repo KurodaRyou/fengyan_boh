@@ -530,9 +530,7 @@ async fn health(State(state): State<AppState>) -> Result<Json<Envelope<Health>>,
         .await?;
     let now = state.clock.now();
     let clock_regression_ms = clock_regression(latest, now);
-    let clock_synced_at = state.clock_signal.snapshot();
-    let clock_synced =
-        clock_synced_at.is_some_and(|last| boh_domain::time::clock_signal_valid(last, now));
+    let (clock_synced, clock_synced_at) = state.clock_signal.status(now);
     let mut wal_path = state.db_path.into_os_string();
     wal_path.push("-wal");
     let span = tracing::Span::current();

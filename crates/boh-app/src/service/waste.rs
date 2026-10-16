@@ -108,7 +108,6 @@ pub async fn log(state: AppState, actor: Actor, command: LogWaste) -> Result<Val
                         payload,
                     })?;
                     let response = ok(json!({ "waste_record": row })).0;
-
                     serde_json::to_string(&response).map_err(|error| {
                         ApiError::from(StorageError::external("保存报损命令响应", error))
                     })

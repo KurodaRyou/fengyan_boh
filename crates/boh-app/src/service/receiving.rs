@@ -66,7 +66,6 @@ pub async fn create(
                     let receipt_id = AggregateId::from_parts(recorded_at, ledger::entropy(tx)?)
                         .map_err(StorageError::from)?;
                     let mut warnings = Vec::new();
-
                     let mut earlier_expiries: BTreeMap<AggregateId, UnixMillis> = BTreeMap::new();
                     let mut balances = super::inventory::WorkingSet::default();
                     let mut lot_numbers = super::inventory::LotNumbers::new(calendar_date);

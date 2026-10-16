@@ -270,8 +270,7 @@ pub async fn log_temperature(
                         payload,
                     })?;
                     let response = ok(json!({ "temperature_reading": row })).0;
-
-                    // Save the entire envelope so retries preserve the original warning and times.
+                    // Save the entire envelope so retries preserve the original response and times.
                     serde_json::to_string(&response).map_err(|error| {
                         ApiError::from(StorageError::external("保存温度命令响应", error))
                     })
