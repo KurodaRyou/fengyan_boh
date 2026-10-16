@@ -40,6 +40,7 @@ CREATE TABLE store_events (
     business_date     TEXT NOT NULL CHECK (date(business_date) IS business_date), -- 'YYYY-MM-DD'，且是真实日期
     occurred_at       INTEGER NOT NULL,                           -- 业务发生时间（校准后）
     recorded_at       INTEGER NOT NULL,                           -- 门店接收时间（系统时钟原值）
+    clock_synced_at   INTEGER,                                    -- 前端声明的上次校时时间；主数据、初始化等为 NULL
     payload           TEXT NOT NULL CHECK (json_type(payload) = 'object'),
     UNIQUE (aggregate_type, aggregate_id, aggregate_version)
 ) STRICT;

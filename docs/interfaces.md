@@ -95,6 +95,7 @@ impl Clock {
     pub fn system() -> Clock;
     pub fn now(&self) -> UnixMillis;
     pub async fn sleep_until(&self, deadline: UnixMillis);
+    pub async fn sleep(&self, duration: Duration);
 }
 
 #[derive(Clone, Debug)]
@@ -110,7 +111,12 @@ impl ManualClock {
 - `UnixMillis` 即 `boh_domain::UnixMillis`。生产只用 `Clock::system()`；需要当前时间的组件接收一个 `Clock`，自己不读系统时间。
 - `now`：UTC Unix 毫秒，系统时钟取原值，不做单调钳制。
 - `sleep_until`：`now() >= deadline` 时才返回，`deadline` 已过时立即返回；系统时间回拨时随之推迟。必须在 tokio 运行时内调用。
-- `ManualClock` 供测试使用：由它得到的 `Clock` 共享同一个时间，不随真实时间流动。`set` 可以回拨，`advance` 只向前；时间到达 `deadline` 后，正在等待的 `sleep_until` 立即返回。
+- `sleep`：按单调时间等待 `duration`，不受墙钟跳变影响；`duration` 为 0 时立即返回。`Clock::system()` 用 tokio 的单调计时。必须在 tokio 运行时内调用。
+  - 节点校时的每个服务器的查询超时（5 秒）、每 1 分钟一次的判断和「距上次核对满 1 小时」都经它计时（domain.md「时间」门店节点校时）。
+  - 「满 1 小时」按单调时间判断，不按判断的次数累计：`ManualClock` 一次推进 1 小时之后，下一次判断就核对。
+- `ManualClock` 供测试使用：由它得到的 `Clock` 共享同一个时间，不随真实时间流动。
+  - 它有两个读数：墙钟（`now()` 返回的值）和单调时间。`set` 只改墙钟，可以回拨，模拟墙钟跳变；`advance` 把两者向前推进同样的时长。
+  - 墙钟到达 `deadline` 后，正在等待的 `sleep_until` 立即返回；自调用 `sleep` 起单调时间累计推进达到 `duration` 后，正在等待的 `sleep` 立即返回。
 - HTTP 黑盒测试：把 `ManualClock::clock()` 交给 `test_router`，服务端读到的当前时间（如 `recorded_at`）就是 `ManualClock` 设定的值。
 - 备份触发测试经 `boh_app::test_node` 进行：调度任务按 `now()` 算出下一个触发时刻（UTC 整点或 `closing_backup_time`），时钟回拨后重算（[backup.md](backup.md)「触发」）。
   - 测试把时间设到触发前 1ms，断言未触发；推进 1ms，断言触发。
@@ -121,26 +127,21 @@ impl ManualClock {
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CaptureTimes {
-    pub captured_at: UnixMillis,
-    pub sent_at: UnixMillis,
-    pub started_captured_at: Option<UnixMillis>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Calibrated {
     pub occurred_at: UnixMillis,
     pub started_at: Option<UnixMillis>,
-    pub capture_time_adjusted: bool,
+    pub clock_synced_at: UnixMillis,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum TimeError {
+    ClientClockNotSynced,
     CaptureTooOld,
     InvalidProductionTime,
     OutOfRange,
 }
 
-pub fn calibrate(times: CaptureTimes, recorded_at: UnixMillis) -> Result<Calibrated, TimeError>;
+pub fn check_capture_times(times: CaptureTimes, recorded_at: UnixMillis) -> Result<(), TimeError>;
+pub fn clock_signal_valid(last_synced_at: UnixMillis, now: UnixMillis) -> bool;
 
 #[derive(Debug, Clone)]
 pub struct StoreTimeZone { /* 私有 */ }
@@ -166,20 +167,24 @@ pub fn business_date(
 ) -> Result<BusinessDate, TimeError>;
 ```
 
-`calibrate` 按以下顺序判定，先命中的结果生效：
+`check_capture_times` 实现 domain.md「时间」的「发生时间的校验」，用于实时录入的写命令（`recorded_at` 是写事务内的节点时间）。比较按数学上的整数进行，不因溢出而改变结果：
 
-1. 带 `started_captured_at` 且它晚于 `captured_at`：`InvalidProductionTime`。
-2. `lag = sent_at − captured_at`；带开始时间时另算 `start_lag = sent_at − started_captured_at`。溢出：`OutOfRange`。
-3. 任一 lag 大于 72 小时（259 200 000 ms）：`CaptureTooOld`；恰好 72 小时照常受理。
-4. 负的 lag 按 0 处理，此时 `capture_time_adjusted = true`。
-5. `occurred_at = recorded_at − lag`，`started_at = recorded_at − start_lag`。溢出：`OutOfRange`。
+| 条件（任一成立） | 结果 |
+|---|---|
+| `clock_synced_at > recorded_at + 60 000`，或 `recorded_at > clock_synced_at + 604 800 000` | `ClientClockNotSynced` |
+| `occurred_at > recorded_at + 60 000`，或带 `started_at` 且 `started_at > recorded_at + 60 000` | `ClientClockNotSynced` |
+| `recorded_at − occurred_at > 259 200 000`，或带 `started_at` 且 `recorded_at − started_at > 259 200 000` | `CaptureTooOld` |
+| 带 `started_at` 且 `started_at > occurred_at` | `InvalidProductionTime` |
+
+- 都不成立时返回 `Ok(())`；边界值（恰好 1 分钟、7 天、72 小时，`started_at = occurred_at`）照常受理。同时命中多行时返回哪一个不作规定（domain.md「写命令通用规则」业务校验）。不返回 `OutOfRange`。
+- `clock_signal_valid`：`last_synced_at ≤ now ≤ last_synced_at + 604 800 000` 时为 `true`（domain.md「时间」校时信号），比较同样不因溢出而改变结果。节点信号用它判定；前端信号不用它（允许领先 1 分钟）。
 
 | 结果 | HTTP |
 |---|---|
+| `TimeError::ClientClockNotSynced` | `400 CLIENT_CLOCK_NOT_SYNCED` |
 | `TimeError::CaptureTooOld` | `400 CAPTURE_TOO_OLD` |
 | `TimeError::InvalidProductionTime` | `400 INVALID_PRODUCTION_TIME` |
 | `TimeError::OutOfRange` | `400 VALIDATION_FAILED` |
-| `capture_time_adjusted = true` | 警告 `CAPTURE_TIME_ADJUSTED` |
 
 - `business_date`：把 `occurred_at` 换算成 `timezone` 的当地时间，当地时刻早于 `cutoff` 归前一日。`occurred_at` 无法换算，或结果年份超出 0000–9999：`OutOfRange`。
 - `parse_timezone`：接受 IANA 时区名，只在 jiff 内置时区库（`jiff::tz::TimeZoneDatabase::bundled()`）中查找；查不到，或得到的是 jiff 的未知时区（`Etc/Unknown`），都为 `InvalidTimeZone`。
@@ -225,10 +230,17 @@ pub struct WasteLogged { /* 字段由实现决定 */ }
 
 ```rust
 #[doc(hidden)]
-pub fn test_router(db_path: &Path, clock: Clock) -> Result<Router, StorageError>;
+pub fn test_router(
+    db_path: &Path,
+    clock: Clock,
+    clock_synced_at: Option<UnixMillis>,
+) -> Result<Router, StorageError>;
 ```
 
 - 在 `db_path` 上调用 `boh_storage::open()`，以 `clock` 作为服务端时钟，构造与生产入口路由相同的 `axum::Router`。
+- `clock_synced_at`：节点的上次校时时间，相当于启动时从状态文件读到的值；`None` 表示没有信号。
+  - 信号是否有效每次按 `clock.now()` 判定（`clock_signal_valid`），`/health` 的 `clock_synced_at` 就是这个值。
+  - 不读写状态文件，不做 NTP 核对：信号在 `Router` 的生命期内不变。
 - 不读环境变量和配置文件，不监听端口；测试直接用这个 `Router` 处理请求。使用固定的测试配置：
 
   | 配置项 | 值 |
@@ -241,7 +253,7 @@ pub fn test_router(db_path: &Path, clock: Clock) -> Result<Router, StorageError>
 - `store_meta` 为空时，用与 `boh-server init` 写 `store_meta` 相同的代码写入上表的 `store_id`，`created_at` 取 `clock.now()`；已存在且 `store_id` 不同时返回 `Err`。
   - 不写预置主数据（报损原因），也不写 `processed_commands`：测试节点的账本从空开始。
 - 写线程不经 `shutdown`：`Router` 及其全部克隆释放后，写线程自行退出。
-- 不启动备份调度、不变量自检等后台任务：`/health` 的备份字段和 `invariant_check` 的两个字段一直为 `null`。
+- 不启动备份调度、不变量自检、节点校时核对等后台任务：`/health` 的备份字段和 `invariant_check` 的两个字段一直为 `null`。
 - 两份 `clippy.toml` 禁用 `test_router`，只有锁定测试及 `spec_support/` 可以 `#[allow]`。
 
 ## boh-app：带后台任务的测试节点
@@ -253,6 +265,7 @@ pub struct TestNodeConfig {
     pub backup_keep_count: NonZeroU32,
     pub timezone: String,             // IANA 时区名
     pub closing_backup_time: String,  // 'HH:MM'
+    pub ntp_servers: Vec<String>,     // 与配置项 ntp_servers 相同的写法
 }
 
 #[doc(hidden)]
@@ -268,6 +281,8 @@ impl TestNode {
     pub fn writer(&self) -> Writer;
     pub async fn run_invariant_check(&self);
     pub fn hold_invariant_checks(&self) -> InvariantCheckHold;
+    pub async fn wait_clock_checks(&self, count: u64);
+    pub async fn wait_clock_ticks(&self, count: u64);
     pub async fn shutdown(self) -> Result<(), StorageError>;
 }
 
@@ -285,8 +300,9 @@ impl InvariantCheckHold {
 ```
 
 - 在 tokio 运行时内调用。与生产启动相同：`boh_storage::open()`；`store_meta` 处理同 `test_router`；创建 `backup_dir`（含上级目录），失败或不是目录时返回 `Err`；启动备份调度。
-  - 配置：`store_id`、`business_day_cutoff`、开发桩同 `test_router`；`timezone` 同时用于营业日和闭店备份；时区或 `closing_backup_time` 非法时返回 `Err`。
-  - 返回时，调度任务已按 `clock` 当时的时间算好第一个触发时刻，启动检查已提交到检查入口（不等待它完成）。
+  - 配置：`store_id`、`business_day_cutoff`、开发桩同 `test_router`；`timezone` 同时用于营业日和闭店备份；时区、`closing_backup_time` 或 `ntp_servers`（规则同配置项，见「boh-server：配置」）非法时返回 `Err`。
+  - 节点校时与生产相同（domain.md「时间」门店节点校时）：启动时读取状态文件 `<db_path>-clock-sync` 作为初始信号，按 `ntp_servers` 核对 `clock`（`Clock::now` 作为 `sntpc` 的本机时间，超时和间隔经 `Clock::sleep`），成功后按规定写状态文件。
+  - 返回时，调度任务已按 `clock` 当时的时间算好第一个触发时刻，启动检查已提交到检查入口（不等待它完成），状态文件已读取，启动时的核对已开始（不等待它完成）。
 - `router`：与生产入口相同的路由；`/health` 反映本节点的备份与自检结果。
 - `hold_backups`：返回的句柄存在期间，每次开始的备份在取得开始时间（文件名中的时间）并读取 `seq_before` 之后、执行 `VACUUM INTO` 之前等待；所有句柄释放后继续。
   - `started()`：有备份正在等待该句柄时返回（已在等待则立即返回）。
@@ -298,7 +314,11 @@ impl InvariantCheckHold {
   - `started()`：有检查正在等待时返回（已在等待则立即返回）。
   - 句柄不借用 `TestNode`，规则同 `hold_backups`；`shutdown` 会等到句柄释放、已提交的检查执行完。
   - 暂停机制只在 `boh-app` 内部，不对外提供其他入口。
-- `shutdown`：不再接受新的触发，执行完正在进行和已提交的检查、已接受的闭店流程和已排队的备份，再 `WriterHandle::shutdown()`。返回后不留任何后台任务。
+- `wait_clock_checks`：等到本节点启动以来完成的核对次数（含启动时的那次）不少于 `count` 后返回。一次核对按 domain.md「一次核对」查询一轮服务器；完成指结果已发布（含状态文件的写入或删除，成功或失败），并且已开始等待下一次判断（已调用 `Clock::sleep`）。
+- `wait_clock_ticks`：等到启动以来完成的每分钟判断次数（不含启动时的核对）不少于 `count` 后返回。完成指已决定是否核对、需要核对时这次核对已完成，并且已开始等待下一次判断。
+  - 锁定测试据此推进 `ManualClock`：返回之后的 `advance` 计入下一次判断的等待。
+- 持久化失败的用例把数据库所在目录设为只读来制造写入失败，要求测试以非 root 用户运行；以 root 运行时用例报告环境不满足条件并失败，不跳过。
+- `shutdown`：不再接受新的触发，执行完正在进行和已提交的检查、已接受的闭店流程和已排队的备份，再 `WriterHandle::shutdown()`。正在等待的 NTP 查询和核对间隔直接取消，已经开始的状态文件持久化执行完。返回后不留任何后台任务。
 - 两份 `clippy.toml` 禁用 `test_node`，只有锁定测试及 `spec_support/` 可以 `#[allow]`。
 
 ## boh-server：配置
@@ -319,12 +339,22 @@ pub struct Config {
     pub backup_dir: PathBuf,
     pub backup_keep_count: NonZeroU32,
     pub closing_backup_time: ClosingBackupTime,
+    pub ntp_servers: Vec<NtpServer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NtpServer {
+    pub host: String,  // 主机名或 IP 地址；IPv6 地址不带方括号
+    pub port: u16,
 }
 pub fn parse_config(text: &str) -> Result<Config, impl std::error::Error>;
 ```
 
 - 解析 TOML 配置文本，不读文件、不创建目录。错误类型由实现决定，锁定测试只区分 `Ok` / `Err`。
 - `backup_dir` 必填；`backup_keep_count` 缺省为 168，必须是正整数（TOML 整数，`1`–`u32::MAX`）；`closing_backup_time` 缺省为 `"23:30"`，格式见 `parse_closing_backup_time`。
+- `ntp_servers` 必填，非空字符串数组，按原顺序解析（domain.md「时间」门店节点校时）：
+  - `host` 或 `host:port`，端口是 `1`–`65535` 的十进制数，缺省 123；IPv6 地址写成 `[addr]` 或 `[addr]:port`，`host` 中不带方括号。
+  - `host` 不能为空，不含空白；不带方括号的 IPv6 地址（如 `::1`）有多个冒号，无法区分端口，为错误。
 - `main` 经此函数加载配置。
 
 ## boh-server：`init` 子命令
@@ -332,7 +362,30 @@ pub fn parse_config(text: &str) -> Result<Config, impl std::error::Error>;
 锁定测试以子进程运行 `boh-server` 二进制（`env!("CARGO_BIN_EXE_boh-server")`）：`boh-server init <配置文件>`。
 
 - 退出码 0 表示成功，非 0 表示失败；测试不依赖输出文本。
-- 读取配置中的 `db_path`、`store_id`、`timezone`、`business_day_cutoff`；不创建 `backup_dir`，不监听端口，不启动后台任务。
+- 读取配置中的 `db_path`、`store_id`、`timezone`、`business_day_cutoff`、`ntp_servers`；不创建 `backup_dir`，不监听端口，不启动后台任务。
+- 节点信号（domain.md「时间」门店节点校时 `init`）：状态文件 `<db_path>-clock-sync` 有效时不查询 NTP；否则查询一轮，成功时写状态文件后继续，失败时以非 0 退出，数据库中不写任何数据（`store_meta`、`processed_commands`、`store_events` 仍为空），状态文件不创建。
+  - 测试把 `ntp_servers` 指向 `spec_support` 中的假 NTP 服务（本机 UDP），它以系统时间加设定的偏差回复；查询轮次和顺序由假服务收到的请求核对。
 - 时间取系统时钟：测试只断言时间落在调用前后读取的系统时间之间，营业日按 `boh_domain::time::business_date` 由事件的 `occurred_at` 核对。
 - 写入内容见 domain.md「主数据」初始化；测试经 `boh_storage::testing::open_reader` 读取数据库，经 `boh_app::test_router` 访问已初始化的数据库。
 - 回滚测试：先经 `boh_storage::testing::open_writer` 和 `migrate` 建库，在 `waste_reasons` 中放一行 `code = 'OTHER'`；`init` 写不进最后一条预置原因，必须以非 0 退出，`store_meta`、`processed_commands`、`store_events` 仍为空。删掉这一行后 `init` 可以重新执行。
+
+## boh-server：`rebuild-projections` 子命令
+
+锁定测试以子进程运行：`boh-server rebuild-projections <配置文件>`。
+
+- 退出码 0 表示成功，非 0 表示失败；测试不依赖输出文本。
+- 经 `boh_storage::open()` 打开 `db_path`，核对 `store_meta`（为空或 `store_id` 与配置不同时以非 0 退出，不重建），再调用 `Writer::rebuild_projections`。
+  - 重建失败（如某个事件的 payload 无法解析）时以非 0 退出，投影表保持运行前的内容。
+- 不受节点信号限制：不读状态文件，不查询 NTP，不监听端口，不启动后台任务。
+- 参数只接受这一种形式：子命令名拼错、配置文件之外多带参数时以非 0 退出，不打开数据库；配置文件不存在或无法解析时以非 0 退出。
+
+## boh-server：服务进程
+
+锁定测试以子进程运行：`boh-server <配置文件>`，经配置的 `listen_addr`（本机地址）用 HTTP/1.1 访问，由测试经系统 `kill` 命令发送信号。
+
+- 就绪：`GET /health` 返回 200 之后视为已开始服务。
+- 启动时读取状态文件并开始一次核对，不等待它完成就开始服务（domain.md「时间」门店节点校时）。
+- 收到 SIGTERM 或 SIGINT 后按 AGENTS.md「Rust」的优雅关闭顺序退出，退出码 0：
+  - 正在等待的 NTP 查询直接取消，不等满 5 秒超时。只在等待 NTP、没有进行中的备份、自检、闭店流程或状态文件持久化时，退出时间不受这 5 秒影响（锁定测试在这种场景下断言 3 秒内退出）；有这些工作时按 AGENTS.md 的关闭顺序执行完再退出。
+  - 没有读事务阻塞 checkpoint 时，退出后 `<db_path>-wal` 不存在或大小为 0（锁定测试只构造这种场景）；`CheckpointBusy` 时按 AGENTS.md「Rust」保留 WAL 并正常退出，不在此列。已成功的写命令经 `boh_storage::testing::open_reader` 都能读到。
+
