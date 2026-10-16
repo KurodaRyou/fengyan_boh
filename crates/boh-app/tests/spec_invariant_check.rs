@@ -247,7 +247,7 @@ async fn supplier(router: &Router, n: u16) -> String {
     data["supplier"]["supplier_id"].as_str().unwrap().to_owned()
 }
 
-/// 收货，各行 `qty` g；返回各行的批次号。平板在 `now − lag` 录入、在 `now` 发送（节点时钟也是 `now`）。
+/// 收货，各行 `qty` g；返回各行的批次号。员工在 `now − lag` 完成录入（节点时钟是 `now`）。
 #[allow(clippy::unwrap_used)] // 同上。
 #[allow(clippy::too_many_arguments)] // 测试辅助：参数逐一对应请求字段。
 async fn receive(
@@ -275,7 +275,7 @@ async fn receive(
         "/api/v1/receipts",
         json!({
             "command_id": cmd(n), "supplier_id": supplier, "lines": lines,
-            "captured_at": now - lag, "sent_at": now,
+            "occurred_at": now - lag, "clock_synced_at": now - lag,
         }),
     )
     .await;
@@ -302,7 +302,7 @@ async fn waste(router: &Router, n: u16, now: i64, item: &str, lot: Option<&str>,
         router,
         &STAFF,
         "/api/v1/waste-records",
-        json!({ "command_id": cmd(n), "lines": [line], "captured_at": now, "sent_at": now }),
+        json!({ "command_id": cmd(n), "lines": [line], "occurred_at": now, "clock_synced_at": now }),
     )
     .await;
 }

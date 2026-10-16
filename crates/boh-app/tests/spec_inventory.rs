@@ -21,7 +21,8 @@ use tempfile::TempDir;
 const NOW: i64 = 1_791_248_400_000; // 2026-10-06 09:00 +08:00
 const MINUTE: i64 = 60_000;
 const HOUR: i64 = 3_600_000;
-const SENT: i64 = NOW + 7 * MINUTE;
+/// 前端上次校时：NOW 前 2 小时。
+const CLIENT_SYNCED: i64 = NOW - 2 * HOUR;
 const UNKNOWN_ID: &str = "01890a5d-ac96-774b-bcce-b302099a8399";
 const URI: &str = "/api/v1/inventory";
 
@@ -122,7 +123,7 @@ impl Node {
         data["supplier"]["supplier_id"].as_str().unwrap().to_owned()
     }
 
-    /// 收货：平板在 `SENT − lag` 录入、在 `SENT` 发送；返回各行的 `lot_id`。
+    /// 收货：员工在 `NOW − lag` 完成录入；返回各行的 `lot_id`。
     #[allow(clippy::unwrap_used)] // 同上。
     async fn receive(&self, n: u16, supplier: &str, lines: Vec<Value>, lag: i64) -> Vec<String> {
         let data = self
@@ -132,7 +133,7 @@ impl Node {
                 "/api/v1/receipts",
                 json!({
                     "command_id": cmd(n), "supplier_id": supplier, "lines": lines,
-                    "captured_at": SENT - lag, "sent_at": SENT,
+                    "occurred_at": NOW - lag, "clock_synced_at": CLIENT_SYNCED,
                 }),
             )
             .await;
@@ -461,7 +462,7 @@ async fn zero_and_negative_lots_and_unallocated_qty_are_reported() {
             0,
         )
         .await;
-    let waste = |n: u16, line: Value| json!({ "command_id": cmd(n), "lines": [line], "captured_at": SENT, "sent_at": SENT });
+    let waste = |n: u16, line: Value| json!({ "command_id": cmd(n), "lines": [line], "occurred_at": NOW, "clock_synced_at": CLIENT_SYNCED });
     let wline = |qty: i64| {
         json!({
             "item_id": flour, "input": { "qty": qty.to_string(), "unit_code": "g", "base_qty_per_unit": "1" },
@@ -799,7 +800,7 @@ async fn fractional_and_negative_quantities_are_decimal_strings() {
         Method::POST,
         "/api/v1/waste-records",
         json!({
-            "command_id": cmd(5), "captured_at": SENT, "sent_at": SENT,
+            "command_id": cmd(5), "occurred_at": NOW, "clock_synced_at": CLIENT_SYNCED,
             "lines": [{
                 "item_id": flour, "input": { "qty": "36", "unit_code": "g", "base_qty_per_unit": "1" },
                 "reason_code": "EXPIRED", "confirm_shortage": true,

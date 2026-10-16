@@ -5,7 +5,6 @@ mod spec_support;
 
 use std::error::Error;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use axum::Router;
 use axum::http::Method;
@@ -22,10 +21,11 @@ const NOW: i64 = 1_791_248_400_000; // 2026-10-06 09:00 +08:00
 const MINUTE: i64 = 60_000;
 const HOUR: i64 = 3_600_000;
 const DAY: i64 = 86_400_000;
-/// 相对校准的上限：72 小时。
+const WEEK: i64 = 7 * DAY;
+/// 「太早」的界限：recorded_at − occurred_at 超过 72 小时。
 const MAX_LAG: i64 = 259_200_000;
-/// 平板发送时刻的平板本地时钟：比节点快 7 分钟，相对校准应抵消这个偏差。
-const SENT: i64 = NOW + 7 * MINUTE;
+/// 前端上次校时：NOW 前 2 小时。
+const CLIENT_SYNCED: i64 = NOW - 2 * HOUR;
 const UNKNOWN_ID: &str = "01890a5d-ac96-774b-bcce-b302099a8399";
 const URI: &str = "/api/v1/temperature-readings";
 
@@ -249,7 +249,7 @@ fn cmd(n: u16) -> String {
     format!("01890a5d-ac96-774b-bcce-b30209a9{n:04x}")
 }
 
-/// 实时录入的请求体：平板在 `SENT − lag` 录入、在 `SENT` 发送。
+/// 实时录入的请求体：员工在 `NOW − lag` 完成录入（前端校准后的时间），前端上次校时为 `CLIENT_SYNCED`。
 fn body(
     command_id: &str,
     equipment_id: &str,
@@ -262,8 +262,8 @@ fn body(
         equipment_id,
         celsius_x10,
         note,
-        SENT - lag,
-        SENT,
+        NOW - lag,
+        CLIENT_SYNCED,
     )
 }
 
@@ -272,15 +272,15 @@ fn timed_body(
     equipment_id: &str,
     celsius_x10: i64,
     note: Option<&str>,
-    captured_at: i64,
-    sent_at: i64,
+    occurred_at: i64,
+    clock_synced_at: i64,
 ) -> Value {
     let mut body = json!({
         "command_id": command_id,
         "equipment_id": equipment_id,
         "celsius_x10": celsius_x10,
-        "captured_at": captured_at,
-        "sent_at": sent_at,
+        "occurred_at": occurred_at,
+        "clock_synced_at": clock_synced_at,
     });
     if let Some(note) = note {
         body["note"] = json!(note);
@@ -356,8 +356,8 @@ fn assert_warnings(reply: &JsonReply, codes: &[&str]) {
 
 // 温度记录接口「新建」：普通员工即可记录；一个命令写一条 TEMPERATURE_LOGGED（新的 TEMPERATURE_READING
 // 聚合，version 1）、一行 temperature_readings 投影和一行 processed_commands。
-// 相对校准抵消平板时钟偏差：lag = sent_at − captured_at = 10 分钟，occurred_at = recorded_at − 10 分钟。
-// 省略 note 时 payload、投影和响应都没有 note；规范化请求保留 captured_at，剥离 command_id、sent_at。
+// occurred_at 原样记录（10 分钟前录入），recorded_at 是节点时钟。
+// 省略 note 时 payload、投影和响应都没有 note；规范化请求保留 occurred_at，剥离 command_id、clock_synced_at。
 #[tokio::test]
 async fn log_writes_event_projection_and_command() {
     let node = node();
@@ -418,7 +418,7 @@ async fn log_writes_event_projection_and_command() {
         node.processed(&cmd(2)).unwrap(),
         (
             "temperature.log".into(),
-            json!({ "equipment_id": f1, "celsius_x10": 38, "captured_at": SENT - 10 * MINUTE }),
+            json!({ "equipment_id": f1, "celsius_x10": 38, "occurred_at": NOW - 10 * MINUTE }),
             NOW,
         )
     );
@@ -458,7 +458,7 @@ async fn note_is_kept_verbatim_and_each_reading_is_a_new_aggregate() {
     assert_eq!(node.readings().unwrap()[1].4.as_deref(), Some(note));
     assert_eq!(
         node.processed(&cmd(3)).unwrap().1,
-        json!({ "equipment_id": f1, "celsius_x10": -185, "note": note, "captured_at": SENT })
+        json!({ "equipment_id": f1, "celsius_x10": -185, "note": note, "occurred_at": NOW })
     );
 }
 
@@ -589,40 +589,26 @@ async fn a_command_rejected_as_invalid_can_be_corrected_with_the_same_id() {
     assert_eq!(node.counts().unwrap(), (2, 2));
 }
 
-// domain「时间」相对校准：lag < 0 按 0 处理，occurred_at = recorded_at，返回警告 CAPTURE_TIME_ADJUSTED；
-// 极端的负 lag（captured_at = i64::MAX）同样归零，不是溢出。
+// domain「时间」发生时间的校验：occurred_at 晚于 recorded_at 不超过 1 分钟时照常受理，原样记录，没有警告
+// （节点不修正前端给出的发生时间）。
 #[tokio::test]
-async fn negative_lag_is_clamped_with_a_warning() {
+async fn occurred_at_slightly_ahead_is_recorded_as_is() {
     let node = node();
     let f1 = node.equipment(&cmd(1), "F1").await;
 
     let reply = node
-        .log(&STAFF, &body(&cmd(2), &f1, 38, None, -2 * MINUTE))
+        .log(&STAFF, &body(&cmd(2), &f1, 38, None, -MINUTE))
         .await;
     let id = reading_id(&reply);
     assert_eq!(
         reply.body["data"],
-        json!({ "temperature_reading": row(&id, &f1, 38, None, "2026-10-06", NOW, NOW, &STAFF) })
+        json!({ "temperature_reading": row(&id, &f1, 38, None, "2026-10-06", NOW + MINUTE, NOW, &STAFF) })
     );
-    assert_warnings(&reply, &["CAPTURE_TIME_ADJUSTED"]);
-
-    let reply = node
-        .log(&STAFF, &timed_body(&cmd(3), &f1, 38, None, i64::MAX, SENT))
-        .await;
-    assert_eq!(
-        assert_success(&reply)["temperature_reading"]["occurred_at"],
-        json!(NOW)
-    );
-    assert_warnings(&reply, &["CAPTURE_TIME_ADJUSTED"]);
-
-    let occurred: Vec<i64> = node.events().unwrap()[1..]
-        .iter()
-        .map(|e| e.occurred_at)
-        .collect();
-    assert_eq!(occurred, [NOW, NOW]);
+    assert_warnings(&reply, &[]);
+    assert_eq!(node.events().unwrap()[1].occurred_at, NOW + MINUTE);
 }
 
-// domain「时间」：lag 恰好 72 小时照常受理，营业日按 occurred_at（三天前 09:00）计算，没有警告。
+// domain「时间」：occurred_at 恰好早于 recorded_at 72 小时照常受理，营业日按 occurred_at（三天前 09:00）计算，没有警告。
 #[tokio::test]
 async fn lag_of_exactly_72_hours_is_accepted() {
     let node = node();
@@ -640,7 +626,7 @@ async fn lag_of_exactly_72_hours_is_accepted() {
     assert_warnings(&reply, &[]);
 }
 
-// domain「时间」：lag 超过 72 小时 400 CAPTURE_TOO_OLD（details 为 {}），什么都不写；
+// domain「时间」：occurred_at 早于 recorded_at 超过 72 小时 400 CAPTURE_TOO_OLD（details 为 {}），什么都不写；
 // 修正后可以用同一个 command_id 重提。
 #[tokio::test]
 async fn lag_over_72_hours_is_capture_too_old() {
@@ -659,32 +645,49 @@ async fn lag_over_72_hours_is_capture_too_old() {
     assert_eq!(node.counts().unwrap(), (2, 2));
 }
 
-// interfaces「calibrate」与「business_date」：差值溢出、occurred_at 换算溢出、营业日无法换算，
-// 都是 400 VALIDATION_FAILED（details 为 {}），什么都不写。设备存在，只有时间不合法。
+// interfaces「business_date」：营业日无法换算（年份超出 0000–9999）时 400 VALIDATION_FAILED（details 为 {}），
+// 什么都不写。节点时钟停在 10000-01-01 前后、节点信号有效（上次校时就是那时），发生时间与接收时间相同，
+// 只有营业日不可表示。设备先在正常时间新建，再换一个 Router 打开同一个库。
 #[tokio::test]
-async fn out_of_range_times_are_validation_failed() {
-    let node = node();
-    let f1 = node.equipment(&cmd(1), "F1").await;
-    let before = node.state();
+async fn unrepresentable_business_date_is_validation_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("boh.db");
+    let clock = ManualClock::new(UnixMillis(NOW));
+    let router = spec_support::router(&db_path, clock.clock()).unwrap();
+    let reply = spec_support::post(
+        &router,
+        "/api/v1/equipment",
+        Some(&MANAGER),
+        &json!({
+            "command_id": cmd(1), "code": "F1", "name": "Walk-in",
+            "equipment_type": "FRIDGE", "active": true,
+        }),
+    )
+    .await
+    .unwrap();
+    let f1 = assert_success(&reply)["equipment"]["equipment_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    drop(router);
 
-    // sent_at − captured_at 溢出。
-    for (captured_at, sent_at) in [(i64::MIN, 1), (-1, i64::MAX)] {
-        let reply = node
-            .log(
-                &STAFF,
-                &timed_body(&cmd(2), &f1, 38, None, captured_at, sent_at),
-            )
-            .await;
-        assert_eq!(assert_error(&reply, 400, "VALIDATION_FAILED"), &json!({}));
-    }
-    // 节点时钟异常：recorded_at − lag 溢出；lag 为 0 时 occurred_at 可表示但营业日无法换算。
-    node.clock.set(UnixMillis(i64::MIN + 1_000));
-    for lag in [2_000, 0] {
-        let reply = node.log(&STAFF, &body(&cmd(2), &f1, 38, None, lag)).await;
-        assert_eq!(assert_error(&reply, 400, "VALIDATION_FAILED"), &json!({}));
-    }
-
-    assert_eq!(node.state(), before);
+    // 10000-01-01 12:00 +08:00（04:00Z）。
+    const YEAR_10000: i64 = 253_402_315_200_000;
+    clock.set(UnixMillis(YEAR_10000));
+    let router =
+        spec_support::router_synced(&db_path, clock.clock(), Some(UnixMillis(YEAR_10000))).unwrap();
+    let reply = spec_support::post(
+        &router,
+        URI,
+        Some(&STAFF),
+        &timed_body(&cmd(2), &f1, 38, None, YEAR_10000, YEAR_10000),
+    )
+    .await
+    .unwrap();
+    assert_eq!(assert_error(&reply, 400, "VALIDATION_FAILED"), &json!({}));
+    let conn = spec_support::reader(&db_path).unwrap();
+    assert_eq!(spec_support::count(&conn, "store_events").unwrap(), 1);
+    assert_eq!(spec_support::count(&conn, "processed_commands").unwrap(), 1);
 }
 
 // domain「时间」营业日：由 occurred_at（不是 recorded_at）按 Asia/Shanghai 与日切 04:00 计算。
@@ -724,7 +727,17 @@ async fn clock_regression_is_recorded_as_is() {
     node.clock.set(UnixMillis(NOW - 2 * DAY));
 
     let reply = node
-        .log(&STAFF, &body(&cmd(3), &f1, 40, None, MINUTE))
+        .log(
+            &STAFF,
+            &timed_body(
+                &cmd(3),
+                &f1,
+                40,
+                None,
+                NOW - 2 * DAY - MINUTE,
+                NOW - 2 * DAY - HOUR,
+            ),
+        )
         .await;
 
     let id = reading_id(&reply);
@@ -761,47 +774,60 @@ async fn clock_regression_is_recorded_as_is() {
 // 幂等与处理顺序
 // ---------------------------------------------------------------------------------------------
 
-// AGENTS「幂等」与 domain「时间」：重试返回首次的响应（含 warnings），不重新校准时间。
-// 首次 lag 为负（归零并警告）；一小时后用原 command_id、原内容重发，只有 sent_at 不同——
-// 包括按新的 sent_at 计算会超过 72 小时或溢出的情况——都原样返回首次响应，不新增事件或命令记录。
+// AGENTS「幂等」与 domain「时间」：重试返回首次的响应（含 warnings），不重新校验发生时间。
+// 首次 occurred_at 领先 30 秒（照常受理）；之后用原 command_id、原内容重发，只有 clock_synced_at 不同——包括已过期、
+// 领先节点超过 1 分钟的值，以及节点时间已超过 occurred_at 72 小时——都原样返回首次响应，不新增事件或命令记录；
+// 事件中仍是首次提交的 clock_synced_at。
 #[tokio::test]
-async fn retries_return_the_original_response_without_recalibrating() {
+async fn retries_return_the_original_response_without_rechecking_times() {
     let node = node();
     let f1 = node.equipment(&cmd(1), "F1").await;
-    let captured_at = SENT + MINUTE;
+    let occurred_at = NOW + 30_000;
     let first = node
         .log(
             &STAFF,
-            &timed_body(&cmd(2), &f1, 38, None, captured_at, SENT),
+            &timed_body(&cmd(2), &f1, 38, None, occurred_at, CLIENT_SYNCED),
         )
         .await;
     reading_id(&first);
-    assert_warnings(&first, &["CAPTURE_TIME_ADJUSTED"]);
     let before = node.state();
-    node.clock.advance(Duration::from_secs(3600));
 
-    for sent_at in [
-        SENT,
-        captured_at + 10 * MINUTE,
-        captured_at + MAX_LAG + 1,
-        i64::MIN,
+    for (now, clock_synced_at) in [
+        (NOW + HOUR, NOW + HOUR - MINUTE),
+        (NOW + HOUR, NOW - WEEK - DAY),
+        (NOW + HOUR, NOW + 3 * HOUR),
+        (occurred_at + MAX_LAG + 1, occurred_at + MAX_LAG),
     ] {
+        node.clock.set(UnixMillis(now));
         let reply = node
             .log(
                 &STAFF,
-                &timed_body(&cmd(2), &f1, 38, None, captured_at, sent_at),
+                &timed_body(&cmd(2), &f1, 38, None, occurred_at, clock_synced_at),
             )
             .await;
-        assert_eq!(reply.status, 200, "sent_at = {sent_at}");
-        assert_eq!(reply.body, first.body, "sent_at = {sent_at}");
+        assert_eq!(reply.status, 200, "clock_synced_at = {clock_synced_at}");
+        assert_eq!(
+            reply.body, first.body,
+            "clock_synced_at = {clock_synced_at}"
+        );
     }
 
     assert_eq!(node.state(), before);
+    let conn = spec_support::reader(&node.db_path).unwrap();
+    let stored: i64 = conn
+        .query_row(
+            "SELECT clock_synced_at FROM store_events WHERE seq = 2",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, CLIENT_SYNCED);
 }
 
 // AGENTS「幂等」：同一 command_id、内容不同时 409 IDEMPOTENCY_CONFLICT，details.fields 为不同的顶层字段名
 // （字典序，只在一方出现的字段也算）；command_type 不同时只列 "command_type"。
-// 幂等检查先于业务校验：改成不存在的设备、或 captured_at 改到 72 小时以外，仍是 409，不是 404 / CAPTURE_TOO_OLD。
+// 幂等检查先于业务校验：改成不存在的设备、或 occurred_at 改到 72 小时以外，仍是 409，不是 404 / CAPTURE_TOO_OLD。
+// clock_synced_at 不在规范化请求中，不参与比对（见上一个用例）。
 #[tokio::test]
 async fn idempotency_conflicts_list_differing_fields() {
     let node = node();
@@ -825,12 +851,12 @@ async fn idempotency_conflicts_list_differing_fields() {
             body(&x, UNKNOWN_ID, 38, None, 10 * MINUTE),
             json!(["equipment_id"]),
         ),
-        // captured_at 与 sent_at 同时前移：lag 不变，规范化请求中只有 captured_at 不同。
+        // occurred_at 不同（clock_synced_at 也不同，但不参与比对）。
         (
-            timed_body(&x, &f1, 38, None, SENT - 11 * MINUTE, SENT - MINUTE),
-            json!(["captured_at"]),
+            timed_body(&x, &f1, 38, None, NOW - 11 * MINUTE, NOW - MINUTE),
+            json!(["occurred_at"]),
         ),
-        (body(&x, &f1, 38, None, MAX_LAG + 1), json!(["captured_at"])),
+        (body(&x, &f1, 38, None, MAX_LAG + 1), json!(["occurred_at"])),
         (
             body(&x, &f2, 39, Some("b"), 10 * MINUTE),
             json!(["celsius_x10", "equipment_id", "note"]),
@@ -955,7 +981,7 @@ async fn identity_is_required_and_checked_first() {
     assert_eq!(node.counts().unwrap(), (0, 0));
 }
 
-// domain「温度记录接口」取值、「写命令通用规则」取值与发生时间、AGENTS「HTTP 约定」：字段缺失、未知字段（含补录用的 occurred_at）、类型或取值不对、
+// domain「温度记录接口」取值、「写命令通用规则」取值与发生时间、AGENTS「HTTP 约定」：字段缺失（含 occurred_at、clock_synced_at）、未知字段、类型或取值不对、
 // 请求体无法解析，一律 400 VALIDATION_FAILED，什么都不写。
 #[tokio::test]
 async fn invalid_commands_are_rejected_with_validation_failed() {
@@ -1000,18 +1026,21 @@ async fn invalid_commands_are_rejected_with_validation_failed() {
             json!("01890a5d-ac96-474b-bcce-b302099a8301"),
         ), // v4
         with("equipment_id", Value::Null),
-        with("captured_at", json!("1791248400000")),
-        with("captured_at", json!(1.5)),
-        with("captured_at", Value::Null),
-        with("captured_at", too_big.clone()),
-        with("sent_at", json!("1791248400000")),
-        with("sent_at", json!(1.5)),
-        with("sent_at", Value::Null),
-        with("sent_at", too_big),
+        with("occurred_at", json!("1791248400000")),
+        with("occurred_at", json!(1.5)),
+        with("occurred_at", Value::Null),
+        with("occurred_at", too_big.clone()),
+        with("clock_synced_at", json!("1791248400000")),
+        with("clock_synced_at", json!(1.5)),
+        with("clock_synced_at", Value::Null),
+        with("clock_synced_at", too_big),
         with("command_id", json!("not-a-uuid")),
         with("command_id", json!("01890a5d-ac96-474b-bcce-b302099a8401")), // v4
-        with("occurred_at", json!(NOW)), // 请求体不接受 occurred_at
-        with("started_captured_at", json!(SENT)),
+        // 相对校准时代的字段、生产才有的 started_at 都是未知字段。
+        with("captured_at", json!(NOW)),
+        with("sent_at", json!(NOW)),
+        with("started_captured_at", json!(NOW)),
+        with("started_at", json!(NOW)),
         with("unit", json!("C")),
     ];
     // AGENTS「ID 与时间」：只接受 36 位小写带连字符的形式。
@@ -1025,8 +1054,8 @@ async fn invalid_commands_are_rejected_with_validation_failed() {
         "command_id",
         "equipment_id",
         "celsius_x10",
-        "captured_at",
-        "sent_at",
+        "occurred_at",
+        "clock_synced_at",
     ] {
         bodies.push(without(key));
     }

@@ -1,5 +1,10 @@
-//! 锁定测试：`boh-server init`。规则见 docs/domain.md「主数据」初始化，接口见 docs/interfaces.md「boh-server：init 子命令」。
-//! 以子进程运行编译好的二进制，只通过退出码、对数据库的只读 SQL 和 `boh_app::test_router` 观察结果。
+//! 锁定测试：`boh-server init`。规则见 docs/domain.md「主数据」初始化与「时间」门店节点校时（`init` 要求节点信号有效），
+//! 接口见 docs/interfaces.md「boh-server：init 子命令」。
+//! 以子进程运行编译好的二进制，只通过退出码、对数据库的只读 SQL、状态文件、假 NTP 服务收到的请求和 `boh_app::test_router`
+//! 观察结果。
+
+#[path = "../../boh-app/tests/spec_support/ntp.rs"]
+mod ntp;
 
 use std::convert::Infallible;
 use std::error::Error;
@@ -14,6 +19,7 @@ use boh_domain::time::{business_date, parse_business_day_cutoff, parse_timezone}
 use boh_storage::clock::{Clock, ManualClock};
 use boh_storage::rusqlite::types::Value as SqlValue;
 use boh_storage::rusqlite::{self, Connection};
+use ntp::{FakeNtp, Reply};
 use serde_json::{Value, json};
 
 const STORE_ID: &str = "01890a5d-ac96-774b-bcce-b302099a8050";
@@ -35,29 +41,71 @@ struct Paths {
     config: PathBuf,
     db: PathBuf,
     backups: PathBuf,
+    /// 状态文件 `<db_path>-clock-sync`。
+    clock_sync: PathBuf,
+    /// 配置中 `ntp_servers` 的假 NTP 服务，按配置顺序。
+    servers: Vec<FakeNtp>,
 }
 
-#[allow(clippy::unwrap_used)] // 测试夹具：临时目录或配置文件写入失败时测试无法开始，直接终止。
+impl Paths {
+    /// 各假 NTP 服务收到的请求数，按配置顺序。
+    fn requests(&self) -> Vec<u64> {
+        self.servers.iter().map(FakeNtp::requests).collect()
+    }
+
+    /// 状态文件的内容；不存在时为 `None`。
+    #[allow(clippy::unwrap_used)] // 测试辅助：除不存在以外的读取错误说明夹具有误。
+    fn clock_sync_file(&self) -> Option<String> {
+        match std::fs::read_to_string(&self.clock_sync) {
+            Ok(text) => Some(text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("read clock sync file: {error}"),
+        }
+    }
+
+    #[allow(clippy::unwrap_used)] // 测试夹具：写不进临时目录时测试无法进行。
+    fn write_clock_sync_file(&self, content: &str) {
+        std::fs::write(&self.clock_sync, content).unwrap();
+    }
+}
+
+/// 配置的 `ntp_servers` 只有一个假 NTP 服务（偏差 0），没有状态文件：init 先查询一次 NTP。
 fn paths() -> Paths {
+    paths_with(vec![FakeNtp::system(Reply::Offset(0))])
+}
+
+/// 按给定顺序把这些假 NTP 服务写进 `ntp_servers`。
+#[allow(clippy::unwrap_used)] // 测试夹具：临时目录或配置文件写入失败时测试无法开始，直接终止。
+fn paths_with(servers: Vec<FakeNtp>) -> Paths {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("boh.db");
     let backups = dir.path().join("backups");
     let config = dir.path().join("config.toml");
+    let list: Vec<String> = servers
+        .iter()
+        .map(|s| format!("\"{}\"", s.server()))
+        .collect();
     std::fs::write(
         &config,
         format!(
             "store_id = \"{STORE_ID}\"\ndb_path = {db:?}\nlisten_addr = \"127.0.0.1:0\"\n\
-             timezone = \"Asia/Shanghai\"\nbusiness_day_cutoff = \"04:00\"\nbackup_dir = {backups:?}\n",
+             timezone = \"Asia/Shanghai\"\nbusiness_day_cutoff = \"04:00\"\nbackup_dir = {backups:?}\n\
+             ntp_servers = [{list}]\n",
             db = db.display().to_string(),
             backups = backups.display().to_string(),
+            list = list.join(", "),
         ),
     )
     .unwrap();
+    let mut clock_sync = db.as_os_str().to_owned();
+    clock_sync.push("-clock-sync");
     Paths {
         _dir: dir,
         config,
         db,
         backups,
+        clock_sync: PathBuf::from(clock_sync),
+        servers,
     }
 }
 
@@ -273,6 +321,16 @@ fn init_writes_store_meta_and_preset_waste_reasons() {
     expected.sort_by(|a, b| a.1.cmp(&b.1));
     assert_eq!(projected, expected);
     assert!(!paths.backups.exists());
+
+    // domain「时间」：初始化写入的事件 clock_synced_at 为 NULL。
+    let with_client_clock: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM store_events WHERE clock_synced_at IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(with_client_clock, 0);
 }
 
 // domain「主数据」初始化：store_meta 已存在时 init 拒绝执行，以非 0 退出码结束，不改动任何数据。
@@ -318,9 +376,11 @@ fn init_rolls_back_everything_when_a_step_fails() {
     assert_eq!(reasons.len(), PRESET_WASTE_REASONS.len());
 }
 
+/// 节点上次校时取 `clock` 当前时间的 Router。
 #[allow(clippy::disallowed_methods)] // 锁定测试经 test_router 访问已初始化的数据库。
 fn router(db: &Path, clock: Clock) -> Rows<Router> {
-    Ok(boh_app::test_router(db, clock)?)
+    let synced_at = clock.now();
+    Ok(boh_app::test_router(db, clock, Some(synced_at))?)
 }
 
 /// 经开发桩身份发送 JSON 请求，返回状态码和信封。
@@ -450,4 +510,160 @@ async fn preset_waste_reasons_are_listed_and_editable_over_http() {
         .unwrap();
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["data"], json!({ "waste_reasons": rows(updated) }));
+}
+
+/// 数据库中没有任何数据：数据库文件不存在；或是一个还没有任何表的空库；或已迁移，store_meta、processed_commands、
+/// store_events 都为空。其他情况（读取失败、只有部分表）都让测试失败，不当成「没有写入」。
+#[allow(clippy::unwrap_used)] // 测试辅助：读取失败本身就是断言失败。
+fn nothing_written(db: &Path) -> bool {
+    if !db.exists() {
+        return true;
+    }
+    let tables: i64 = reader(db)
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    if tables == 0 {
+        return true;
+    }
+    everything(db).unwrap()[0..3].iter().all(Vec::is_empty)
+}
+
+/// 状态文件内容是一行十进制整数加换行，值在 [before, after] 内。
+fn assert_synced_between(content: Option<String>, before: UnixMillis, after: UnixMillis) {
+    let content = content.unwrap_or_else(|| panic!("clock sync file missing"));
+    let value: i64 = content
+        .strip_suffix('\n')
+        .and_then(|digits| digits.parse().ok())
+        .unwrap_or_else(|| panic!("clock sync file content {content:?}"));
+    assert!(
+        (before.0..=after.0).contains(&value),
+        "{value} not in {before:?}..={after:?}"
+    );
+    assert_eq!(content, format!("{value}\n"));
+}
+
+// domain「时间」门店节点校时 init：「先读状态文件」——信号有效时不查询 NTP，状态文件不变，照常初始化。
+#[test]
+fn init_uses_a_valid_state_file_without_querying_ntp() {
+    let paths = paths();
+    let synced_at = Clock::system().now().0 - 3_600_000;
+    paths.write_clock_sync_file(&format!("{synced_at}\n"));
+
+    assert!(init(&paths.config));
+
+    assert_eq!(paths.requests(), [0]);
+    assert_eq!(paths.clock_sync_file(), Some(format!("{synced_at}\n")));
+    assert_eq!(everything(&paths.db).unwrap()[0].len(), 1);
+}
+
+// init：「无效时按一次核对查询一轮，成功则写入状态文件后继续」。无效包括：没有状态文件、内容无法解析、已过期（8 天前）、
+// 晚于现在（时钟复位到过去）。查询恰好一次，状态文件改写为收到回复时的系统时间。
+#[test]
+fn init_syncs_when_there_is_no_valid_signal() {
+    let now = Clock::system().now().0;
+    for content in [
+        None,
+        Some("abc\n".to_owned()),
+        Some(format!("{}\n", now - 8 * 86_400_000)),
+        Some(format!("{}\n", now + 3_600_000)),
+    ] {
+        let paths = paths();
+        if let Some(content) = &content {
+            paths.write_clock_sync_file(content);
+        }
+        let before = Clock::system().now();
+
+        assert!(init(&paths.config), "{content:?}");
+
+        let after = Clock::system().now();
+        assert_eq!(paths.requests(), [1], "{content:?}");
+        assert_synced_between(paths.clock_sync_file(), before, after);
+        assert_eq!(everything(&paths.db).unwrap()[0].len(), 1, "{content:?}");
+    }
+}
+
+// init：「否则以非 0 退出码结束，不写任何数据」：偏差超过 1 分钟（+10 分钟、−10 分钟）、KoD、未同步的服务器、
+// 不回复（5 秒超时）都是这次核对失败。数据库中没有数据，状态文件不创建。之后服务器恢复正常，init 可以重新执行。
+#[test]
+fn init_fails_without_a_successful_sync() {
+    for reply in [
+        Reply::Offset(600_000),
+        Reply::Offset(-600_000),
+        Reply::KissOfDeath("DENY"),
+        Reply::Unsynchronized,
+        Reply::Silent,
+    ] {
+        let paths = paths_with(vec![FakeNtp::system(reply.clone())]);
+
+        assert!(!init(&paths.config), "{reply:?}");
+
+        assert_eq!(paths.requests(), [1], "{reply:?}");
+        assert!(nothing_written(&paths.db), "{reply:?}");
+        assert_eq!(paths.clock_sync_file(), None, "{reply:?}");
+
+        paths.servers[0].set_default(Reply::Offset(0));
+        assert!(init(&paths.config), "{reply:?} then ok");
+        assert_eq!(everything(&paths.db).unwrap()[0].len(), 1, "{reply:?}");
+    }
+}
+
+// init：「拿到偏差超过 1 分钟的合法回复时同样删除已有的状态文件」。已有的状态文件无效（8 天前、内容损坏）：偏差 +10 分钟、
+// −10 分钟时 init 以非 0 退出、不写数据，状态文件被删除；没有合法回复（不回复、KoD、未同步的服务器）时 init 同样以非 0 退出、
+// 不写数据，状态文件保持原样。
+#[test]
+fn init_deletes_an_invalid_state_file_on_an_offset_over_one_minute() {
+    let expired = format!("{}\n", Clock::system().now().0 - 8 * 86_400_000);
+    for content in [expired.as_str(), "abc\n"] {
+        for offset in [600_000, -600_000] {
+            let paths = paths_with(vec![FakeNtp::system(Reply::Offset(offset))]);
+            paths.write_clock_sync_file(content);
+            assert!(!init(&paths.config), "{content:?} {offset}");
+            assert_eq!(paths.requests(), [1], "{content:?} {offset}");
+            assert!(nothing_written(&paths.db), "{content:?} {offset}");
+            assert_eq!(paths.clock_sync_file(), None, "{content:?} {offset}");
+        }
+
+        for reply in [
+            Reply::Silent,
+            Reply::KissOfDeath("DENY"),
+            Reply::Unsynchronized,
+        ] {
+            let paths = paths_with(vec![FakeNtp::system(reply.clone())]);
+            paths.write_clock_sync_file(content);
+            assert!(!init(&paths.config), "{content:?} {reply:?}");
+            assert_eq!(paths.requests(), [1], "{content:?} {reply:?}");
+            assert!(nothing_written(&paths.db), "{content:?} {reply:?}");
+            assert_eq!(
+                paths.clock_sync_file().as_deref(),
+                Some(content),
+                "{content:?} {reply:?}"
+            );
+        }
+    }
+}
+
+// init 的「一次核对」与服务进程相同：按 ntp_servers 的顺序查询，没有合法回复的服务器跳过（KoD、不回复满 5 秒），
+// 第一个合法回复决定结果。
+#[test]
+fn init_tries_servers_in_order() {
+    let paths = paths_with(vec![
+        FakeNtp::system(Reply::KissOfDeath("RSTR")),
+        FakeNtp::system(Reply::Silent),
+        FakeNtp::system(Reply::Offset(0)),
+        FakeNtp::system(Reply::Offset(0)),
+    ]);
+    let before = Clock::system().now();
+
+    assert!(init(&paths.config));
+
+    let after = Clock::system().now();
+    assert_eq!(paths.requests(), [1, 1, 1, 0]);
+    assert_synced_between(paths.clock_sync_file(), before, after);
+    // 不回复的服务器至少等满 5 秒。
+    assert!(after.0 - before.0 >= 5_000, "{before:?} {after:?}");
 }

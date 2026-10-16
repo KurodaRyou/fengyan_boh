@@ -9,7 +9,7 @@ use boh_storage::{LATEST_SCHEMA_VERSION, StorageError, schema_version};
 use tempfile::TempDir;
 
 const MIGRATION_001: &str = include_str!("../../../migrations/001_initial_schema.sql");
-const MIGRATION_001_FNV1A_64: u64 = 0xfdd0_ce57_922a_6b5f;
+const MIGRATION_001_FNV1A_64: u64 = 0xebd7_91d2_0025_63c8;
 const MIGRATION_002: &str = include_str!("../../../migrations/002_equipment.sql");
 const MIGRATION_002_FNV1A_64: u64 = 0x5b5d_70a4_7c72_9418;
 const MIGRATION_003: &str = include_str!("../../../migrations/003_temperature_readings.sql");
@@ -626,6 +626,74 @@ fn strict_tables_reject_text_in_integer_columns() {
             ffi::SQLITE_CONSTRAINT_DATATYPE,
         );
     }
+}
+
+// 001 + domain「时间」：store_events.clock_synced_at 是可空的 INTEGER 列，紧跟 recorded_at，没有默认值和 CHECK。
+// 不写这一列的 INSERT（主数据、初始化等）得到 NULL；实时录入的值原样保存，含 0 和负数（取值由业务校验负责）；
+// STRICT 拒绝非数字文本和小数。
+#[test]
+fn clock_synced_at_is_a_nullable_integer_column() {
+    let (_dir, conn) = fresh_db();
+    let columns: Vec<(String, String, i64, Option<String>)> = conn
+        .prepare("SELECT name, type, \"notnull\", dflt_value FROM pragma_table_info('store_events') ORDER BY cid")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    let names: Vec<&str> = columns.iter().map(|c| c.0.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "seq",
+            "id",
+            "event_type",
+            "schema_version",
+            "aggregate_type",
+            "aggregate_id",
+            "aggregate_version",
+            "command_id",
+            "actor_id",
+            "device_id",
+            "business_date",
+            "occurred_at",
+            "recorded_at",
+            "clock_synced_at",
+            "payload",
+        ]
+    );
+    assert_eq!(
+        columns[13],
+        ("clock_synced_at".into(), "INTEGER".into(), 0, None)
+    );
+
+    insert_command(&conn, CMD, "{}").unwrap();
+    Event::new(EVT).insert(&conn).unwrap();
+    let copy = "INSERT INTO store_events (id, event_type, schema_version, aggregate_type, aggregate_id,
+                    aggregate_version, command_id, actor_id, device_id, business_date, occurred_at,
+                    recorded_at, clock_synced_at, payload)
+                SELECT ?1, event_type, schema_version, aggregate_type, ?1, aggregate_version, command_id,
+                    actor_id, device_id, business_date, occurred_at, recorded_at, ?2, payload
+                FROM store_events WHERE seq = 1";
+    conn.execute(copy, params![EVT2, TS - 60_000]).unwrap();
+    conn.execute(copy, params![EVT3, -1]).unwrap();
+    for invalid in ["'yesterday'", "1.5"] {
+        assert_sqlite_error(
+            conn.execute(
+                &copy.replace("?2", invalid),
+                params!["01890a5d-ac96-774b-bcce-b302099a805b"],
+            ),
+            ffi::SQLITE_CONSTRAINT_DATATYPE,
+        );
+    }
+    let stored: Vec<Option<i64>> = conn
+        .prepare("SELECT clock_synced_at FROM store_events ORDER BY seq")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(stored, [None, Some(TS - 60_000), Some(-1)]);
 }
 
 // AGENTS「只追加」：UPDATE / DELETE / REPLACE / UPSERT 都必须由触发器拒绝。

@@ -253,10 +253,10 @@ async fn failed_rebuild_rolls_back_every_projection() {
     assert_eq!(ledger(&db_path).unwrap(), ledger_before);
 }
 
-/// 平板发送时刻的平板本地时钟。
-const SENT: i64 = NOW.0 + 7 * 60_000;
+/// 前端上次校时：NOW 前 1 小时。
+const CLIENT_SYNCED: i64 = NOW.0 - 3_600_000;
 
-/// 记录一条温度读数：平板在 `captured_at` 录入、在 `SENT` 发送。返回完整响应。
+/// 记录一条温度读数：员工在 `occurred_at` 完成录入，前端上次校时为 `clock_synced_at`。返回完整响应。
 #[allow(clippy::unwrap_used)] // 测试夹具：响应体不是 JSON 已违反信封约定，直接终止测试。
 async fn log(
     router: &axum::Router,
@@ -264,12 +264,12 @@ async fn log(
     equipment_id: &str,
     celsius_x10: i64,
     note: Option<&str>,
-    captured_at: i64,
-    sent_at: i64,
+    occurred_at: i64,
+    clock_synced_at: i64,
 ) -> spec_support::JsonReply {
     let mut body = json!({
         "command_id": command_id, "equipment_id": equipment_id, "celsius_x10": celsius_x10,
-        "captured_at": captured_at, "sent_at": sent_at,
+        "occurred_at": occurred_at, "clock_synced_at": clock_synced_at,
     });
     if let Some(note) = note {
         body["note"] = json!(note);
@@ -283,7 +283,7 @@ async fn log(
 
 // 设备与温度记录混合的账本：在线写入后篡改两张投影（删行、改行、插入多余的行），重建后全部投影与在线写入逐行一致，
 // 账本、processed_commands 和 store_meta 不变；重建可重复执行。
-// 重建不影响幂等回执：之后用原 command_id、原内容（sent_at 不同）重发读数，原样返回首次响应（含 warnings），不新增事件。
+// 重建不影响幂等回执：之后用原 command_id、原内容（clock_synced_at 不同）重发读数，原样返回首次响应，不新增事件。
 // 账本中包含停用设备上的读数、带 / 不带 note 的读数和时钟回拨后的读数。
 #[tokio::test]
 async fn rebuild_restores_equipment_and_temperature_projections() {
@@ -299,19 +299,24 @@ async fn rebuild_restores_equipment_and_temperature_projections() {
         &a,
         -185,
         Some("门封条结霜"),
-        SENT - 600_000,
-        SENT,
+        NOW.0 - 600_000,
+        CLIENT_SYNCED,
     )
     .await;
     update(&router, &a, &cmd(4), 1, "Walk-in A", "FREEZER", true).await;
-    // 负 lag：首次响应带 CAPTURE_TIME_ADJUSTED。
-    let first = log(&router, &cmd(5), &b, 38, None, SENT + 60_000, SENT).await;
-    assert_eq!(
-        first.body["warnings"][0]["code"],
-        json!("CAPTURE_TIME_ADJUSTED")
-    );
+    // occurred_at 领先 recorded_at 30 秒，原样记录。
+    let first = log(
+        &router,
+        &cmd(5),
+        &b,
+        38,
+        None,
+        NOW.0 + 30_000,
+        CLIENT_SYNCED,
+    )
+    .await;
     update(&router, &b, &cmd(6), 1, "Walk-in", "FRIDGE", false).await;
-    log(&router, &cmd(7), &b, 41, None, SENT, SENT).await;
+    log(&router, &cmd(7), &b, 41, None, NOW.0, CLIENT_SYNCED).await;
     clock.set(UnixMillis(NOW.0 - 2 * 86_400_000));
     log(
         &router,
@@ -319,8 +324,8 @@ async fn rebuild_restores_equipment_and_temperature_projections() {
         &a,
         -180,
         Some("回拨"),
-        SENT - 60_000,
-        SENT,
+        NOW.0 - 2 * 86_400_000 - 60_000,
+        NOW.0 - 2 * 86_400_000 - 3_600_000,
     )
     .await;
     drop(router);
@@ -364,8 +369,8 @@ async fn rebuild_restores_equipment_and_temperature_projections() {
         &b,
         38,
         None,
-        SENT + 60_000,
-        SENT + 120_000,
+        NOW.0 + 30_000,
+        NOW.0 + 3_000_000,
     )
     .await;
     assert_eq!(retry.body, first.body);
@@ -670,7 +675,7 @@ fn receipt_line(
     })
 }
 
-/// 收货：平板在 `SENT − lag` 录入、在 `sent_at` 发送。返回完整响应。
+/// 收货：员工在 `NOW − lag` 完成录入，前端上次校时为 `clock_synced_at`。返回完整响应。
 #[allow(clippy::unwrap_used)] // 测试夹具：响应体不是 JSON 已违反信封约定，直接终止测试。
 async fn receive(
     router: &axum::Router,
@@ -678,11 +683,11 @@ async fn receive(
     supplier_id: &str,
     lines: Vec<Value>,
     lag: i64,
-    sent_at: i64,
+    clock_synced_at: i64,
 ) -> spec_support::JsonReply {
     let body = json!({
         "command_id": command_id, "supplier_id": supplier_id, "lines": lines,
-        "captured_at": SENT - lag, "sent_at": sent_at,
+        "occurred_at": NOW.0 - lag, "clock_synced_at": clock_synced_at,
     });
     let reply = spec_support::post(router, "/api/v1/receipts", Some(&STAFF), &body)
         .await
@@ -691,13 +696,13 @@ async fn receive(
     reply
 }
 
-// 收货的账本（同一物料两行、带生产商批号、单位换算（0.125 bag = 3125 g）、小数数量（5.25 g）、负 lag 的警告、前一营业日）：
+// 收货的账本（同一物料两行、带生产商批号、单位换算（0.125 bag = 3125 g）、小数数量（5.25 g）、领先 1 分钟的 occurred_at、前一营业日）：
 // 在线写入后篡改库存投影
 // （删批次及其流水、改余量与来源行序、改流水数量），重建后全部投影与在线写入逐行一致，账本、processed_commands 和 store_meta 不变；
 // 重建可重复执行。验收用例「批次号重建」：同次收货的 A、B 重建后仍为 RAW-FLOUR-20261006-001、…-002，source_line_no 仍为 0、1；
 // occurred_at 为 10-06 03:00 的黄油批次属于前一营业日，批次日期仍是当地日历日期 10-06（RAW-BUTTER-20261006-002）。
 // 之后黄油改为 SEMI：重建时黄油的当前分类与建批次时不同，两个 RAW-BUTTER 批次号照原样恢复，不按当前分类重新拼装。
-// 重建不影响幂等回执：之后用原 command_id、原内容（sent_at 不同）重发，原样返回首次响应（含 warnings），不新增事件。
+// 重建不影响幂等回执：之后用原 command_id、原内容（clock_synced_at 不同）重发，原样返回首次响应（含 warnings），不新增事件。
 // 重建后的批次能继续支撑新的写命令：面粉新批次的流水号接着重建出的批次取 …-004；它早于 A 到期，返回 EXPIRES_BEFORE_OLDER_STOCK；
 // 同次的黄油行取当前分类，流水号接着 RAW-BUTTER 批次取 SEMI-BUTTER-20261006-003，到期晚于已有黄油批次，不警告。
 #[tokio::test]
@@ -756,7 +761,7 @@ async fn rebuild_restores_receipt_projections() {
             receipt_line(&flour, "10", "g", "1", "2026-10-25"),
         ],
         0,
-        SENT,
+        CLIENT_SYNCED,
     )
     .await;
     let a = first.body["data"]["receipt"]["lines"][0]["lot_id"]
@@ -773,10 +778,18 @@ async fn rebuild_restores_receipt_projections() {
         with_lot_no,
         receipt_line(&flour, "0.125", "bag", "25000", "2026-10-22"),
     ];
-    let second = receive(&router, &cmd(5), &supplier, lines.clone(), -60_000, SENT).await;
+    let second = receive(
+        &router,
+        &cmd(5),
+        &supplier,
+        lines.clone(),
+        -60_000,
+        CLIENT_SYNCED,
+    )
+    .await;
     assert_eq!(
-        second.body["warnings"][0]["code"],
-        json!("CAPTURE_TIME_ADJUSTED")
+        second.body["data"]["receipt"]["occurred_at"],
+        json!(NOW.0 + 60_000)
     );
     let butter_lot = second.body["data"]["receipt"]["lines"][0]["lot_id"]
         .as_str()
@@ -801,7 +814,7 @@ async fn rebuild_restores_receipt_projections() {
         &supplier,
         vec![receipt_line(&butter, "3", "g", "1", "2026-10-20")],
         6 * 3_600_000,
-        SENT,
+        CLIENT_SYNCED,
     )
     .await;
     assert_eq!(
@@ -874,7 +887,7 @@ async fn rebuild_restores_receipt_projections() {
         &supplier,
         lines,
         -60_000,
-        SENT + 3_600_000,
+        NOW.0 - 1_800_000,
     )
     .await;
     assert_eq!(retry.body, second.body);
@@ -888,7 +901,7 @@ async fn rebuild_restores_receipt_projections() {
             receipt_line(&butter, "1", "g", "1", "2026-10-25"),
         ],
         0,
-        SENT,
+        CLIENT_SYNCED,
     )
     .await;
     let lot = reply.body["data"]["receipt"]["lines"][0]["lot_id"].clone();
@@ -944,7 +957,7 @@ async fn rebuild_refuses_goods_received_v1() {
         &supplier,
         vec![receipt_line(&flour, "5", "g", "1", "2026-10-20")],
         0,
-        SENT,
+        CLIENT_SYNCED,
     )
     .await;
     drop(router);
@@ -997,16 +1010,17 @@ fn waste_line(item_id: &str, qty: &str, lot_id: Option<&str>, confirm: bool) -> 
     line
 }
 
-/// 报损：平板在 `SENT` 录入、在 `sent_at` 发送。返回完整响应。
+/// 报损：员工在 NOW 完成录入，前端上次校时为 `clock_synced_at`。返回完整响应。
 #[allow(clippy::unwrap_used)] // 测试夹具：响应体不是 JSON 已违反信封约定，直接终止测试。
 async fn waste(
     router: &axum::Router,
     command_id: &str,
     lines: Vec<Value>,
-    sent_at: i64,
+    clock_synced_at: i64,
 ) -> spec_support::JsonReply {
     let body = json!({
-        "command_id": command_id, "lines": lines, "captured_at": SENT, "sent_at": sent_at,
+        "command_id": command_id, "lines": lines, "occurred_at": NOW.0,
+        "clock_synced_at": clock_synced_at,
     });
     let reply = spec_support::post(router, "/api/v1/waste-records", Some(&STAFF), &body)
         .await
@@ -1075,7 +1089,7 @@ fn lot_balances(db_path: &Path) -> Result<Vec<(String, i64)>, Box<dyn Error>> {
 // 报损的账本（不指定批次的 FIFO、指定批次使批次变负、账外缺口新建与累加、两个物料、一个命令多行、小数数量）：在线写入后篡改库存投影
 // （删账外缺口、改批次余量、删流水），重建后全部投影与在线写入逐行一致，账本、processed_commands 和 store_meta 不变；
 // 重建可重复执行。
-// 重建不影响幂等回执：之后用原 command_id、原内容（含确认标记，sent_at 不同）重发，原样返回首次响应，不新增事件。
+// 重建不影响幂等回执：之后用原 command_id、原内容（含确认标记，clock_synced_at 不同）重发，原样返回首次响应，不新增事件。
 // 重建后的投影能继续支撑新的写命令：面粉 A −1.75、B 10，净账面 8.25，报 8 g 不需要确认，FIFO 跳过 A，分配 B 8。
 // 批次余量是千分之一克（A −1750）。
 #[tokio::test]
@@ -1109,7 +1123,7 @@ async fn rebuild_restores_waste_projections() {
             receipt_line(&sugar, "4", "g", "1", "2026-10-20"),
         ],
         0,
-        SENT,
+        CLIENT_SYNCED,
     )
     .await;
     let lot = |i: usize| {
@@ -1123,19 +1137,19 @@ async fn rebuild_restores_waste_projections() {
         &router,
         &cmd(6),
         vec![waste_line(&flour, "2.75", None, false)],
-        SENT,
+        CLIENT_SYNCED,
     )
     .await;
     let lines = vec![
         waste_line(&flour, "4", Some(&a), true),
         waste_line(&sugar, "6", None, true),
     ];
-    let second = waste(&router, &cmd(7), lines.clone(), SENT).await;
+    let second = waste(&router, &cmd(7), lines.clone(), CLIENT_SYNCED).await;
     waste(
         &router,
         &cmd(8),
         vec![waste_line(&sugar, "1", None, true)],
-        SENT,
+        CLIENT_SYNCED,
     )
     .await;
     assert_eq!(
@@ -1170,14 +1184,14 @@ async fn rebuild_restores_waste_projections() {
     drop(writer);
 
     let router = spec_support::router(&db_path, clock.clock()).unwrap();
-    let retry = waste(&router, &cmd(7), lines, SENT + 3_600_000).await;
+    let retry = waste(&router, &cmd(7), lines, NOW.0 - 1_800_000).await;
     assert_eq!(retry.body, second.body);
     assert_eq!(ledger(&db_path).unwrap(), ledger_before);
     let reply = waste(
         &router,
         &cmd(9),
         vec![waste_line(&flour, "8", None, false)],
-        SENT,
+        CLIENT_SYNCED,
     )
     .await;
     let line = &reply.body["data"]["waste_record"]["lines"][0];
@@ -1208,7 +1222,7 @@ async fn rebuilt_lots_keep_their_fifo_order() {
             receipt_line(&flour, "10", "g", "1", "2026-10-20"),
         ],
         0,
-        SENT,
+        CLIENT_SYNCED,
     )
     .await;
     drop(router);
@@ -1227,7 +1241,7 @@ async fn rebuilt_lots_keep_their_fifo_order() {
         &router,
         &cmd(5),
         vec![waste_line(&flour, "8", None, false)],
-        SENT,
+        CLIENT_SYNCED,
     )
     .await;
     assert_eq!(
@@ -1266,7 +1280,7 @@ async fn waste_ledger(db_path: &Path) -> (String, String) {
             receipt_line(&flour, "3000", "g", "1", "2026-10-20"),
         ],
         0,
-        SENT,
+        CLIENT_SYNCED,
     )
     .await;
     drop(router);

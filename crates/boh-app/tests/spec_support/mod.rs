@@ -2,16 +2,19 @@
 //! `boh_storage::testing` 和备份目录中的文件访问系统。接口见 docs/interfaces.md。
 #![allow(dead_code)] // 每个测试文件只用到其中一部分辅助函数。
 
+pub mod ntp;
+
 use std::convert::Infallible;
 use std::error::Error;
 use std::num::NonZeroU32;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use axum::Router;
 use axum::body::{Body, to_bytes};
-use axum::http::{Method, Request, Response, StatusCode, header};
+use axum::http::{HeaderMap, Method, Request, Response, StatusCode, header};
 use boh_app::{TestNode, TestNodeConfig};
+use boh_domain::UnixMillis;
 use boh_storage::StorageError;
 use boh_storage::clock::Clock;
 use boh_storage::rusqlite::types::Value as SqlValue;
@@ -44,13 +47,66 @@ pub const STAFF: Actor = Actor {
     role: "STAFF",
 };
 
-#[allow(clippy::disallowed_methods)] // 锁定测试经 test_router 构造 Router。
+/// 一天的毫秒数。
+pub const DAY: i64 = 86_400_000;
+/// 节点信号的有效期（domain.md「时间」校时信号）：7 天。
+pub const SIGNAL_VALIDITY: i64 = 7 * DAY;
+/// `router` / `node` 默认把节点的上次校时设在构造时的这么久之前：之后时钟在
+/// [构造时 − 3 天, 构造时 + 4 天] 内时节点信号有效，业务用例可以前后移动时钟而不触发 `CLOCK_NOT_SYNCED`。
+pub const DEFAULT_SYNCED_BEFORE: i64 = 3 * DAY;
+
+/// 节点信号有效的 Router：上次校时为构造时的 `DEFAULT_SYNCED_BEFORE` 之前。
 pub fn router(db_path: &Path, clock: Clock) -> Result<Router, StorageError> {
-    boh_app::test_router(db_path, clock)
+    let synced_at = UnixMillis(clock.now().0 - DEFAULT_SYNCED_BEFORE);
+    router_synced(db_path, clock, Some(synced_at))
 }
 
-#[allow(clippy::disallowed_methods)] // 锁定测试经 test_node 构造带后台任务的节点。
+/// 指定节点上次校时（`None` 为没有信号）的 Router（docs/interfaces.md「Router 测试入口」）。
+#[allow(clippy::disallowed_methods)] // 锁定测试经 test_router 构造 Router。
+pub fn router_synced(
+    db_path: &Path,
+    clock: Clock,
+    clock_synced_at: Option<UnixMillis>,
+) -> Result<Router, StorageError> {
+    boh_app::test_router(db_path, clock, clock_synced_at)
+}
+
+/// 节点状态文件 `<db_path>-clock-sync`（domain.md「时间」门店节点校时）。
+pub fn clock_sync_file(db_path: &Path) -> PathBuf {
+    let mut path = db_path.as_os_str().to_owned();
+    path.push("-clock-sync");
+    PathBuf::from(path)
+}
+
+/// 按规定格式（一行十进制整数加换行）写状态文件。
+#[allow(clippy::unwrap_used)] // 测试夹具：写不进临时目录时测试无法进行。
+pub fn write_clock_sync_file(db_path: &Path, synced_at: i64) {
+    std::fs::write(clock_sync_file(db_path), format!("{synced_at}\n")).unwrap();
+}
+
+/// 状态文件的原始内容；不存在时为 `None`。
+#[allow(clippy::unwrap_used)] // 测试辅助：除不存在以外的读取错误说明夹具有误。
+pub fn read_clock_sync_file(db_path: &Path) -> Option<String> {
+    match std::fs::read_to_string(clock_sync_file(db_path)) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("read clock sync file: {error}"),
+    }
+}
+
+/// 节点信号有效的测试节点：先把状态文件写成构造时的 `DEFAULT_SYNCED_BEFORE` 之前，再启动。
 pub async fn node(
+    db_path: &Path,
+    clock: Clock,
+    config: TestNodeConfig,
+) -> Result<TestNode, StorageError> {
+    write_clock_sync_file(db_path, clock.now().0 - DEFAULT_SYNCED_BEFORE);
+    bare_node(db_path, clock, config).await
+}
+
+/// 不改动状态文件的测试节点（docs/interfaces.md「带后台任务的测试节点」）。
+#[allow(clippy::disallowed_methods)] // 锁定测试经 test_node 构造带后台任务的节点。
+pub async fn bare_node(
     db_path: &Path,
     clock: Clock,
     config: TestNodeConfig,
@@ -58,18 +114,36 @@ pub async fn node(
     boh_app::test_node(db_path, clock, config).await
 }
 
-/// `test_node` 的配置；`keep_count` 为 0 时 panic（测试写错）。
+/// `test_node` 的配置；`keep_count` 为 0 时 panic（测试写错）。NTP 服务指向一个已关闭的本机端口：核对都没有回复。
 pub fn node_config(
     backup_dir: &Path,
     keep_count: u32,
     timezone: &str,
     closing_backup_time: &str,
 ) -> TestNodeConfig {
+    node_config_with_ntp(
+        backup_dir,
+        keep_count,
+        timezone,
+        closing_backup_time,
+        vec![ntp::closed_server()],
+    )
+}
+
+/// 指定 `ntp_servers` 的 `test_node` 配置。
+pub fn node_config_with_ntp(
+    backup_dir: &Path,
+    keep_count: u32,
+    timezone: &str,
+    closing_backup_time: &str,
+    ntp_servers: Vec<String>,
+) -> TestNodeConfig {
     TestNodeConfig {
         backup_dir: backup_dir.to_owned(),
         backup_keep_count: NonZeroU32::new(keep_count).unwrap_or_else(|| panic!("keep_count = 0")),
         timezone: timezone.to_owned(),
         closing_backup_time: closing_backup_time.to_owned(),
+        ntp_servers,
     }
 }
 
@@ -96,6 +170,7 @@ pub fn rebuild_projections(conn: &mut Connection) -> Result<u64, StorageError> {
 pub struct JsonReply {
     pub status: StatusCode,
     pub content_type: Option<String>,
+    pub headers: HeaderMap,
     pub body: Value,
 }
 
@@ -150,11 +225,13 @@ pub async fn send(router: &Router, request: Request<Body>) -> Result<JsonReply, 
         .map(|value| value.to_str())
         .transpose()?
         .map(str::to_owned);
+    let headers = response.headers().clone();
     let bytes = to_bytes(response.into_body(), usize::MAX).await?;
     let body = serde_json::from_slice(&bytes)?;
     Ok(JsonReply {
         status,
         content_type,
+        headers,
         body,
     })
 }

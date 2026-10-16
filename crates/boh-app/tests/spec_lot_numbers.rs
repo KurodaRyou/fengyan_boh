@@ -16,8 +16,6 @@ use tempfile::TempDir;
 const NOW: i64 = 1_791_248_400_000; // 2026-10-06 09:00 +08:00
 const MINUTE: i64 = 60_000;
 const HOUR: i64 = 3_600_000;
-/// 平板时钟比节点快 7 分钟，相对校准应抵消这个偏差。
-const SKEW: i64 = 7 * MINUTE;
 /// 2026-09-10 08:00 +08:00。
 const AT_09_10_0800: i64 = 1_788_998_400_000;
 /// 2026-09-10 14:00 +08:00。
@@ -38,9 +36,15 @@ struct Node {
 
 #[allow(clippy::unwrap_used)] // 测试夹具：临时目录或 Router 构造失败时测试无法开始，直接终止。
 fn node() -> Node {
+    node_at(NOW)
+}
+
+/// 时钟从 `start` 开始；节点信号在 [start − 3 天, start + 4 天] 内有效（spec_support::router）。
+#[allow(clippy::unwrap_used)] // 测试夹具：临时目录或 Router 构造失败时测试无法开始，直接终止。
+fn node_at(start: i64) -> Node {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("boh.db");
-    let clock = ManualClock::new(UnixMillis(NOW));
+    let clock = ManualClock::new(UnixMillis(start));
     let router = spec_support::router(&db_path, clock.clock()).unwrap();
     Node {
         _dir: dir,
@@ -129,8 +133,8 @@ impl Node {
         data["supplier"]["supplier_id"].as_str().unwrap().to_owned()
     }
 
-    /// 节点时钟设为 `recorded_at` 后收货：平板在 `recorded_at + SKEW − lag` 录入、在 `recorded_at + SKEW` 发送，
-    /// 所以 `occurred_at = recorded_at − lag`。返回完整响应。
+    /// 节点时钟设为 `recorded_at` 后收货：员工在 `recorded_at − lag` 完成录入（`occurred_at`），前端上次校时为
+    /// `recorded_at` 前 1 小时。返回完整响应。
     #[allow(clippy::unwrap_used)] // 测试夹具：响应体不是 JSON 已违反信封约定，直接终止测试。
     async fn receive(
         &self,
@@ -141,14 +145,13 @@ impl Node {
         lag: i64,
     ) -> JsonReply {
         self.clock.set(UnixMillis(recorded_at));
-        let sent_at = recorded_at + SKEW;
         spec_support::post(
             &self.router,
             "/api/v1/receipts",
             Some(&STAFF),
             &json!({
                 "command_id": cmd(n), "supplier_id": supplier, "lines": lines,
-                "captured_at": sent_at - lag, "sent_at": sent_at,
+                "occurred_at": recorded_at - lag, "clock_synced_at": recorded_at - HOUR,
             }),
         )
         .await
@@ -215,7 +218,7 @@ impl Node {
 }
 
 // 验收用例「批次号与 FIFO」（domain「批次」批次日期、流水号、FIFO 分配）：面粉（RAW）09-10 08:00 收货一行；09-10 14:00 一次收货三行（面粉、黄油、面粉）；
-// 09-11 收货一行；09-12 10:00 经相对校准（lag 72 小时）入账一张 09-09 10:00 的收货，再经 lag 50 小时入账一张 09-10 08:00 的收货。
+// 09-11 收货一行；09-12 10:00 入账一张 occurred_at 为 09-09 10:00（早 72 小时）的收货，再入账一张 09-10 08:00（早 50 小时）的收货。
 // - 批次号依次为 RAW-FLOUR-20260910-001；…-20260910-002、SEMI-BUTTER-20260910-001、RAW-FLOUR-20260910-003；
 //   …-20260911-001；…-20260909-001；…-20260910-004（旧日期按已有最大流水号 + 1）。
 // - 同一命令内按行序取号；不同物料各自从 001 开始；黄油是 SEMI，类型段取物料分类。
@@ -223,8 +226,7 @@ impl Node {
 // - 库存明细按 FIFO（批次日期、流水号）排列：迟到入账的 09-09 批次排最前，09-10 的四个批次按流水号，最后是 09-11。
 #[tokio::test]
 async fn lot_numbers_follow_lot_date_and_entry_order() {
-    let node = node();
-    node.clock.set(UnixMillis(AT_09_10_0800));
+    let node = node_at(AT_09_10_0800);
     let flour = node.item(1, "FLOUR", "RAW").await;
     let butter = node.item(2, "BUTTER", "SEMI").await;
     let supplier = node.supplier(3).await;
@@ -483,7 +485,7 @@ async fn category_change_keeps_existing_lot_numbers() {
     assert_eq!(lot_ids(&original), ["RAW-FLOUR-20261006-001"]);
 
     node.set_category(4, &flour, 1, "SEMI").await;
-    // 一小时后重发：captured_at 不变，sent_at 晚一小时。
+    // 一小时后重发：occurred_at 不变（仍是 NOW），clock_synced_at 不同。
     let retry = node
         .receive(3, &supplier, vec![line(&flour, 1, exp)], NOW + HOUR, HOUR)
         .await;
@@ -652,7 +654,7 @@ async fn expiry_warning_ignores_lots_without_positive_remaining() {
             "/api/v1/waste-records",
             Some(&STAFF),
             &json!({
-                "command_id": cmd(n), "captured_at": NOW + SKEW, "sent_at": NOW + SKEW,
+                "command_id": cmd(n), "occurred_at": NOW, "clock_synced_at": NOW - HOUR,
                 "lines": [{
                     "item_id": flour, "lot_id": lot_id,
                     "input": { "qty": qty.to_string(), "unit_code": "g", "base_qty_per_unit": "1" },

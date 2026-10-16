@@ -105,7 +105,7 @@ async fn temperature_logged_with_and_without_note() {
     ] {
         let mut body = json!({
             "command_id": command_id, "equipment_id": id, "celsius_x10": celsius_x10,
-            "captured_at": NOW.0 - 60_000, "sent_at": NOW.0,
+            "occurred_at": NOW.0 - 60_000, "clock_synced_at": NOW.0 - 3_600_000,
         });
         if let Some(note) = note {
             body["note"] = json!(note);
@@ -342,7 +342,7 @@ async fn goods_received_with_and_without_manufacturer_lot_no() {
             Some(&STAFF),
             &json!({
                 "command_id": command_id, "supplier_id": supplier, "lines": [line],
-                "captured_at": NOW.0 - 60_000, "sent_at": NOW.0,
+                "occurred_at": NOW.0 - 60_000, "clock_synced_at": NOW.0 - 3_600_000,
             }),
         )
         .await
@@ -430,7 +430,7 @@ async fn waste_logged_specified_and_unspecified_lot() {
                     "produced_on": "2026-10-01", "expires_on": "2026-10-20", "line_cost_cents": 100,
                 },
             ],
-            "captured_at": NOW.0 - 60_000, "sent_at": NOW.0,
+            "occurred_at": NOW.0 - 60_000, "clock_synced_at": NOW.0 - 3_600_000,
         }),
     )
     .await;
@@ -457,7 +457,7 @@ async fn waste_logged_specified_and_unspecified_lot() {
             Some(&STAFF),
             &json!({
                 "command_id": command_id, "lines": [line],
-                "captured_at": NOW.0 - 60_000, "sent_at": NOW.0,
+                "occurred_at": NOW.0 - 60_000, "clock_synced_at": NOW.0 - 3_600_000,
             }),
         )
         .await

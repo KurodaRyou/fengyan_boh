@@ -24,10 +24,10 @@ use tempfile::TempDir;
 const NOW: i64 = 1_791_248_400_000; // 2026-10-06 09:00 +08:00
 const MINUTE: i64 = 60_000;
 const HOUR: i64 = 3_600_000;
-/// 相对校准的上限：72 小时。
+/// 「太早」的界限：recorded_at − occurred_at 超过 72 小时。
 const MAX_LAG: i64 = 259_200_000;
-/// 平板发送时刻的平板本地时钟：比节点快 7 分钟，相对校准应抵消这个偏差。
-const SENT: i64 = NOW + 7 * MINUTE;
+/// 前端上次校时：NOW 前 2 小时。
+const CLIENT_SYNCED: i64 = NOW - 2 * HOUR;
 const UNKNOWN_ID: &str = "01890a5d-ac96-774b-bcce-b302099a8399";
 const URI: &str = "/api/v1/receipts";
 
@@ -382,24 +382,24 @@ fn expiring(mut line: Value, expires_on: &str) -> Value {
     line
 }
 
-/// 实时录入的请求体：平板在 `SENT − lag` 录入、在 `SENT` 发送。
+/// 实时录入的请求体：员工在 `NOW − lag` 完成录入（前端校准后的时间），前端上次校时为 `CLIENT_SYNCED`。
 fn body(command_id: &str, supplier_id: &str, lines: Vec<Value>, lag: i64) -> Value {
-    timed_body(command_id, supplier_id, lines, SENT - lag, SENT)
+    timed_body(command_id, supplier_id, lines, NOW - lag, CLIENT_SYNCED)
 }
 
 fn timed_body(
     command_id: &str,
     supplier_id: &str,
     lines: Vec<Value>,
-    captured_at: i64,
-    sent_at: i64,
+    occurred_at: i64,
+    clock_synced_at: i64,
 ) -> Value {
     json!({
         "command_id": command_id,
         "supplier_id": supplier_id,
         "lines": lines,
-        "captured_at": captured_at,
-        "sent_at": sent_at,
+        "occurred_at": occurred_at,
+        "clock_synced_at": clock_synced_at,
     })
 }
 
@@ -473,7 +473,7 @@ fn assert_warnings(reply: &JsonReply, expected: &[(&str, Value)]) {
 //   （10-06 08:50）的当地日期；投影的 lot_date、lot_serial 由批次号拆出。
 // - 同一物料的两行分别建批次，source_line_no 为原下标（domain「批次」来源）；用基本单位提交时系数为 1。
 // - payload 的键顺序锁定在 golden 样本中；这里按 JSON 值比对。manufacturer_lot_no 省略时 payload、投影、响应都没有它。
-// - 相对校准抵消平板时钟偏差；规范化请求保留 captured_at，剥离 command_id、sent_at。
+// - occurred_at 原样记录；规范化请求保留 occurred_at，剥离 command_id、clock_synced_at。
 #[tokio::test]
 async fn receive_writes_event_lots_movements_and_command() {
     let node = node();
@@ -635,7 +635,7 @@ async fn receive_writes_event_lots_movements_and_command() {
     assert_eq!(node.on_hand(&butter).unwrap(), 500_000);
     let mut canonical = request.clone();
     canonical.as_object_mut().unwrap().remove("command_id");
-    canonical.as_object_mut().unwrap().remove("sent_at");
+    canonical.as_object_mut().unwrap().remove("clock_synced_at");
     assert_eq!(
         node.processed(&cmd(4)).unwrap(),
         ("receipt.create".into(), canonical, NOW)
@@ -792,10 +792,10 @@ async fn business_date_and_physical_at_follow_occurred_at() {
     );
 }
 
-// domain「时间」相对校准：lag < 0 按 0 处理并返回警告 CAPTURE_TIME_ADJUSTED（details 为 {}）；
-// lag 超过 72 小时 400 CAPTURE_TOO_OLD（details 为 {}），恰好 72 小时照常受理。
+// domain「时间」发生时间的校验：occurred_at 领先 recorded_at 1 分钟时照常受理、原样记录，没有警告；
+// 早于 recorded_at 超过 72 小时 400 CAPTURE_TOO_OLD（details 为 {}），恰好 72 小时照常受理。
 #[tokio::test]
-async fn relative_calibration_applies() {
+async fn capture_time_limits_apply() {
     let node = node();
     let flour = node.item(&cmd(1), "FLOUR", &[]).await;
     let supplier = node.supplier(&cmd(2), "S1").await;
@@ -811,8 +811,8 @@ async fn relative_calibration_applies() {
             ),
         )
         .await;
-    assert_eq!(receipt(&reply)["occurred_at"], json!(NOW));
-    assert_warnings(&reply, &[("CAPTURE_TIME_ADJUSTED", json!({}))]);
+    assert_eq!(receipt(&reply)["occurred_at"], json!(NOW + MINUTE));
+    assert_warnings(&reply, &[]);
 
     let before = node.state();
     let reply = node
@@ -853,7 +853,7 @@ async fn relative_calibration_applies() {
 // B（…-002）余量 5、到期 10-25；一次收货的四行依次建 …-003～…-006，批次号都排在 A、B 之后：
 // lines[0] 到期 10-15（早于 A、B），lines[1] 到期 10-25（不早于任何先扣的批次），lines[2] 到期 10-22（早于 B 和同次的 lines[1]）。
 // 每个命中的行恰好一条警告（早于多个批次也只一条），按 line 升序，details 为 {line, item_id, lot_id}（新批次）；各行都入账。
-// 另一物料的批次、到期相同的批次都不触发；CAPTURE_TIME_ADJUSTED 排在最前。
+// 另一物料的批次、到期相同的批次都不触发。
 #[tokio::test]
 async fn expiry_before_stock_used_first_warns_per_line() {
     let node = node();
@@ -899,7 +899,7 @@ async fn expiry_before_stock_used_first_warns_per_line() {
                     // 与同次的 lines[1] 同日到期：不早于任何先扣的批次。
                     expiring(line(&flour, "1", "g", "1"), "2026-10-25"),
                 ],
-                -MINUTE,
+                0,
             ),
         )
         .await;
@@ -917,7 +917,6 @@ async fn expiry_before_stock_used_first_warns_per_line() {
     assert_warnings(
         &reply,
         &[
-            ("CAPTURE_TIME_ADJUSTED", json!({})),
             (
                 "EXPIRES_BEFORE_OLDER_STOCK",
                 json!({ "line": 0, "item_id": flour, "lot_id": lots[0] }),
@@ -1296,13 +1295,21 @@ async fn invalid_values_are_validation_failed() {
     top("supplier_id uppercase", &|r| {
         r["supplier_id"] = json!(r["supplier_id"].as_str().unwrap().to_uppercase())
     });
-    top("captured_at missing", &|r| {
-        r.as_object_mut().unwrap().remove("captured_at");
+    top("occurred_at missing", &|r| {
+        r.as_object_mut().unwrap().remove("occurred_at");
     });
-    top("sent_at missing", &|r| {
-        r.as_object_mut().unwrap().remove("sent_at");
+    top("clock_synced_at missing", &|r| {
+        r.as_object_mut().unwrap().remove("clock_synced_at");
     });
-    top("occurred_at present", &|r| r["occurred_at"] = json!(NOW));
+    top("occurred_at string", &|r| {
+        r["occurred_at"] = json!(NOW.to_string())
+    });
+    top("clock_synced_at null", &|r| {
+        r["clock_synced_at"] = Value::Null
+    });
+    top("captured_at present", &|r| r["captured_at"] = json!(NOW));
+    top("sent_at present", &|r| r["sent_at"] = json!(NOW));
+    top("started_at present", &|r| r["started_at"] = json!(NOW));
     top("unknown field", &|r| r["note"] = json!("x"));
     top("command_id missing", &|r| {
         r.as_object_mut().unwrap().remove("command_id");
@@ -1459,58 +1466,13 @@ async fn invalid_values_are_validation_failed() {
     assert_eq!(node.state(), before);
 }
 
-// interfaces「calibrate」：sent_at − captured_at 溢出（正、负两个方向）时 400 VALIDATION_FAILED（details 为 {}）；
-// 时间差恰好是 i64::MAX 时不溢出，先命中「超过 72 小时」，400 CAPTURE_TOO_OLD。都什么都不写。
-#[tokio::test]
-async fn out_of_range_times_are_validation_failed() {
-    let node = node();
-    let flour = node.item(&cmd(1), "FLOUR", &[]).await;
-    let supplier = node.supplier(&cmd(2), "S1").await;
-    let before = node.state();
-
-    for (captured_at, sent_at) in [(i64::MIN, i64::MAX), (i64::MAX, i64::MIN)] {
-        let reply = node
-            .receive(
-                &STAFF,
-                &timed_body(
-                    &cmd(3),
-                    &supplier,
-                    vec![line(&flour, "1", "g", "1")],
-                    captured_at,
-                    sent_at,
-                ),
-            )
-            .await;
-        assert_eq!(
-            assert_error(&reply, 400, "VALIDATION_FAILED"),
-            &json!({}),
-            "{captured_at} {sent_at}"
-        );
-    }
-    let reply = node
-        .receive(
-            &STAFF,
-            &timed_body(
-                &cmd(3),
-                &supplier,
-                vec![line(&flour, "1", "g", "1")],
-                i64::MIN + 1,
-                0,
-            ),
-        )
-        .await;
-    assert_eq!(assert_error(&reply, 400, "CAPTURE_TOO_OLD"), &json!({}));
-
-    assert_eq!(node.state(), before);
-}
-
 // ---------------------------------------------------------------------------------------------
 // 幂等与处理顺序
 // ---------------------------------------------------------------------------------------------
 
-// 验收用例「幂等」、场景「同次收货重复提交」：一小时后用原 command_id、原内容重发（sent_at 不同，包括会超过 72 小时的值），
-// 原样返回首次响应（含 warnings、原批次号 …-001、…-002），seq 不增加，批次与流水不变；不重新计算到期提醒，
-// 也不重新分配流水号。
+// 验收用例「幂等」、场景「同次收货重复提交」：之后用原 command_id、原内容重发（clock_synced_at 不同，包括已过期的值；
+// 节点时间超过 occurred_at 72 小时），原样返回首次响应（含 warnings、原批次号 …-001、…-002），seq 不增加，批次与流水不变；
+// 不重新校验发生时间，不重新计算到期提醒，也不重新分配流水号。
 // 幂等检查先于业务校验：首次成功后换算系数变了，原内容重试仍返回首次响应，不是 409 UNIT_CONVERSION_CHANGED。
 #[tokio::test]
 async fn retries_return_the_original_response() {
@@ -1521,39 +1483,55 @@ async fn retries_return_the_original_response() {
         expiring(line(&flour, "5", "g", "1"), "2026-10-20"),
         expiring(line(&flour, "1", "bag", "25000"), "2026-10-15"),
     ];
-    let captured_at = SENT + MINUTE;
+    let occurred_at = NOW + 30_000;
     let first = node
         .receive(
             &STAFF,
-            &timed_body(&cmd(3), &supplier, lines.clone(), captured_at, SENT),
+            &timed_body(
+                &cmd(3),
+                &supplier,
+                lines.clone(),
+                occurred_at,
+                CLIENT_SYNCED,
+            ),
         )
         .await;
     let lots = lot_ids(receipt(&first));
     assert_eq!(lots, ["RAW-FLOUR-20261006-001", "RAW-FLOUR-20261006-002"]);
     assert_warnings(
         &first,
-        &[
-            ("CAPTURE_TIME_ADJUSTED", json!({})),
-            (
-                "EXPIRES_BEFORE_OLDER_STOCK",
-                json!({ "line": 1, "item_id": flour, "lot_id": lots[1] }),
-            ),
-        ],
+        &[(
+            "EXPIRES_BEFORE_OLDER_STOCK",
+            json!({ "line": 1, "item_id": flour, "lot_id": lots[1] }),
+        )],
     );
     node.update_item(&cmd(4), &flour, 1, &[("bag", "20000")], true)
         .await;
     let before = node.state();
-    node.clock.advance(Duration::from_secs(3600));
 
-    for sent_at in [SENT, captured_at + 10 * MINUTE, captured_at + MAX_LAG + 1] {
+    for (now, clock_synced_at) in [
+        (NOW + HOUR, NOW + HOUR - MINUTE),
+        (NOW + HOUR, NOW - 8 * 24 * HOUR),
+        (occurred_at + MAX_LAG + 1, occurred_at + MAX_LAG),
+    ] {
+        node.clock.set(UnixMillis(now));
         let reply = node
             .receive(
                 &STAFF,
-                &timed_body(&cmd(3), &supplier, lines.clone(), captured_at, sent_at),
+                &timed_body(
+                    &cmd(3),
+                    &supplier,
+                    lines.clone(),
+                    occurred_at,
+                    clock_synced_at,
+                ),
             )
             .await;
-        assert_eq!(reply.status, 200, "sent_at = {sent_at}");
-        assert_eq!(reply.body, first.body, "sent_at = {sent_at}");
+        assert_eq!(reply.status, 200, "clock_synced_at = {clock_synced_at}");
+        assert_eq!(
+            reply.body, first.body,
+            "clock_synced_at = {clock_synced_at}"
+        );
     }
 
     assert_eq!(node.state(), before);
@@ -1561,7 +1539,7 @@ async fn retries_return_the_original_response() {
 
 // AGENTS「幂等」：同一 command_id、内容不同时 409 IDEMPOTENCY_CONFLICT，details.fields 为不同的顶层字段名（字典序）；
 // 行内任何差异（含行序、省略可选字段）都列为 "lines"；command_type 不同时只列 "command_type"。
-// 幂等检查先于业务校验：改成不存在的供应商、过期的日期、变化的系数、72 小时以外的 captured_at，仍是 409。
+// 幂等检查先于业务校验：改成不存在的供应商、过期的日期、变化的系数、72 小时以外的 occurred_at，仍是 409。
 #[tokio::test]
 async fn idempotency_conflicts_list_differing_fields() {
     let node = node();
@@ -1642,24 +1620,24 @@ async fn idempotency_conflicts_list_differing_fields() {
             ),
             json!(["lines"]),
         ),
-        // captured_at 与 sent_at 同时前移：lag 不变，只有 captured_at 不同。
+        // occurred_at 不同（clock_synced_at 也不同，但不参与比对）。
         (
             timed_body(
                 &x,
                 &supplier,
                 lines.clone(),
-                SENT - 11 * MINUTE,
-                SENT - MINUTE,
+                NOW - 11 * MINUTE,
+                NOW - MINUTE,
             ),
-            json!(["captured_at"]),
+            json!(["occurred_at"]),
         ),
         (
             body(&x, &supplier, lines.clone(), MAX_LAG + 1),
-            json!(["captured_at"]),
+            json!(["occurred_at"]),
         ),
         (
             body(&x, &other, vec![lines[0].clone()], 0),
-            json!(["captured_at", "lines", "supplier_id"]),
+            json!(["lines", "occurred_at", "supplier_id"]),
         ),
         // 物料新建命令的 command_id 用于收货。
         (
