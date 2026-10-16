@@ -1,6 +1,6 @@
 # Fengyan BOH — 门店边缘节点
 
-烘焙门店后厨（BOH）系统的门店本地节点。部署在每家门店的一台 Linux 机器上，局域网内的平板通过浏览器（门店节点托管的 Web SPA）访问。
+烘焙门店后厨（BOH）系统的门店本地节点。部署在每家门店的一台 Linux 机器上，局域网内的平板和员工手机通过 Android / iOS 原生 App 访问。
 **断网是常态，不是异常**：所有门店内核心操作必须在完全离线时正常工作，联网后再把事件同步到总部。
 
 业务决策、事件目录与领域规则见 [docs/domain.md](docs/domain.md)；系统依赖的门店操作规范见 [docs/sop.md](docs/sop.md)；规范用词见 [docs/glossary.md](docs/glossary.md)；锁定测试使用的接口见 [docs/interfaces.md](docs/interfaces.md)；备份模块的细则见 [docs/backup.md](docs/backup.md)；不变量自检的细则见 [docs/invariant-check.md](docs/invariant-check.md)；员工认证与设备注册见 [docs/auth.md](docs/auth.md)。
@@ -117,11 +117,11 @@
 - `init` 写入 `store_meta` 和预置报损原因；第一个店长随认证切片加入。
 - 业务接口经 `Actor` 开发桩取得身份（[docs/auth.md](docs/auth.md)「开发桩」）。
 - 报损不判定吸收，每行都不被吸收。
-- 当前没有显式补录入口；温度记录、收货、报损的发生时间通过相对校准确定。
+- 当前没有显式补录入口；温度记录、收货、报损的发生时间通过相对校准确定（门店节点校时切片改为前端校时后提交的 `occurred_at`）。
 - 第一版只有一家门店、没有总部：`MASTER_DATA_CHANGED` 只有 `source = LOCAL` 的写入口，由店长维护（归属见 [docs/domain.md](docs/domain.md)「主数据」）。
 
 待做，按顺序：
-1. 定点小数（数量支持 3 位小数、小数换算系数、录入上限、库存状态上限）→ 盘点（含盘点吸收：已有的报损一并实现吸收判定）→ 局域网 HTTPS → 员工认证（`EMPLOYEE` 投影、写接口、golden 样本与第一个店长）。
+1. 定点小数（数量支持 3 位小数、小数换算系数、录入上限、库存状态上限）→ 门店节点校时（校时前拒绝写入）→ 盘点（含盘点吸收：已有的报损一并实现吸收判定）→ 局域网 HTTPS → 员工认证（`EMPLOYEE` 投影、写接口、golden 样本与第一个店长）。
 2. 扩展：生产 → 纠错（冲销、数量更正）→ 补录入口 → 销售导入。每一步配对应的验收用例。
 
 ---
@@ -153,7 +153,7 @@
 ## 架构
 
 ```
-[ 平板 Web SPA（IndexedDB 命令暂存）]  ──HTTP (LAN)──►  axum handler
+[ 平板 / 手机原生 App（本地命令暂存）]  ──HTTP (LAN)──►  axum handler
                                    │
               ┌────────────────────┴───────────────────┐
               ▼ 命令（写）                              ▼ 查询（读）
@@ -170,7 +170,7 @@
                 └─ INSERT processed_commands（含响应和 warnings）
               COMMIT
 
-   后台任务（读连接 / 备份连接）：备份、不变量自检
+   后台任务（读连接 / 备份连接）：备份、不变量自检、节点校时核对
    同步 worker（待实现，与请求完全解耦）
    └─ SELECT store_events WHERE seq > acked_seq ORDER BY seq ─► mTLS 推送总部 ─► 更新 sync_state
 ```
@@ -179,7 +179,7 @@
 
 ```
 crates/
-  boh-domain/   纯类型与校验不变量、库存规则纯函数（见「库存规则归属」）、相对校准与营业日纯函数。只允许依赖 serde / uuid / thiserror / jiff。禁止数据库、HTTP、系统 I/O（包括读系统时钟）。
+  boh-domain/   纯类型与校验不变量、库存规则纯函数（见「库存规则归属」）、发生时间校验与营业日纯函数。只允许依赖 serde / uuid / thiserror / jiff。禁止数据库、HTTP、系统 I/O（包括读系统时钟）。
   boh-storage/  SQLite：连接初始化、迁移、写入线程、读连接池、ledger（唯一写事件入口）、projections（含各事件共用的库存投影写入）、备份、时钟模块（可注入）、原生 SQL。
   boh-app/      http（路由、响应信封）、service（命令编排，含各命令共用的库存决策读取）、sync（同步 worker，待实现）。
   boh-server/   main：加载配置、启动、信号处理、优雅关闭；子命令 init、rebuild-projections；认证切片加子命令 enroll-code、unlock-device、reset-unlock-code、revoke-device、reset-pin。
@@ -276,8 +276,9 @@ scripts/        CI 扫描脚本。
 - **批次间的 FIFO 顺序看批次号**：同一物料内先比批次日期，再比流水号。批次日期在建批次时由 `occurred_at` 确定，写进 payload 中的批次号，之后不重算。
 - `recorded_at` 取系统时钟原值，**不做单调钳制**。
   - 顺序已由 `seq` 保证；钳制会让一次跳到未来的时钟把之后的时间全部卡在未来。
-- `occurred_at` 由相对校准计算（或补录时显式给出）；主数据命令和初始化取 `recorded_at`，冲销和数量更正取原事件的值。`business_date` 由 `occurred_at` 计算（`SALES_IMPORTED` 例外，由命令显式给出）。规则见 `docs/domain.md`「时间」。
+- `occurred_at` 由前端在校时信号有效期内给出（或补录时由员工填写），节点原样记录、不计算；主数据命令和初始化取 `recorded_at`，冲销和数量更正取原事件的值。`business_date` 由 `occurred_at` 计算（`SALES_IMPORTED` 例外，由命令显式给出）。规则见 `docs/domain.md`「时间」。
 - 系统时间只通过时钟模块读取，业务代码显式接收时间。
+- 门店节点和前端各自校时，校时信号 7 天内有效。节点信号无效时，业务写命令和主数据命令一律 `503 CLOCK_NOT_SYNCED`；提交时前端信号无效，或 `occurred_at` 晚于 `recorded_at` 超过 1 分钟的命令 `400 CLIENT_CLOCK_NOT_SYNCED`，前端按 domain.md「前端错误处理」显示提示页。细则见 `docs/domain.md`「时间」。
 
 ### 只追加（Append-only）
 - `store_events`、`processed_commands` 由数据库触发器禁止 `UPDATE` / `DELETE`；`store_meta` 是单行表，禁止修改和删除。
@@ -297,8 +298,8 @@ scripts/        CI 扫描脚本。
 
 ### 幂等
 - 每个写命令必须带客户端生成的 `command_id`（UUIDv7）。超时或结果未知时，客户端**必须用原 ID、原内容重试**。
-- 规范化请求：把命令反序列化成强类型结构体再序列化，剥离 `command_id` 和 `sent_at`，按 [docs/auth.md](docs/auth.md)「敏感命令的幂等」处理敏感字段后存进 `processed_commands.request`。
-  普通业务命令只剥离这两个字段（`captured_at` 是业务内容）。比对 `command_type` + 规范化请求（文本，不用哈希）；所有含 PIN 或 PIN 重置授权秘密的命令（含员工主数据权限提升）适用 [docs/auth.md](docs/auth.md)「敏感命令的幂等」的例外。
+- 规范化请求：把命令反序列化成强类型结构体再序列化，剥离 `command_id` 和 `clock_synced_at`，按 [docs/auth.md](docs/auth.md)「敏感命令的幂等」处理敏感字段后存进 `processed_commands.request`。
+  普通业务命令只剥离这两个字段（`occurred_at` 是业务内容）。比对 `command_type` + 规范化请求（文本，不用哈希）；所有含 PIN 或 PIN 重置授权秘密的命令（含员工主数据权限提升）适用 [docs/auth.md](docs/auth.md)「敏感命令的幂等」的例外。
 - **幂等检查先于任何业务校验**。
   - 同一 `command_id` + 同一 `command_type` + 同一规范化请求 → 直接返回保存的响应（含 warnings），不重复执行。
   - 同一 `command_id`，但 `command_type` 或规范化请求不同 → `409 IDEMPOTENCY_CONFLICT`，响应中给出差异字段。
@@ -390,16 +391,17 @@ scripts/        CI 扫描脚本。
 { "success": false, "data": null, "warnings": [], "error": { "code": "IDEMPOTENCY_CONFLICT", "message": "...", "details": { } } }
 ```
 
-- 警告不改变 `success`。警告码见 `docs/domain.md`：`STOCK_SHORTFALL`、`ABSORBED_BY_COUNT`、`EXPIRES_BEFORE_OLDER_STOCK`、`CAPTURE_TIME_ADJUSTED`。
+- 警告不改变 `success`。警告码见 `docs/domain.md`：`STOCK_SHORTFALL`、`ABSORBED_BY_COUNT`、`EXPIRES_BEFORE_OLDER_STOCK`。
 - 错误对象包含 `code`、`message`、`details`；`details` 总是存在，没有明细时为 `{}`。
-- HTTP 状态码要和语义一致：校验失败 400、不存在 404、幂等冲突与业务冲突 409、内部错误 500。`code` 是稳定的大写蛇形字符串，客户端按 `code` 判断，不按 `message`。
+- HTTP 状态码要和语义一致：校验失败 400、不存在 404、幂等冲突与业务冲突 409、内部错误 500、节点时钟未校时 503。`code` 是稳定的大写蛇形字符串，客户端按 `code` 判断，不按 `message`。
 - 数量和换算系数一律用小数字符串，不用 JSON 数字；金额用 JSON 整数（分）。见 `docs/domain.md`「数量」。
 - 通用错误码：结构或取值错误 `400 VALIDATION_FAILED`；引用的实体不存在 `404 REFERENCE_NOT_FOUND`。
 - 其他通用错误码：未匹配的路由 `404 ROUTE_NOT_FOUND`；方法不允许 `405 METHOD_NOT_ALLOWED`；内部错误 `500 INTERNAL_ERROR`；缺少或无效的身份 `401 UNAUTHENTICATED`；角色不够 `403 FORBIDDEN`。
 - 身份与权限通过后，请求体不是合法 JSON、缺少 `Content-Type: application/json`、字段缺失、未知字段、类型或取值不对，以及路径参数无法解析，一律 `400 VALIDATION_FAILED`。
   - axum 提取器默认返回纯文本的 415 / 422，必须转换成信封。
-- 写命令按以下顺序处理，先命中的结果生效：身份与权限 → 请求结构与取值（反序列化成强类型命令）→ 幂等检查 → 业务校验。被前两步拒绝的请求不做幂等比对。
+- 写命令按以下顺序处理，先命中的结果生效：身份与权限 → 请求结构与取值（反序列化成强类型命令）→ 幂等检查 → 节点校时信号 → 业务校验。被前两步拒绝的请求不做幂等比对。
 - 写命令成功一律 `200`，重试返回的原响应也是 `200`。
+- 需要人工处理后重提的错误码，由前端 App 底层按 `docs/domain.md`「前端错误处理」的对照表统一显示提示页和处理动作，处理后以同一个 `command_id` 重提；各业务页面不各自处理。
 - `409 IDEMPOTENCY_CONFLICT` 的 `details` 是 `{"fields": [...]}`：`command_type` 不同时只列 `"command_type"`；否则列出规范化请求中取值不同或只在一方出现的顶层字段名，按字典序排列。规范化请求包含路径参数（如设备 ID）。
 - 内部错误只记日志，不把 SQL / 内部细节返回给客户端。
 - `GET /health` 不需要身份。`data` 的字段（时间都是 UTC Unix 毫秒）：
@@ -408,6 +410,7 @@ scripts/        CI 扫描脚本。
   |---|---|
   | `status` | `"ok"` 或 `"degraded"` |
   | `schema_version` | 数据库的 `user_version` |
+  | `clock_synced` | 节点校时信号是否有效；含义见 domain.md「时间」校时信号。随门店节点校时切片加入 |
   | `clock_regression_ms` | `max(0, max(store_events.recorded_at) − now)`，账本为空时为 0；含义见 domain.md「时间」时钟异常 |
   | `last_backup_ok_at` | 本进程最近一次成功备份完成时的 `now()`；本进程还没有成功过时为 `null` |
   | `last_backup_seq` | 该次备份的 `n`（见「备份」）；同上为 `null` |
@@ -415,8 +418,8 @@ scripts/        CI 扫描脚本。
   | `wal_size_bytes` | `<数据库文件>-wal` 的大小；文件不存在时为 0 |
   | `invariant_check` | 本进程最近一次不变量自检的尝试与报告，结构见 [docs/invariant-check.md](docs/invariant-check.md)「报告」 |
 
-  - `clock_regression_ms > 300000`，`last_backup_failed_at` 不是 `null`，或 `invariant_check.last_attempt.result` 是 `violated` / `failed`，`status` 为 `degraded`；否则为 `ok`。
-    `degraded` 只是报告：不阻止任何写入，不让进程退出或重启。
+  - `clock_synced` 是 `false`，`clock_regression_ms > 300000`，`last_backup_failed_at` 不是 `null`，或 `invariant_check.last_attempt.result` 是 `violated` / `failed`，`status` 为 `degraded`；否则为 `ok`。
+    `degraded` 只是报告，不让进程退出或重启；写入是否被拒只看 `clock_synced`。
   - 备份字段只反映本进程：`null` 表示「本进程还不知道」，不表示没有备份；重启会清掉失败状态。`ok` 只表示本进程暂未发现异常，不表示已有一份可用备份。
     判断备份是否过期、重启前的历史，留到需要「门店当前是否受有效备份保护」时另行设计。
   - 生成报告成功返回 `200`（含 `degraded`）；查询数据库或读取 WAL 文件失败（文件不存在除外）返回 `500 INTERNAL_ERROR`。监控必须看 `data.status`，不能只看状态码。
@@ -448,6 +451,7 @@ ARM 门店机改用 `aarch64-unknown-linux-musl`。部署文件见 `deploy/`。
 
 ## 尚未设计（动手前先讨论）
 
+- 前端原生 App：技术栈（Android / iOS 各自开发或跨平台）、安装分发与版本更新、本地队列的持久化；时间规则已定，见 [docs/domain.md](docs/domain.md)「时间」前端校时。
 - 下行同步：主数据包的格式、拉取与导入流程（原则已定：总部维护统一的 JSON 主数据包，逐行比对快照，`source = HQ_PACKAGE`；全部主数据归总部所有，见 [docs/domain.md](docs/domain.md)「主数据」）。**总部本期不开发，延后。**
   - 设计时一并定：门店修改申请的流程；按门店下发不同物料时，下发给某店的包内引用必须完整（配方用到的物料都在包内）；物料撤出某店的下发范围时该店只停用、不删除；新门店初始化、首次主数据包导入与首位店长本地 PIN 设定的衔接（包括如何满足 `LAST_ACTIVE_MANAGER` 约束）；员工调动后在新门店的登录（认证状态不同步，见 [docs/auth.md](docs/auth.md)）。
 - 上行同步的实现：总部接收接口、批量大小、mTLS 证书下发与轮换、失败的重试分类（哪些错误可重试）。**延后**；契约见「上行同步」。

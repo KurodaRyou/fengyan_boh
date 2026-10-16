@@ -18,7 +18,7 @@
 
 | 规范名 | 中文用词 | 定义 | 详见 |
 |---|---|---|---|
-| Write path | 写入路径 | 所有写命令共用的链路，与具体业务无关：`Writer::call` → `BEGIN IMMEDIATE` → 幂等检查 → 业务校验 → `Ledger::append`（写事件并更新投影）→ 写 `processed_commands` → `COMMIT` → 返回信封 | AGENTS「架构」 |
+| Write path | 写入路径 | 所有写命令共用的链路，与具体业务无关：`Writer::call` → `BEGIN IMMEDIATE` → 幂等检查 → 节点校时信号 → 业务校验 → `Ledger::append`（写事件并更新投影）→ 写 `processed_commands` → `COMMIT` → 返回信封 | AGENTS「架构」 |
 | Single writer | 唯一写连接 | 整个节点只有 `sqlite-writer` 线程持有的一个写连接，所有写操作排队经过它 | AGENTS「SQLite」 |
 | Ledger | 账本 | `store_events` 表：只追加的事件流，是全部业务状态的唯一来源 | AGENTS「只追加」 |
 | `seq` | 提交顺序 | 账本中事件的连续序号，由 SQLite 分配；事件间的一切顺序只看它 | AGENTS「ID 与时间」 |
@@ -27,7 +27,7 @@
 | Aggregate | 聚合 | 一组相关事件共用的标识（`aggregate_type` + 聚合 ID），`aggregate_version` 给出组内顺序。只是事件上的字段，不是代码中的类层次 | domain「事件目录」 |
 | Upcast | upcast | 读取旧 `schema_version` 的 payload 时，把它转换成当前结构的函数；与单位换算无关 | AGENTS「只追加」 |
 | Idempotency | 幂等 | 同一 `command_id` 重复提交时返回原结果、不重复执行；内容不同时返回 `409 IDEMPOTENCY_CONFLICT` | AGENTS「幂等」 |
-| Canonical request | 规范化请求 | 命令反序列化成强类型结构体后再序列化、剥离 `command_id` 和 `sent_at` 得到的文本，用于幂等比对；含 PIN 或授权秘密的命令另有例外，见 auth「敏感命令的幂等」 | AGENTS「幂等」 |
+| Canonical request | 规范化请求 | 命令反序列化成强类型结构体后再序列化、剥离 `command_id` 和 `clock_synced_at` 得到的文本，用于幂等比对；含 PIN 或授权秘密的命令另有例外，见 auth「敏感命令的幂等」 | AGENTS「幂等」 |
 | Envelope | 信封 | 所有 HTTP 响应共用的外层结构：`success`、`data`、`warnings`、`error` | AGENTS「HTTP 约定」 |
 | Invariant self-check | 不变量自检 | 启动时和闭店时在读连接上检查投影是否满足不变量，`/health` 返回最近一次的结果 | invariant-check「触发」 |
 | Sync cursor | 同步游标 | `sync_state.acked_seq`：总部已确认收到的最大 `seq`，上行同步从它之后推送 | AGENTS「上行同步」 |
@@ -37,8 +37,8 @@
 | 规范名 | 中文用词 | 定义 | 详见 |
 |---|---|---|---|
 | Business date | 营业日 | 门店当地日期，早于日切时刻（必填配置 `business_day_cutoff`，如 `04:00`）的发生时间算前一营业日 | domain「时间」 |
-| Relative calibration | 相对校准 | 用平板同一时钟算出 `lag = sent_at − captured_at`，以节点的 `recorded_at − lag` 作为 `occurred_at`，抵消平板时钟偏差 | domain「时间」 |
-| Backfill | 补录 | 经显式入口直接提交过去的 `occurred_at`，不走相对校准 | domain「时间」 |
+| Clock sync signal | 校时信号 | 门店节点或前端最近一次校时成功的时间；`上次校时 ≤ 现在 ≤ 上次校时 + 7 天` 时有效，有效期内认为时间准确 | domain「时间」 |
+| Backfill | 补录 | 经显式入口提交员工填写的过去的 `occurred_at`，不要求前端校时信号，不受 72 小时限制 | domain「时间」 |
 | Fixed-point quantity | 定点数量 | 基本单位的数量，最多 3 位小数；存千分之一基本单位的整数，接口和 payload 中写成小数字符串 | domain「数量」 |
 | Unit conversion | 单位换算 | 录入数量乘换算系数得到基本单位数量（`convert_unit`），四舍五入到 0.001 基本单位 | domain「单位」 |
 | Entry limit | 录入上限 | 每次录入在所选单位下的数字绝对值不超过 9999.999 | domain「数量」 |
