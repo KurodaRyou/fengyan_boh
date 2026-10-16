@@ -80,11 +80,11 @@ occurred_at = recorded_at − lag
 | `EQUIPMENT` | 设备 | `boh_domain::equipment::EquipmentSnapshot` |
 
 - **归属**：上表全部实体都属于连锁层面，UUID 和 `code` 全连锁统一，不按门店划分。
-  - 第一版只有一家门店、没有总部：门店节点暂代主数据来源，由店长经主数据写接口维护（`source = LOCAL`）。总部上线之前不开第二家门店。
+  - 第一版只有一家门店、没有总部：门店节点暂代主数据来源，由店长经主数据写接口创建和维护全部主数据，包括物料和供应商（`source = LOCAL`）。总部上线之前不开第二家门店。
   - 接入总部后：主数据全部由总部所有，只经主数据包进入门店（`source = HQ_PACKAGE`）；门店节点关闭主数据写接口，门店只能提交修改申请。总部以这家门店现有的主数据作为初始数据，UUID 和 `code` 不变。
-  - 接入总部后，`init` 不再写入预置报损原因，由主数据包提供。
-  - 门店不自建物料，不自找供应商；总部可以按区域、按门店下发不同的物料。员工调动由总部执行。
-  - 理由：物料的 `code` 写进批次号、印在标签上，也用于销售导入，创建后不能修改；门店自建的主数据接入总部后无法与总部统一。
+  - 接入总部后，新门店的 `init` 不再创建预置报损原因或第一个店长的员工主数据，两者均由首次主数据包提供（`source = HQ_PACKAGE`），UUID 和 `code` 由总部统一分配。首位店长的本地 PIN 设定与初始化的衔接随下行同步设计，见 [AGENTS.md](../AGENTS.md)「尚未设计」。
+  - 接入总部后，门店不自建物料，不自找供应商；总部可以按区域、按门店下发不同的物料。员工调动由总部执行。
+  - 理由：物料的 `code` 写进批次号、印在标签上，也用于销售导入，创建后不能修改；多门店各自创建主数据可能造成编码冲突。
 
 - 已落地实体的样本在 `crates/boh-app/tests/golden/MASTER_DATA_CHANGED@1/`。
 
@@ -109,7 +109,7 @@ occurred_at = recorded_at − lag
 - **系统操作人**：初始化和主数据包导入在没有登录员工时，`actor_id` 使用保留 ID `00000000-0000-7000-8000-000000000000`。
 - **系统设备**：初始化和没有登录平板的主数据包导入，`device_id` 使用保留 ID `00000000-0000-7000-8000-000000000001`，表示产生事件的本门店节点。该身份不需要设备注册、设备令牌、解锁码或员工会话，不写入设备注册表；事件的 `device_id` 仍为非空 UUIDv7。
 - 两个保留 ID 不得分配给真实员工或注册平板。系统身份只由节点内部的初始化和主数据包导入入口填写，表示事件来源，不授予 HTTP 访问权限。
-- **初始化**：`boh-server init` 在一个写事务中写入 `store_meta`、预置主数据和第一个店长账号（在终端输入两次 PIN），任一步失败则全部回滚，可以重新执行。第一个店长随认证切片加入；当前写入 `store_meta` 和预置报损原因。
+- **初始化（第一版，接入总部前）**：`boh-server init` 在一个写事务中写入 `store_meta`、预置主数据和第一个店长账号（在终端输入两次 PIN），任一步失败则全部回滚，可以重新执行。第一个店长随认证切片加入；当前写入 `store_meta` 和预置报损原因。
   - 初始化是一个命令：`command_type` 为 `store.init`，`command_id` 由服务端按 AGENTS.md「ID 与时间」生成；`processed_commands` 中的规范化请求为 `{"store_id": <配置的 store_id>}`，响应为 `{}`。
   - `store_meta.created_at`、`processed_commands.recorded_at` 和每条事件的 `recorded_at` 都是同一个 `now()`；事件的 `occurred_at = recorded_at`，`business_date` 由它计算。
   - 产生的每条 `MASTER_DATA_CHANGED` 都使用上述系统 `actor_id` 和系统 `device_id`，`source = LOCAL`，`aggregate_version = 1`。
