@@ -25,48 +25,77 @@
 
 ## 时间
 
+实现状态：「校时信号」「门店节点校时」「前端校时」「发生时间」尚未实现，随「门店节点校时」切片实现。当前代码和 [interfaces.md](interfaces.md)「时间」仍按相对校准（`occurred_at = recorded_at − (sent_at − captured_at)`）计算发生时间，该切片一并修改。
+
 | 字段 | 含义 | 来源 | 用途 |
 |---|---|---|---|
 | `seq` | 提交顺序 | SQLite 分配 | 重放、同步。不用于 FIFO（见「批次」） |
-| `recorded_at` | 门店接收时间 | 系统时钟原值，不做钳制 | 审计、展示 |
-| `occurred_at` | 业务发生时间 | 相对校准，或补录时由员工填写；主数据命令和初始化取 `recorded_at`；冲销和数量更正取原事件的值 | 计算 `business_date` 和批次日期；吸收判定 |
+| `recorded_at` | 门店接收时间 | 门店节点系统时钟原值，不做钳制；写入时节点的校时信号必须有效 | 审计、展示 |
+| `occurred_at` | 业务发生时间 | 前端录入时的校准时间，或补录时由员工填写，节点原样记录、不计算；主数据命令和初始化取 `recorded_at`；冲销和数量更正取原事件的值 | 计算 `business_date` 和批次日期；吸收判定 |
 | `business_date` | 营业日 | 由 `occurred_at` 计算；`SALES_IMPORTED` 例外，由命令显式给出 | 报表归属 |
 
-**相对校准**（实时录入的默认方式）：客户端录入时记 `captured_at`，发送时带 `sent_at`，两者都是平板本地时钟。服务端计算
+**分工**：业务发生时间由前端负责，接收时间由门店节点负责。各自先校时，再记录自己负责的时间；节点不推算、不修正前端给出的发生时间。
 
-```
-lag         = sent_at − captured_at
-occurred_at = recorded_at − lag
-```
+**校时信号**：门店节点和前端各自校时，每次校时成功记下当时的时间，即「上次校时」。满足 `上次校时 ≤ 现在 ≤ 上次校时 + 7 天` 时信号有效，有效期内认为时间准确，不逐条检查。
 
-两个时间来自同一块时钟，相减后绝对偏差抵消。
-这只校准时钟偏差，不证明真实录入时点：两个时间都由客户端提交，系统不保证它们真实。系统保证留痕（见下方「展示与导出」），真实性靠 [SOP](sop.md) 与店长复核；盘点吸收不需要店长确认。
+- 「现在不早于上次校时」用来发现时钟复位到过去（如门店机主板电池耗尽）：只看间隔时，负数会被当成在有效期内。
+- 时钟在有效期内向前跳，系统不检测。
 
-- `lag < 0`：按 0 处理，返回警告 `CAPTURE_TIME_ADJUSTED`。
-- `lag > 72h`：`400 CAPTURE_TOO_OLD`。可以补录的命令（见下方「补录」）改走补录入口；盘点不能补录，重新清点后用新命令提交（见「盘点」第 1 条）。
-- 换算溢出（时间戳超出可表示范围）：`400 VALIDATION_FAILED`。
-- 生产命令可带 `started_captured_at`，用同一个 `sent_at`、`recorded_at` 按上述规则换算出 `started_at` 写进 payload。
-- 带开始时间时，先校验 `started_captured_at <= captured_at`，再计算两段 lag；开始时间也适用 72 小时上限。开始晚于完成时返回 `400 INVALID_PRODUCTION_TIME`，不得用 lag 的负值归零掩盖错误顺序。
+**门店节点校时**：
+
+- 节点系统时钟由 `systemd-timesyncd` 自动校准。节点另按配置项 `ntp_servers`（必填，至少一个）向 NTP 服务器核对系统时钟：偏差不超过 1 分钟即为一次校时成功，把当时的时间写进状态目录中的文件并 fsync，跨重启保留。启动时核对一次，之后信号无效时每分钟、有效时每小时核对一次。
+- 重启不使信号失效：节点启动时读取持久化的上次校时时间，仍满足有效条件即接受写入，不等待本次联网校时成功。核对失败（如断网）不使仍有效的信号失效；只有信号本身无效时才拒绝写入，按 SOP 校准后恢复。
+  - 理由：信号需要「最近一次校时成功的时间」并跨重启保留，timesyncd 不提供。
+- 节点信号无效时：业务写命令和主数据命令返回 `503 CLOCK_NOT_SYNCED`，`details` 为 `{}`，不写事件或 `processed_commands`；前端校时接口同样返回它。其他查询、报损预检和 `/health` 照常。
+  - 理由：节点未校时时写入的记录，`recorded_at` 不可信；批次号印在标签上后不能修改。
+  - 在写命令处理顺序中位于幂等检查之后、业务校验之前：已成功命令的原样重试照常返回首次响应。被拒的命令不落库，员工校时后再次点击提交，用同一个 `command_id` 重提。
+  - 前端按「前端错误处理」显示提示页（见 [SOP](sop.md)「门店机校时」）。
+  - 校时成功后自动恢复写入，不需要人工确认。
+  - `init` 同样要求节点信号有效，否则拒绝执行；`rebuild-projections`、备份、不变量自检不受限制。
+- 部署要求：门店节点经有线网口接入门店局域网；另有无线网卡，预先保存店长手机热点的名称和密码，热点打开时自动连接。无线连接的默认路由优先于有线网口，门店路由器在线但外网断开时，校时也走热点。
+
+**前端校时**：
+
+- 前端是 Android / iOS 原生 App，以门店节点为基准校时：经 `GET /api/v1/clock`（不需要身份）取节点当前时间，按往返耗时的一半修正（Cristian 算法），记下与设备单调时钟（不随系统时间修改而变化，如 Android 的 `SystemClock.elapsedRealtime()`）的偏差。App 内的当前时间由单调时钟加偏差得出，设备改时间不影响；设备重启后重新校时。
+- 前端只在自己的信号有效时允许录入和提交；信号无效时先校时，节点返回 `CLOCK_NOT_SYNCED` 时按 SOP 处理。
+- 录入时记下设备单调时钟的读数，保存在 App 内，不提交。首次提交时，用这个读数加当时的偏差算出 `occurred_at`（生产另算 `started_at`），随命令保存；结果未知的重试用原值、原内容。
+- 每条实时录入的写命令带：
+  - `occurred_at`：员工完成录入的时刻。生产另带 `started_at`：员工点「开始生产」的时刻。
+  - `clock_synced_at`：提交时前端的上次校时时间。它不是业务内容，规范化请求中剥离（见 AGENTS.md「幂等」）：结果未知、期间重新校过时的重试不会被判为幂等冲突。
+- 收到 `CLIENT_CLOCK_NOT_SYNCED` 时按「前端错误处理」处理：校时完成后，App 用录入时的单调时钟读数加新的偏差重算 `occurred_at`（和 `started_at`），再以同一个 `command_id` 重提。
+  - 录入之后设备重启过、单调时钟读数失效时，无法重算：这条记录改走补录入口，由员工填写发生时间。
+
+**发生时间的校验**（业务校验，在幂等检查和节点信号检查之后）：
+
+- 前端信号：不满足 `clock_synced_at ≤ recorded_at + 1 分钟` 且 `recorded_at ≤ clock_synced_at + 7 天` 时返回 `400 CLIENT_CLOCK_NOT_SYNCED`。
+  - 看提交时的信号：`occurred_at` 由录入时的单调时钟读数和提交时的偏差算出。
+- 晚于接收时间：`occurred_at`（或 `started_at`）晚于 `recorded_at` 超过 1 分钟时同样返回 `400 CLIENT_CLOCK_NOT_SYNCED`；不超过 1 分钟时照常受理，原样记录。
+  - 理由：节点信号有效时，超过 1 分钟说明前端时钟不对；处理方式与信号无效相同，所以用同一个错误码。
+- 太早：`recorded_at − occurred_at`（或 `recorded_at − started_at`）超过 72 小时时返回 `400 CAPTURE_TOO_OLD`。可以补录的命令改走补录入口；盘点不能补录，重新清点后用新命令提交（见「盘点」第 1 条）。
+- 生产带 `started_at` 时必须满足 `started_at <= occurred_at`（相等允许），不满足时返回 `400 INVALID_PRODUCTION_TIME`。实时录入和补录都适用。
+- 被拒时不写事件或 `processed_commands`；`details` 都是 `{}`。
+- 首次提交时记录的时间随事件保存；重试时返回原响应，即使已超过 72 小时也不重新校验。
 
 **补录**（显式入口；实现状态：尚未实现，随补录入口实现，前置 Q6）：
 
-- 收货、生产、报损、订货、温度记录的命令可以显式提交 `occurred_at`（生产同时提交 `started_at`），不走相对校准。
-- `occurred_at` 晚于 `recorded_at`：`400 INVALID_OCCURRED_AT`。超出锁账范围：`409 BOOKS_LOCKED`（见 Q6）。
+- 实时录入和补录在 App 中都有发生时间输入项：实时录入时 App 自动填入录入时刻的时间，补录时必须由员工主动填写。
+- 收货、生产、报损、订货、温度记录可以经补录入口提交员工填写的 `occurred_at`（生产同时提交 `started_at`）。它不是 App 录入时刻的时间，所以不带 `clock_synced_at`，不受 72 小时限制。
+- `occurred_at`（或 `started_at`）晚于 `recorded_at`：`400 INVALID_OCCURRED_AT`（填写有误，不是时钟问题，不设容差）。超出锁账范围：`409 BOOKS_LOCKED`（见 Q6）。
 - 盘点不能补录。
 - 界面交互：所选那天该物料有盘点时，提示「X 点盘过该物料，这次发生在盘点前还是盘点后？」，按选择把 `occurred_at` 设在那次盘点时间的对应一侧。
+
+**真实性**：前端提交的时间只证明「按校准后的时钟在这个时刻录入」，不证明业务真实发生在这个时刻。系统保证留痕（见下方「展示与导出」），真实性靠 [SOP](sop.md) 与店长复核；盘点吸收不需要店长确认。
 
 **通用规则**：
 
 - 一个命令产生的所有事件共用同一组 `recorded_at`、`occurred_at`、`business_date`。
 - 冲销和数量更正的 `occurred_at`、`business_date` 取原事件的值，由写入线程填写，客户端不能指定。
-- 首次提交时算出的 `occurred_at` 随事件保存；重试时返回原响应，不重新计算。
 - 创建收货、生产、报损等单据时，界面显示将要记录的发生日期和时间，供操作人员核验（见 [SOP](sop.md)「记录」）。
-- 生产带 `started_at` 时必须满足 `started_at <= occurred_at`（相等允许），相对校准和显式补录都适用。不满足时返回 `400 INVALID_PRODUCTION_TIME`，不写事件或 `processed_commands`；此校验与其他业务校验一样在幂等检查之后执行。
 - **营业日**：配置项 `timezone = "Asia/Shanghai"`（IANA 时区名）、`business_day_cutoff = "04:00"`（`'HH:MM'`），都必填，缺失或非法时拒绝启动。`occurred_at` 换算到门店当地时间，早于日切的算前一营业日。由 `jiff` 纯函数计算。修改日切配置不重算历史事件。
 - **展示与导出**：记录的展示和导出同时给出操作人、设备、`recorded_at` 和 `occurred_at`。不设阈值、不打标签，由复核的人比对两者判断。被纠错的记录与它的更正、冲销按聚合 version 顺序一起展示。
-- **时钟异常**：`recorded_at` 不保证递增，这是预期行为。`/health` 暴露 `clock_regression_ms = max(0, max(store_events.recorded_at) − now)`，超过 5 分钟时状态为 `degraded`，**不拒绝写入**。
-  - 它表示「账本中最晚的一条记录比当前时钟超前多少」，不是「最近一次回拨了多少」。主要发现当前时钟落后（如断网的门店机断电后主板时钟复位，拿不到 NTP）；只要再写入记录，「最新一条事件的 `recorded_at`」就会跟着落后，发现不了这种情况。
-  - 时钟曾跳到未来、写入记录后又被拨回时，账本只追加，那条记录一直在：指标持续 `degraded`，直到真实时间追上它。两种情况从账本上分不出来，需要结合当前时间判断。
+- **时钟异常**：`recorded_at` 不保证递增，这是预期行为。`/health` 暴露 `clock_regression_ms = max(0, max(store_events.recorded_at) − now)`，超过 5 分钟时状态为 `degraded`。这一项只报告，不拒绝写入；拒绝写入只看节点的校时信号。
+  - 它表示「账本中最晚的一条记录比当前时钟超前多少」，不是「最近一次回拨了多少」。
+  - 时钟曾跳到未来、写入记录后又被拨回时，账本只追加，那条记录一直在：指标持续 `degraded`，直到真实时间追上它。
 
 ## 主数据
 
@@ -177,7 +206,7 @@ occurred_at = recorded_at − lag
   - 生产商批号 `manufacturer_lot_no` 是另一项可选属性，不参与编号。
 - **批次日期**：建批次事件的 `occurred_at` 换算到门店时区（配置 `timezone`）的日历日期，不用营业日。
   - 收货取收货的 `occurred_at`，生产产出取生产的 `occurred_at`（完成时刻）。
-  - 例：服务器时间 10-09 00:10、lag 20 分钟，`occurred_at` 为 10-08 23:50，批次日期为 10-08。
+  - 例：10-08 23:50 录入、10-09 00:10 节点收到，`occurred_at` 为 10-08 23:50，批次日期为 10-08。
   - 补录时 `occurred_at` 由员工填写，批次日期随之是那一天。
 - **流水号**：同一物料、同一批次日期内，按入账顺序取已有最大流水号 + 1；同一命令中靠前的行先取。
   - 同一天内不还原实物先后：A 先到但后入账，B 先入账，则 B 为 `001`、A 为 `002`。
@@ -241,7 +270,7 @@ occurred_at = recorded_at − lag
 - 命令携带 `recipe_version`，按该版本计算。版本存在即可，不要求是当前版本。
 - 员工可以修改每行实际 `qty`、增加配方外的物料（`planned_qty = 0`）、把某行改为 0，也可以修改实际产出（烤坏的直接少计产出，不另记报损）。
 - 半成品（面团、馅料）也是物料，可以作为另一个配方的原料。
-- 生产界面在员工点「开始生产」时记录 `started_captured_at`（只存在客户端，提交时一起带上）。用料的实物时点取开始时间，见「盘点吸收」。
+- 生产界面在员工点「开始生产」时记录 `started_at`（只存在客户端，提交时一起带上）。用料的实物时点取开始时间，见「盘点吸收」。
 
 ## 盘点
 
@@ -251,11 +280,11 @@ occurred_at = recorded_at − lag
    - 创建盘点时选择要盘的物料：物料列表每行最左侧有勾选框，表头最左侧提供全选、反选；按勾选结果生成单物料、部分物料或全部物料的盘点表（全部 N 种物料中的 1–N 种）。选中的每个物料仍按第 3 条的完整批次范围清点和校验。
    - 每个批次行显示批次号、收货或生产时间、到期日、生产商批号。盘点表不预填清点数量，有空格时客户端不允许提交。
    - 余量为 0 的已有批次确认有实物时，按标签上的批次号经「批次查询」找到，补加到盘点表。
-   - 草稿按设备保存在平板的 `IndexedDB` 中，刷新、休眠后都能恢复。草稿保存清点数及物料 / 批次标识、营业日和重试所需的命令信息，不保存库存余量，不改变「客户端不维护库存镜像」的规则。
+   - 草稿按设备保存在 App 的本地存储中，App 重启、设备休眠后都能恢复。草稿保存清点数及物料 / 批次标识、营业日和重试所需的命令信息，不保存库存余量，不改变「客户端不维护库存镜像」的规则。
    - 提交成功后删除草稿；提交被拒时保留已填的数，刷新盘点表后只补新出现的批次行。
    - 首次提交时生成的 `command_id` 存进草稿。结果未知时草稿锁定为只读，用原 ID、原内容重试，直到拿到结果。
    - **草稿跨营业日不能提交**：草稿保存打开盘点表时门店节点返回的当前 `business_date`；首次提交或被拒后重新提交前，用库存明细查询返回的当前 `business_date` 核对，跨营业日时清空草稿、重新清点。客户端不自己计算时区和日切。结果未知的命令先按原 ID、原内容取回结果，再处理草稿的营业日。
-2. **提交盘点**：命令携带 `purpose`（`CLOSING` / `AUDIT`）和逐批次的清点结果，`captured_at` 取员工点「完成盘点」的时刻，同一事务内写入 `STOCK_COUNT_SUBMITTED` 和 `STOCK_ADJUSTED`。不加审批，提交即调整，录错就重盘。
+2. **提交盘点**：命令携带 `purpose`（`CLOSING` / `AUDIT`）和逐批次的清点结果，`occurred_at` 取员工点「完成盘点」时刻的 App 时间，同一事务内写入 `STOCK_COUNT_SUBMITTED` 和 `STOCK_ADJUSTED`。不加审批，提交即调整，录错就重盘。
    - 同一营业日可以分几次提交，每次盘一组物料；同一营业日分次提交的 `CLOSING` 盘点各自入账。拆分的单位是物料：一个物料在一次提交中清点它全部存放位置的实物，不能按存放区域拆到几次提交。本期不加存放位置字段。
 3. **范围与校验**：只针对 `lines` 里出现的物料。对其中每个物料，范围是该物料的全部批次（含余量为 0 的）加上账外缺口，范围与余量一律以门店节点提交时的值为准。
    - 填入的数量一律视为实有数量，没填不等于 0。被盘物料中余量不为 0（含负余量）的每个批次都必须出现在 `lines` 中，实物没有就填 0；缺少时返回 `400 COUNT_LINE_MISSING`，列出缺少的批次，整条命令不入账。打开盘点表之后新建的批次同样校验，客户端刷新盘点表后补填。
@@ -385,7 +414,7 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
   | `qty` | 小数，最多 3 位 | 售出数量，基本单位；退货为负 |
   | `amount_cents` | 整数 | 实收金额，单位分 |
 
-- Excel / CSV 在**平板浏览器中解析**，转成统一的 JSON 命令提交。Rust 端只处理 JSON，不为 Excel 引入依赖。命令走普通的 write path，幂等规则不变。
+- Excel / CSV 在**前端 App 中解析**，转成统一的 JSON 命令提交。Rust 端只处理 JSON，不为 Excel 引入依赖。命令走普通的 write path，幂等规则不变。
 - 营业日取自文件内容，由命令显式给出，不按 `occurred_at` 计算。一个文件只能包含一个营业日。
 - 出现未知 `item_code` 时**整份拒绝**（`400 UNKNOWN_ITEM_CODE`），列出未知编码。前厅现做、不经后厨的商品由「忽略编码清单」过滤，计入 `ignored_rows`。
 - **同一营业日可以重复导入**：每个营业日一个 `SALES_DAY` 聚合，由投影 `sales_days` 映射。第一次导入时生成 UUIDv7，之后每次 version +1；`daily_sales` 以最新版本为准。不需要冲销。
@@ -440,19 +469,33 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 ### 写命令通用规则
 
 适用于本节的写命令：主数据、温度记录、收货、报损。报损预检是 `POST`，但不是写命令：没有 `command_id`，没有幂等处理（见「报损接口」预检）。
-处理顺序见 AGENTS.md「HTTP 约定」：身份与权限 → 请求结构与取值 → 幂等检查 → 业务校验。各接口只写自己的取值、业务校验和例外。
+处理顺序见 AGENTS.md「HTTP 约定」：身份与权限 → 请求结构与取值 → 幂等检查 → 节点校时信号 → 业务校验。各接口只写自己的取值、业务校验和例外。
 
 - **取值**：不满足时 `400 VALIDATION_FAILED`，`details` 为 `{}`。
 - **新建**：服务端生成 UUIDv7 作为聚合 ID，写一条 `aggregate_version = 1` 的事件。
 - **发生时间**：
-  - 温度记录、收货、报损带 `captured_at`、`sent_at`，`occurred_at`、`business_date` 按「时间」的相对校准计算。请求体不接受 `occurred_at`（补录入口见「时间」）。
-    - 相对校准和营业日计算属于业务校验，在幂等检查之后执行。
-      理由：`recorded_at` 在写事务内才确定，`sent_at` 不在规范化请求中。重试即使带着会超限或溢出的新 `sent_at`，也返回首次响应，不重新校准。
-    - `CAPTURE_TOO_OLD`、时间溢出的 `VALIDATION_FAILED` 以及警告 `CAPTURE_TIME_ADJUSTED` 的 `details` 都是 `{}`。
-  - 主数据命令不带 `captured_at` / `sent_at`：`occurred_at = recorded_at`，`business_date` 由它计算。
+  - 温度记录、收货、报损带 `occurred_at`、`clock_synced_at`，按「时间」的「发生时间的校验」校验后原样记录，`business_date` 由 `occurred_at` 计算。
+    - 发生时间的校验和营业日计算属于业务校验，在幂等检查之后执行。
+      理由：`recorded_at` 在写事务内才确定。重试即使带着已过期的 `clock_synced_at`，也返回首次响应，不重新校验。
+  - 主数据命令不带 `occurred_at` / `clock_synced_at`：`occurred_at = recorded_at`，`business_date` 由它计算。
 - **业务校验**（幂等检查之后）：被拒绝时不写事件或 `processed_commands`。同时命中多个业务错误时，返回哪一个不作规定；接口规定了判定先后的除外（报损的不足确认在其余业务校验都通过之后判定）。
 - **引用**：引用的实体不存在时 `404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": <被引用的实体>, "id"}`，接口另有规定的除外。停用的照常受理。
 - **行下标**：带 `lines` 的命令，错误和警告 `details` 中的 `line` 是行在 `lines` 中的下标。
+
+### 前端错误处理
+
+需要人工处理后才能重提的错误码，由前端 App 的底层统一处理，各业务页面不各自处理：
+
+1. 写命令被这类错误码拒绝时，App 按下表显示提示页，提示页带处理按钮或处理说明。
+2. 员工完成处理后再点提交，App 以同一个 `command_id` 重提。被拒的命令不落库，按下表修改内容后用同一个 ID 重提不会造成幂等冲突。
+3. 结果未知（超时、断线）不属于这类：先用原 ID、原内容重试取回结果。
+
+| 错误码 | 提示页 | 处理 | 重提前修改的内容 |
+|---|---|---|---|
+| `503 CLOCK_NOT_SYNCED` | 门店机需要校时，请店长打开手机热点 | 店长按 [SOP](sop.md)「门店机校时」打开热点，门店机自动校时 | 不改 |
+| `400 CLIENT_CLOCK_NOT_SYNCED` | 本机时间需要校准 | 员工点「校时」按钮，App 对门店节点校时 | 按新的偏差重算 `occurred_at`、`started_at`，更新 `clock_synced_at`（见「时间」前端校时） |
+
+新增需要人工处理的错误码时，加进本表。
 
 ### 主数据接口
 
@@ -551,7 +594,7 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
     - 用日历日期而不是营业日：日切前（如凌晨 2 点）收到当天生产的货是正常的。
   - 流水号用尽：`409 LOT_SERIAL_EXHAUSTED`（见「批次」）。
   - 库存状态上限：`409 STOCK_LIMIT_EXCEEDED`（见「数量」）。同一物料的多行累计检查：每行看到前面各行新建的批次。
-- **警告**：`CAPTURE_TIME_ADJUSTED` 在前，之后按 `line` 升序的 `EXPIRES_BEFORE_OLDER_STOCK`（见「批次」）。
+- **警告**：按 `line` 升序的 `EXPIRES_BEFORE_OLDER_STOCK`（见「批次」）。
 - **吸收**：收货行新建批次，不被盘点吸收（见「盘点吸收」）。
 - **投影**：每行在 `inventory_lots` 建一个 `origin = 'RECEIPT'` 的批次（`lot_id` 及由它拆出的批次日期和流水号，`source_line_no` 是行下标，`remaining_qty = qty`），在 `inventory_movements` 写一条 `kind = 'RECEIPT'`、`alloc_source = 'NEW_LOT'` 的流水，`physical_at = occurred_at`。`line_cost_cents`、`produced_on` 只在事件中。
 - **`GOODS_RECEIVED@1` 不支持**：`@1` 的 `lot_id` 是 UUID，payload 中没有生成批次号所需的类型和编码，不能 upcast，也不推测。
@@ -612,11 +655,11 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
   - 需要确认但没带确认的行，照确认后的结果继续试算后续各行。全部行处理完后，存在这样的行时整条命令不入账，返回 `409 WASTE_CONFIRMATION_REQUIRED`，`details` 为 `{"lines": [{line, item_id, lot_id?, qty, item_book_qty, lot_book_qty?}]}`，按 `line` 升序列出全部这样的行，一次确认完。
   - 账面足够的行带了确认标记照常处理。
 - **重提**：
-  - 只有明确收到拒绝（如 `WASTE_CONFIRMATION_REQUIRED`）之后，才可以用同一个 `command_id` 修改内容重提：被拒绝的命令不落库。确认后重提时 `captured_at` 沿用首次填写的值，只更新 `sent_at`；超过 72 小时返回 `CAPTURE_TOO_OLD`，改走补录。
-  - 结果未知（超时、断线）时，先用原 ID、原内容重试取回结果，不能直接加确认标记。首次已成功时，原内容重试返回首次响应，即使已超过 72 小时（幂等检查先于时间校准）。
+  - 只有明确收到拒绝（如 `WASTE_CONFIRMATION_REQUIRED`）之后，才可以用同一个 `command_id` 修改内容重提：被拒绝的命令不落库。确认后重提时 `occurred_at` 沿用首次录入的值；超过 72 小时返回 `CAPTURE_TOO_OLD`，改走补录。
+  - 结果未知（超时、断线）时，先用原 ID、原内容重试取回结果，不能直接加确认标记。首次已成功时，原内容重试返回首次响应，即使已超过 72 小时（幂等检查先于时间校验）。
   - 成功之后用同一个 ID 去掉或改变确认标记：`409 IDEMPOTENCY_CONFLICT`，`fields` 为 `["lines"]`。
   - 修改某行的物料、批次或数量后，客户端清除该行的确认，重新预检。
-- **警告**：`CAPTURE_TIME_ADJUSTED`；被吸收的行另返回 `ABSORBED_BY_COUNT`（见「盘点吸收」；吸收判定随盘点切片实现，现在不产生）。
+- **警告**：被吸收的行返回 `ABSORBED_BY_COUNT`（见「盘点吸收」；吸收判定随盘点切片实现，现在不产生）。
   - 报损不返回 `STOCK_SHORTFALL`：不足已在入账前提示并确认，事件中有提交时的账面。
 - **投影**：
   - 未被吸收的行：`alloc` 按顺序每项写一条 `inventory_movements`，`kind = 'WASTE'`，`alloc_source` 取该项的 `source`，`lot_id` 取该项的 `lot_id`（`SHORTFALL` 为 `NULL`），`nominal_qty = qty_delta = −qty`，`physical_at = occurred_at`。
@@ -626,9 +669,9 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 
 **预检**：
 
-- 请求体见 `boh_domain::waste::PrecheckWaste`，只有 `lines`，取值规则同正式提交；不接受 `command_id`、`captured_at`、`sent_at` 和 `confirm_shortage`。
+- 请求体见 `boh_domain::waste::PrecheckWaste`，只有 `lines`，取值规则同正式提交；不接受 `command_id`、`occurred_at`、`clock_synced_at` 和 `confirm_shortage`。
 - 在一个读事务中执行，不写事件、`processed_commands` 或任何表；没有幂等处理。
-- 校验与正式提交相同（取值、引用、`LOT_ITEM_MISMATCH`、`ITEM_HAS_NO_LOTS`、单位、库存状态上限），错误码与 `details` 也相同。不做时间校准，也不做吸收判定（没有发生时间）。
+- 校验与正式提交相同（取值、引用、`LOT_ITEM_MISMATCH`、`ITEM_HAS_NO_LOTS`、单位、库存状态上限），错误码与 `details` 也相同。不做时间校验，也不做吸收判定（没有发生时间）。
 - 成功的 `data` 是 `{"lines": [{line, item_id, lot_id?, qty, item_book_qty, lot_book_qty?, needs_confirmation, alloc}]}`，每行一项：按正式提交的逐行处理计算，假设全部行都不被吸收、需要确认的行都已确认。`warnings` 为空数组。
 - 结果是按当前账面的估算：正式提交在写事务内重新计算，两次请求之间账面可能变化。界面把 `alloc` 显示为「按当前账面预计扣减」。
 
@@ -660,13 +703,13 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 
 - **批次追溯是账面推定**。员工实际拿的批次和系统推定的不一致时，批次余量会偏离实物，直到下一次盘点。
 - **同一天内的批次顺序按入账先后**，不还原实物到达的先后：先到但后入账的批次流水号更大，FIFO 排在后面。
-- **批次日期依赖门店节点时钟**：门店长期离线、门店节点和平板的日期都错、操作人员又没有核验界面显示的发生日期时，会产生日期错误的记录和批次号，批次号印出后不能修改。将来可以加入联网自动校时，事件同步到总部后供集中复核。
+- **批次日期依赖门店节点时钟**：节点只在校时信号有效时接受写入（见「时间」校时信号）。校时之后长期离线时，主板时钟的漂移会累积，系统不检测。
 - **盘点期间的实物变动**：系统不检测，靠操作规范禁止，违反时由重盘纠正。
-- **时钟**：系统时钟跳到未来再拨回时，期间事件的 `business_date` 是错的，不能自动修正；`/health` 会暴露这种情况，并持续 `degraded` 到真实时间追上那些记录（见「时间」时钟异常）。
-- **发生时间由员工声明**：`captured_at`、`sent_at`、生产的 `started_captured_at` 和补录的 `occurred_at` 都由客户端提交，已认证员工可以伪造；HTTPS、设备令牌和 PIN 不能证明真实录入时间。伪造会改变记录归属的营业日、盘点窗口和吸收判定。温度记录的时间就是记录内容，伪造即记录造假。系统只保证留痕（见「时间」展示与导出），防伪造靠 [SOP](sop.md) 与店长复核。实时录入不受 Q6 锁账日约束。
+- **时钟**：校时之后系统时钟仍被改到未来再拨回时（如离线期间手动改时间），期间事件的 `business_date` 是错的，不能自动修正；`/health` 会暴露这种情况，并持续 `degraded` 到真实时间追上那些记录（见「时间」时钟异常）。
+- **发生时间由前端声明**：`occurred_at`、`clock_synced_at`、生产的 `started_at` 都由客户端提交，已认证员工可以伪造；HTTPS、设备令牌和 PIN 不能证明真实录入时间。伪造会改变记录归属的营业日、盘点窗口和吸收判定。温度记录的时间就是记录内容，伪造即记录造假。系统只保证留痕（见「时间」展示与导出），防伪造靠 [SOP](sop.md) 与店长复核。实时录入不受 Q6 锁账日约束。
 - **门店节点长时间宕机**时没有离线写入能力，改用纸质登记，恢复后走补录入口，见 [SOP](sop.md)。
 - **大数量的录入精度**：录入上限按所选单位计，大数量只能精确到大单位的 0.001。例如 11680.5 g 超过 g 的录入上限，换成 kg 是 11.6805，超过 3 位小数，只能录 `11.681` kg。账面和批次余量本身不受录入上限限制。
-- **客户端暂存**：普通命令只承诺页面不刷新期间，命令进入 `IndexedDB` 队列，界面显示「待提交 N 条」。盘点草稿是例外，可跨刷新、休眠恢复，规则见「盘点」第 1 条。客户端不维护库存镜像，不做批次分配。排队命令补交被拒时，界面列出命令和原因，由人工处理。
+- **客户端暂存**：普通命令只承诺 App 不退出期间，命令进入 App 的本地队列，界面显示「待提交 N 条」。盘点草稿是例外，可跨 App 重启、休眠恢复，规则见「盘点」第 1 条。客户端不维护库存镜像，不做批次分配。排队命令补交被拒时，界面列出命令和原因，由人工处理。
 
 ## 验收用例
 
@@ -678,11 +721,11 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 | 主题 | 代表例子 | 预期 | 锁定测试（`crates/boh-app/tests/`） |
 |---|---|---|---|
 | 报损不足确认与分配 | 只有批次 A 5；报损 8 g，不指定批次 | 不带确认时 `409 WASTE_CONFIRMATION_REQUIRED`；确认后 `A 5 FIFO` + `3 SHORTFALL`；A **0**，账外缺口 **−3**，账面 **−3**；不返回 `STOCK_SHORTFALL` | `spec_waste.rs` |
-| 批次号与 FIFO | 面粉：09-10 08:00 收货一行；09-10 14:00 收货两行；09-11 收货一行；09-12 经相对校准（lag 72 小时）入账一张 09-09 的收货 | 批次号依次为 `RAW-FLOUR-20260910-001`、`…-002`、`…-003`、`…-20260911-001`、`…-20260909-001`；FIFO 先扣 `…-20260909-001` | `spec_lot_numbers.rs`、`spec_waste.rs` |
+| 批次号与 FIFO | 面粉：09-10 08:00 收货一行；09-10 14:00 收货两行；09-11 收货一行；09-12 入账一张 `occurred_at` 为 09-09、早于 `recorded_at` 不到 72 小时的收货 | 批次号依次为 `RAW-FLOUR-20260910-001`、`…-002`、`…-003`、`…-20260911-001`、`…-20260909-001`；FIFO 先扣 `…-20260909-001` | `spec_lot_numbers.rs`、`spec_waste.rs` |
 | 批次号重建 | 同次收货 A、B 后清空投影、按 `seq` 重建，再报损 8 g，不指定批次 | 批次号不变；分配 `A 5 FIFO` + `B 3 FIFO` | `spec_replay.rs` |
 | 收货日期 | 10-08 02:00 收货（营业日 10-07），`produced_on` 10-08 | 照常受理；`produced_on` 10-09 时 `400 INVALID_LOT_DATES`，`reason` `PRODUCED_IN_FUTURE` | `spec_receiving.rs` |
 | 单位换算 | 离线录入「2 袋，每袋 25000 g」；提交前换算改为 20000 | `409 UNIT_CONVERSION_CHANGED`，不入账 | `spec_receiving.rs`、`spec_waste.rs` |
-| 幂等 | 同一命令发送 2 次，`sent_at` 不同 | 第二次原样返回首次响应（含 warnings），`seq` 不增加 | 各接口的 `spec_*.rs` |
+| 幂等 | 同一命令发送 2 次，`clock_synced_at` 不同 | 第二次原样返回首次响应（含 warnings），`seq` 不增加 | 各接口的 `spec_*.rs` |
 | 单位换算与舍入 | 物料基本单位 g，单位 oz 系数 `28.349523125`；收货 `1.25` oz | `qty` **`35.437`**（35.43690390625 四舍五入，中点远离 0）；换算结果为 0 时 `400 VALIDATION_FAILED` | `spec_receiving.rs`、`spec_waste.rs`、`spec_recipes.rs` |
 | 录入上限与库存状态上限 | 面粉账面 `999990000` g；一次收货两行各 `5` kg，再收货 `0.001` g | 前者之后账面 `1000000000`，照常受理；后者 `409 STOCK_LIMIT_EXCEEDED`，`details` `{line 0, item_id}`，不入账 | `spec_receiving.rs`、`spec_waste.rs` |
 | 新批次余量越界 | 面粉批次 A −1000000000 g、B 0，净账面 −1000000000 g；收货 `1.001` 个 `max`（系数 `1000000000`） | 净账面只到 `1000000`，但新批次余量超过上限：`409 STOCK_LIMIT_EXCEEDED`，`details` `{line 0, item_id}`，不带 `lot_id`，不入账；改为 `1` 个 `max` 时新批次恰好为上限，照常受理 | `spec_waste.rs` |
@@ -694,10 +737,9 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 |---|---|---|
 | 生产期间盘点 | 面粉 100；09:10 开始生产，取 20；09:20 盘点得 80（调整 −20）；09:30 完工，用料 20，`started_at = 09:10` | 用料被吸收；账面 **80**；返回 `ABSORBED_BY_COUNT` |
 | 生产没带开始时间 | 同上，没有 `started_at` | 不被吸收，账面 **60** |
-| 生产开始晚于完成 | 相对校准命令的 `started_captured_at = 09:30`、`captured_at = 09:10`、`sent_at = 09:40`；或补录的 `started_at > occurred_at` | `400 INVALID_PRODUCTION_TIME`；库存、事件和 `processed_commands` 不变 |
-| 负 lag 不掩盖生产顺序 | `sent_at = 09:00`、`captured_at = 09:10`、`started_captured_at = 09:30` | 归零前拒绝：`400 INVALID_PRODUCTION_TIME`；不入账 |
-| 生产开始等于完成 | `started_captured_at = captured_at`，其余内容合法 | 时间顺序合法，照常处理 |
-| 开始时间超过 72 小时 | 生产完成的 lag 1 小时，开始的 lag 72 小时零 1 ms | `400 CAPTURE_TOO_OLD`；不入账 |
+| 生产开始晚于完成 | 实时录入或补录的 `started_at = 09:30`、`occurred_at = 09:10` | `400 INVALID_PRODUCTION_TIME`；库存、事件和 `processed_commands` 不变 |
+| 生产开始等于完成 | `started_at = occurred_at`，其余内容合法 | 时间顺序合法，照常处理 |
+| 开始时间超过 72 小时 | `occurred_at` 比 `recorded_at` 早 1 小时，`started_at` 早 72 小时零 1 ms | `400 CAPTURE_TOO_OLD`；不入账 |
 | 用料改为 0 | 配方每批用面粉 100 g，`batch_count` 1，没有符合吸收条件的盘点；员工把面粉的实际 `qty` 改为 0 | 面粉行 `planned_qty` **100**、`qty` **0**、`alloc` 为空数组；面粉账面不变，不写该行流水 |
 | 配方外物料 | 黄油有足够的正余量批次，没有符合吸收条件的盘点；生产时增加配方外的黄油 5 g | 黄油行 `planned_qty` **0**、`qty` **5**，按 FIFO 扣减 |
 | 迟到报损 | 100；09:00 报损 10 留在平板队列；09:20 盘点得 90（调整 −10）；09:40 报损送达 | 被吸收；账面 **90**；未解释损耗 **0** |
@@ -724,7 +766,7 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 | 零差异盘点 | 批次 A 5，没有账外缺口；清点 A 5 | 照常写 `STOCK_COUNT_SUBMITTED`、`STOCK_ADJUSTED`；调整含 A 行（`book_qty` **5**、`delta` **0**）和账外缺口行（`book_qty` **0**、`delta` **0**）；不写库存流水；写一行 `inventory_counts`（`book_qty` 5、`counted_qty` 5） |
 | 只剩账外缺口的物料 | 批次 A 0（已耗尽），账外缺口 −3；补加 A，清点 0 | A 保持 **0**；账外缺口调整 **+3** 归零；账面 **0** |
 | 清点数为负 | 批次 A、B；提交 A −1、B 5 | `400 VALIDATION_FAILED`；整条不入账（合计为正也拒绝） |
-| 盘点超过 72 小时 | 盘点的 `captured_at` 比 `sent_at` 早 72 小时零 1 ms | `400 CAPTURE_TOO_OLD`；不入账 |
+| 盘点超过 72 小时 | 盘点的 `occurred_at` 比 `recorded_at` 早 72 小时零 1 ms | `400 CAPTURE_TOO_OLD`；不入账 |
 | 冲销时批次已消耗 | 收货批次 L 10，已用掉 3，之后没有盘点；冲销这次收货 | L 扣到 **0**；账外缺口 **−3**；返回 `STOCK_SHORTFALL` |
 | 数量更正 | 收货录成 1000（实际 100），批次 L1；生产从 L1 扣 300；之后没有盘点；更正为 100 | L1 **−200**；账外缺口 **0**；返回 `STOCK_SHORTFALL` |
 | 更正多次后冲销 | 报损 10 → 更正为 8 → 更正为 6 → 冲销 | 冲销退回 **6**；报损合计 **0** |
