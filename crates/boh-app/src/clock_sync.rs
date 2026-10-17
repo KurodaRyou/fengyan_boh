@@ -4,7 +4,8 @@ use std::future::{Future, pending, poll_fn};
 use std::io::{Read, Write};
 use std::net::{Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use boh_domain::UnixMillis;
@@ -48,7 +49,7 @@ impl NtpServer {
             };
             (host, port)
         } else {
-            if value.matches(':').count() > 1 {
+            if value.parse::<Ipv6Addr>().is_ok() {
                 return Err(StorageError::Message(
                     "IPv6 addresses require square brackets",
                 ));
@@ -111,14 +112,8 @@ impl std::fmt::Display for NtpServersError {
     }
 }
 
-impl std::error::Error for NtpServersError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Empty => None,
-            Self::InvalidEntry { source, .. } => Some(source),
-        }
-    }
-}
+// Display includes the entry reason for serde; exposing it as source repeats it.
+impl std::error::Error for NtpServersError {}
 
 pub fn parse_ntp_servers(values: &[String]) -> Result<Vec<NtpServer>, NtpServersError> {
     if values.is_empty() {
@@ -138,15 +133,21 @@ pub fn parse_ntp_servers(values: &[String]) -> Result<Vec<NtpServer>, NtpServers
 }
 
 #[derive(Clone)]
-pub struct ClockSignal(watch::Sender<Option<UnixMillis>>);
+pub struct ClockSignal {
+    last_synced_at: watch::Sender<Option<UnixMillis>>,
+    invalid_logged: Arc<AtomicBool>,
+}
 
 impl ClockSignal {
     pub fn new(last_synced_at: Option<UnixMillis>) -> Self {
-        Self(watch::channel(last_synced_at).0)
+        Self {
+            last_synced_at: watch::channel(last_synced_at).0,
+            invalid_logged: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     pub fn snapshot(&self) -> Option<UnixMillis> {
-        *self.0.borrow()
+        *self.last_synced_at.borrow()
     }
 
     pub fn valid(&self, now: UnixMillis) -> bool {
@@ -155,8 +156,35 @@ impl ClockSignal {
 
     /// Validity and timestamp from one snapshot, even while a check publishes.
     pub fn status(&self, now: UnixMillis) -> (bool, Option<UnixMillis>) {
-        let last = self.snapshot();
-        (last.is_some_and(|last| clock_signal_valid(last, now)), last)
+        // Hold the watch read lock through the logging decision so publication
+        // cannot reset the marker while a reader observes the previous signal.
+        let last = self.last_synced_at.borrow();
+        let valid = last.is_some_and(|last| clock_signal_valid(last, now));
+        if valid {
+            self.invalid_logged.store(false, Ordering::Relaxed);
+        } else if let Some(last) = *last
+            && !self.invalid_logged.swap(true, Ordering::Relaxed)
+        {
+            let reason = if now < last {
+                "clock precedes last synchronization"
+            } else {
+                "expired"
+            };
+            tracing::info!(
+                reason,
+                last_synced_at = last.0,
+                now = now.0,
+                "node clock signal invalid"
+            );
+        }
+        (valid, *last)
+    }
+
+    fn publish(&self, value: Option<UnixMillis>) {
+        self.last_synced_at.send_modify(|last| {
+            *last = value;
+            self.invalid_logged.store(false, Ordering::Relaxed);
+        });
     }
 
     pub async fn load(db_path: &Path) -> Self {
@@ -237,11 +265,8 @@ fn persist(path: &Path, time: UnixMillis) -> Result<(), StorageError> {
     let mut name = path.as_os_str().to_owned();
     name.push(".tmp");
     let temp = PathBuf::from(name);
-    match std::fs::remove_file(&temp) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(StorageError::io("删除残留节点校时临时文件", error)),
-    }
+    remove_if_present(&temp)
+        .map_err(|error| StorageError::io("删除残留节点校时临时文件", error))?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -256,9 +281,7 @@ fn persist(path: &Path, time: UnixMillis) -> Result<(), StorageError> {
             .map_err(|error| StorageError::io("重命名节点校时状态文件", error))?;
         sync_directory(path)
     })();
-    if let Err(error) = std::fs::remove_file(&temp)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
+    if let Err(error) = remove_if_present(&temp) {
         let error = StorageError::io("清理节点校时临时文件", error);
         tracing::error!(error = %Diagnostic(&error), "clock state cleanup failed");
     }
@@ -266,12 +289,15 @@ fn persist(path: &Path, time: UnixMillis) -> Result<(), StorageError> {
 }
 
 fn remove_state(path: &Path) -> Result<(), StorageError> {
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(StorageError::io("删除节点校时状态文件", error)),
-    }
+    remove_if_present(path).map_err(|error| StorageError::io("删除节点校时状态文件", error))?;
     sync_directory(path)
+}
+
+fn remove_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -305,10 +331,25 @@ struct Socket<'a> {
     received: AtomicI64,
 }
 
+#[track_caller]
 fn network_error(operation: &'static str, error: std::io::Error) -> sntpc::Error {
     let error = StorageError::io(operation, error);
     tracing::debug!(error = %Diagnostic(&error), "NTP network unavailable");
     sntpc::Error::Network
+}
+
+#[track_caller]
+fn sent_datagram(sent: usize, expected: usize) -> sntpc::Result<usize> {
+    if sent != expected {
+        return Err(network_error(
+            "发送完整 NTP 数据报",
+            std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                format!("NTP datagram sent {sent} bytes; expected {expected}"),
+            ),
+        ));
+    }
+    Ok(sent)
 }
 
 impl NtpUdpSocket for Socket<'_> {
@@ -318,6 +359,7 @@ impl NtpUdpSocket for Socket<'_> {
             .send_to(buf, addr)
             .await
             .map_err(|error| network_error("发送 NTP 查询", error))
+            .and_then(|sent| sent_datagram(sent, buf.len()))
     }
     async fn recv_from(&self, buf: &mut [u8]) -> sntpc::Result<(usize, SocketAddr)> {
         let result = self
@@ -331,8 +373,8 @@ impl NtpUdpSocket for Socket<'_> {
 }
 
 enum CheckResult {
-    Synced(UnixMillis),
-    Incorrect,
+    Synced(UnixMillis, i64),
+    Incorrect(i64),
     NoReply,
 }
 
@@ -355,7 +397,7 @@ async fn query_addresses(
             Ok(result) => return Ok(result),
             // KoD applies to the server name, not just this resolved address.
             Err(error @ sntpc::Error::KissOfDeath(_)) => return Err(error),
-            // The socket adapter already recorded the I/O error with its source.
+            // The socket adapter records I/O failures and incomplete datagrams.
             Err(sntpc::Error::Network) => {}
             Err(error) => tracing::debug!(?error, %addr, "no valid NTP reply from address"),
         }
@@ -394,9 +436,9 @@ async fn query_address(addr: SocketAddr, clock: &Clock) -> Result<CheckResult, s
         return Ok(CheckResult::NoReply);
     }
     Ok(if reply.offset.unsigned_abs() <= 60_000_000 {
-        CheckResult::Synced(UnixMillis(received))
+        CheckResult::Synced(UnixMillis(received), reply.offset / 1000)
     } else {
-        CheckResult::Incorrect
+        CheckResult::Incorrect(reply.offset / 1000)
     })
 }
 
@@ -406,6 +448,7 @@ struct Checker {
     retired: Vec<NtpServer>,
     path: PathBuf,
     signal: ClockSignal,
+    last_check_succeeded: bool,
 }
 
 impl Checker {
@@ -416,11 +459,13 @@ impl Checker {
             retired: Vec::new(),
             path: state_path(db_path),
             signal,
+            last_check_succeeded: false,
         }
     }
 
     async fn check(&mut self, mut stop: Option<&mut watch::Receiver<bool>>) -> bool {
-        let mut outcome = CheckResult::NoReply;
+        self.signal.valid(self.clock.now());
+        let mut outcome = None;
         for server in &self.servers {
             if stop.as_ref().is_some_and(|stop| *stop.borrow()) {
                 return false;
@@ -431,13 +476,16 @@ impl Checker {
             let result = tokio::select! {
                 biased;
                 _ = wait_for_stop(stop.as_deref_mut()) => return false,
-                _ = self.clock.sleep(Duration::from_secs(5)) => continue,
+                _ = self.clock.sleep(Duration::from_secs(5)) => {
+                    tracing::debug!(host = %server.host, port = server.port, "NTP query timed out");
+                    continue;
+                },
                 result = query(server, &self.clock) => result,
             };
             match result {
                 Ok(CheckResult::NoReply) => {}
                 Ok(result) => {
-                    outcome = result;
+                    outcome = Some((result, server.clone()));
                     break;
                 }
                 Err(sntpc::Error::KissOfDeath(
@@ -451,13 +499,24 @@ impl Checker {
                 Err(error) => tracing::debug!(?error, host = %server.host, "no valid NTP reply"),
             }
         }
+        let Some((outcome, server)) = outcome else {
+            if self.last_check_succeeded {
+                tracing::info!("all NTP servers returned no valid reply");
+            } else {
+                tracing::debug!("all NTP servers returned no valid reply");
+            }
+            self.last_check_succeeded = false;
+            return true;
+        };
+        self.last_check_succeeded = matches!(outcome, CheckResult::Synced(..));
         let path = self.path.clone();
-        let new_signal = match outcome {
+        let (new_signal, offset_ms) = match outcome {
             CheckResult::NoReply => return true,
-            CheckResult::Synced(time) => Some(time),
-            CheckResult::Incorrect => {
-                self.signal.0.send_replace(None);
-                None
+            CheckResult::Synced(time, offset) => (Some(time), offset),
+            CheckResult::Incorrect(offset_ms) => {
+                self.signal.publish(None);
+                tracing::warn!(host = %server.host, port = server.port, offset_ms, "node clock offset exceeds one minute");
+                (None, offset_ms)
             }
         };
         // Do not select on stop here: spawn_blocking cannot be cancelled once running.
@@ -471,7 +530,14 @@ impl Checker {
         match result {
             Ok(()) => {
                 if new_signal.is_some() {
-                    self.signal.0.send_replace(new_signal);
+                    let now = self.clock.now();
+                    let was_valid = self.signal.valid(now);
+                    self.signal.publish(new_signal);
+                    if !was_valid && self.signal.valid(now) {
+                        tracing::info!(host = %server.host, port = server.port, offset_ms, "node clock signal restored");
+                    } else {
+                        tracing::debug!(host = %server.host, port = server.port, offset_ms, "node clock check succeeded");
+                    }
                 }
             }
             Err(error) => {
@@ -628,36 +694,8 @@ async fn run_schedule(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use crate::test_support::Capture as LogCapture;
     use tracing::instrument::WithSubscriber;
-
-    #[derive(Clone, Default)]
-    struct LogCapture(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for LogCapture {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl LogCapture {
-        fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
-            let capture = self.clone();
-            tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::DEBUG)
-                .with_writer(move || capture.clone())
-                .with_ansi(false)
-                .without_time()
-                .finish()
-        }
-        fn text(&self) -> String {
-            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
-        }
-    }
 
     async fn reply_once(
         kod: Option<[u8; 4]>,
@@ -725,7 +763,7 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert!(matches!(result, CheckResult::Synced(time) if time == clock.clock().now()));
+        assert!(matches!(result, CheckResult::Synced(time, _) if time == clock.clock().now()));
         reply.await.unwrap();
         assert_unused(&unused);
     }
@@ -745,7 +783,7 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert!(matches!(result, CheckResult::Incorrect));
+        assert!(matches!(result, CheckResult::Incorrect(_)));
         reply.await.unwrap();
         assert_unused(&unused);
     }
@@ -826,7 +864,13 @@ mod tests {
         assert_eq!(read_state(&path), Some(previous));
         assert!(temp.is_dir());
         let text = capture.text();
-        assert_eq!(text.lines().count(), 1, "{text}");
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.contains("caused by"))
+                .count(),
+            1,
+            "{text}"
+        );
         for part in [
             "ERROR",
             "删除残留节点校时临时文件",
@@ -862,7 +906,13 @@ mod tests {
                 .unwrap()
             );
             let text = capture.text();
-            assert_eq!(text.lines().count(), 1, "{text}");
+            assert_eq!(
+                text.lines()
+                    .filter(|line| line.contains("caused by"))
+                    .count(),
+                1,
+                "{text}"
+            );
             for part in [
                 operation,
                 "caused by",
@@ -874,5 +924,275 @@ mod tests {
                 assert!(text.contains(part), "missing {part}: {text}");
             }
         }
+    }
+
+    fn assert_log_count(text: &str, level: &str, message: &str, count: usize) {
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.contains(level) && line.contains(message))
+                .count(),
+            count,
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_logs_info_and_routine_success_logs_debug() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = boh_storage::clock::ManualClock::new(UnixMillis(1_792_137_600_000));
+        let signal = ClockSignal::new(None);
+        let mut checker = Checker::new(
+            &dir.path().join("boh.db"),
+            clock.clock(),
+            vec![],
+            signal.clone(),
+        );
+        let capture = LogCapture::default();
+        for _ in 0..2 {
+            let (addr, reply) = reply_once(None, 1).await;
+            checker.servers = vec![NtpServer::parse(&addr.to_string()).unwrap()];
+            assert!(
+                checker
+                    .check(None)
+                    .with_subscriber(capture.subscriber())
+                    .await
+            );
+            reply.await.unwrap();
+            assert!(signal.valid(clock.clock().now()));
+            let text = capture.text();
+            assert!(text.contains(&format!("port={}", addr.port())), "{text}");
+        }
+        let text = capture.text();
+        assert_log_count(&text, "INFO", "node clock signal restored", 1);
+        assert_log_count(&text, "DEBUG", "node clock check succeeded", 1);
+        for part in ["host=127.0.0.1", "offset_ms=1000"] {
+            assert!(text.contains(part), "missing {part}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn excessive_offset_invalidates_and_logs_warn_with_server_and_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = boh_storage::clock::ManualClock::new(UnixMillis(1_792_137_600_000));
+        let signal = ClockSignal::new(Some(clock.clock().now()));
+        let (addr, reply) = reply_once(None, 120).await;
+        let mut checker = Checker::new(
+            &dir.path().join("boh.db"),
+            clock.clock(),
+            vec![NtpServer::parse(&addr.to_string()).unwrap()],
+            signal.clone(),
+        );
+        let capture = LogCapture::default();
+        assert!(
+            checker
+                .check(None)
+                .with_subscriber(capture.subscriber())
+                .await
+        );
+        reply.await.unwrap();
+        assert_eq!(signal.snapshot(), None);
+        let text = capture.text();
+        assert_log_count(&text, "WARN", "node clock offset exceeds one minute", 1);
+        for part in [
+            "host=127.0.0.1",
+            &format!("port={}", addr.port()),
+            "offset_ms=120000",
+        ] {
+            assert!(text.contains(part), "missing {part}: {text}");
+        }
+
+        let (addr, reply) = reply_once(None, 0).await;
+        checker.servers = vec![NtpServer::parse(&addr.to_string()).unwrap()];
+        assert!(
+            checker
+                .check(None)
+                .with_subscriber(capture.subscriber())
+                .await
+        );
+        reply.await.unwrap();
+        assert!(signal.valid(clock.clock().now()));
+        assert_log_count(&capture.text(), "INFO", "node clock signal restored", 1);
+    }
+
+    #[test]
+    fn expired_and_regressed_signals_log_once_across_clones() {
+        let last = UnixMillis(1_792_137_600_000);
+        for (now, reason) in [
+            (UnixMillis(last.0 + 7 * 24 * 60 * 60 * 1000 + 1), "expired"),
+            (
+                UnixMillis(last.0 - 1),
+                "clock precedes last synchronization",
+            ),
+        ] {
+            let signal = ClockSignal::new(Some(last));
+            let capture = LogCapture::default();
+            tracing::subscriber::with_default(capture.subscriber(), || {
+                assert!(signal.valid(last));
+                for _ in 0..3 {
+                    assert!(!signal.clone().valid(now));
+                    assert_eq!(signal.status(now), (false, Some(last)));
+                }
+            });
+            let text = capture.text();
+            assert_log_count(&text, "INFO", "node clock signal invalid", 1);
+            assert!(text.contains(reason), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn success_to_no_reply_logs_info_once_until_next_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = boh_storage::clock::ManualClock::new(UnixMillis(1_792_137_600_000));
+        let signal = ClockSignal::new(None);
+        let mut checker = Checker::new(
+            &dir.path().join("boh.db"),
+            clock.clock(),
+            vec![],
+            signal.clone(),
+        );
+        let capture = LogCapture::default();
+        for _ in 0..2 {
+            let (addr, reply) = reply_once(None, 0).await;
+            checker.servers = vec![
+                NtpServer::parse("255.255.255.255:123").unwrap(),
+                NtpServer::parse(&addr.to_string()).unwrap(),
+            ];
+            assert!(
+                checker
+                    .check(None)
+                    .with_subscriber(capture.subscriber())
+                    .await
+            );
+            reply.await.unwrap();
+            checker.servers.truncate(1);
+            for _ in 0..3 {
+                assert!(
+                    checker
+                        .check(None)
+                        .with_subscriber(capture.subscriber())
+                        .await
+                );
+                assert!(signal.valid(clock.clock().now()));
+            }
+        }
+        let text = capture.text();
+        assert_log_count(&text, "INFO", "all NTP servers returned no valid reply", 2);
+        assert_log_count(&text, "DEBUG", "all NTP servers returned no valid reply", 4);
+    }
+
+    #[test]
+    fn server_entry_reason_is_not_repeated_in_full_diagnostic() {
+        let error = parse_ntp_servers(&["host:abc".to_owned()]).unwrap_err();
+        let error = StorageError::external("解析 NTP 服务器列表", error);
+        let text = Diagnostic(&error).to_string();
+        assert_eq!(
+            text.matches("NTP port must be a decimal integer").count(),
+            1,
+            "{text}"
+        );
+    }
+    #[test]
+    fn network_diagnostic_points_to_the_call_site() {
+        let capture = LogCapture::default();
+        let caller_line = tracing::subscriber::with_default(capture.subscriber(), || {
+            let cause = std::io::Error::from(std::io::ErrorKind::Other);
+            let caller_line = line!() + 1;
+            assert_eq!(network_error("测试网络错误", cause), sntpc::Error::Network);
+            caller_line
+        });
+        let text = capture.text();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(
+            text.contains(&format!("clock_sync.rs:{caller_line}:")),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn incomplete_datagram_logs_one_complete_network_diagnostic() {
+        let capture = LogCapture::default();
+        tracing::subscriber::with_default(capture.subscriber(), || {
+            assert_eq!(sent_datagram(47, 48), Err(sntpc::Error::Network));
+            assert_eq!(sent_datagram(48, 48), Ok(48));
+        });
+        let text = capture.text();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        for part in [
+            "DEBUG",
+            "发送完整 NTP 数据报",
+            "caused by",
+            "sent 47 bytes; expected 48",
+            "clock_sync.rs:",
+        ] {
+            assert!(text.contains(part), "missing {part}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_no_reply_stays_debug() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = boh_storage::clock::ManualClock::new(UnixMillis(1_792_137_600_000));
+        let mut checker = Checker::new(
+            &dir.path().join("boh.db"),
+            clock.clock(),
+            vec![NtpServer::parse("255.255.255.255:123").unwrap()],
+            ClockSignal::new(None),
+        );
+        let capture = LogCapture::default();
+        for _ in 0..2 {
+            assert!(
+                checker
+                    .check(None)
+                    .with_subscriber(capture.subscriber())
+                    .await
+            );
+        }
+        let text = capture.text();
+        assert_log_count(&text, "INFO", "all NTP servers returned no valid reply", 0);
+        assert_log_count(&text, "DEBUG", "all NTP servers returned no valid reply", 2);
+    }
+    #[tokio::test]
+    async fn failed_persistence_does_not_report_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("boh.db");
+        let temp = dir.path().join("boh.db-clock-sync.tmp");
+        std::fs::create_dir(&temp).unwrap();
+        let clock = boh_storage::clock::ManualClock::new(UnixMillis(1_792_137_600_000));
+        let signal = ClockSignal::new(None);
+        let (addr, reply) = reply_once(None, 0).await;
+        let mut checker = Checker::new(
+            &db,
+            clock.clock(),
+            vec![NtpServer::parse(&addr.to_string()).unwrap()],
+            signal.clone(),
+        );
+        let capture = LogCapture::default();
+        assert!(
+            checker
+                .check(None)
+                .with_subscriber(capture.subscriber())
+                .await
+        );
+        reply.await.unwrap();
+        assert_eq!(signal.snapshot(), None);
+        assert_log_count(&capture.text(), "INFO", "node clock signal restored", 0);
+        assert_log_count(
+            &capture.text(),
+            "ERROR",
+            "clock state persistence failed",
+            1,
+        );
+        std::fs::remove_dir(&temp).unwrap();
+        let (addr, reply) = reply_once(None, 0).await;
+        checker.servers = vec![NtpServer::parse(&addr.to_string()).unwrap()];
+        assert!(
+            checker
+                .check(None)
+                .with_subscriber(capture.subscriber())
+                .await
+        );
+        reply.await.unwrap();
+        assert!(signal.valid(clock.clock().now()));
+        assert_log_count(&capture.text(), "INFO", "node clock signal restored", 1);
     }
 }

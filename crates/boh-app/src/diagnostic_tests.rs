@@ -1,48 +1,13 @@
 //! Capture the real request diagnostic exit, including a cancelled caller.
-use std::io::{self, Write};
-use std::sync::{Arc, Mutex};
 
 use axum::http::Method;
 use boh_domain::AggregateId;
 use boh_storage::StorageError;
 use tracing::instrument::WithSubscriber;
-use tracing_subscriber::fmt::MakeWriter;
 
 use super::{assert_internal_error, create, node, send};
 use crate::actor::{Actor, Role};
-
-#[derive(Clone, Default)]
-struct Capture(Arc<Mutex<Vec<u8>>>);
-
-impl Write for Capture {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for Capture {
-    type Writer = Self;
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
-impl Capture {
-    fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
-        tracing_subscriber::fmt()
-            .with_writer(self.clone())
-            .with_ansi(false)
-            .without_time()
-            .finish()
-    }
-    fn text(&self) -> String {
-        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
-    }
-}
+use crate::test_support::Capture;
 
 async fn fail_equipment_insert(node: &super::Node) {
     node.storage

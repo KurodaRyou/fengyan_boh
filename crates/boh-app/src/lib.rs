@@ -11,6 +11,8 @@ pub use invariant_check::InvariantCheckHold;
 mod service;
 pub use service::master_data::initialize_store;
 #[cfg(test)]
+mod test_support;
+#[cfg(test)]
 mod tests;
 
 use std::num::{NonZeroU32, NonZeroUsize};

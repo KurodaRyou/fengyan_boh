@@ -151,6 +151,8 @@ ntp_servers = ["ntp.aliyun.com"]
             ("host:0", "1..=65535"),
             ("host:65536", "1..=65535"),
             ("host:abc", "decimal integer"),
+            ("ntp.aliyun.com:12:34", "port must be a decimal integer"),
+            ("host::123", "port must be a decimal integer"),
             ("host:", "decimal integer"),
         ] {
             let text = VALID.replace(
