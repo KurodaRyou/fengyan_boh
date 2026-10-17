@@ -1,5 +1,7 @@
 # /etc/systemd/system/boh.service
 # 同时将 deploy/60-boh-timesyncd.conf 安装到 /etc/systemd/timesyncd.conf.d/60-boh-timesyncd.conf。
+# 将 deploy/60-boh-resolved.conf 安装到 /etc/systemd/resolved.conf.d/60-boh-resolved.conf。
+# 按这两个片段中的注释关闭网口 NTP 下发并设置 /etc/resolv.conf 的 stub 链接。
 [Unit]
 Description=Fengyan BOH store edge node
 # 只依赖 network.target，不依赖 network-online：断网是正常工作状态
