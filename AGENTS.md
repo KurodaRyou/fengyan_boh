@@ -1,7 +1,7 @@
 # Fengyan BOH — 门店边缘节点
 
 烘焙门店后厨（BOH）系统的门店本地节点。部署在每家门店的一台 Linux 机器上，局域网内由门店统一采购、纳入设备管理的平板和手机通过 Android / iOS 原生 App 访问（部署要求见 [docs/domain.md](docs/domain.md)「时间」前端校时）。
-**断网是常态，不是异常**：门店节点和前端的校时信号有效时，所有门店内核心操作无需外网即可正常工作，联网后再把事件同步到总部。节点无有效校时信号时，按 [SOP](docs/sop.md)「门店机校时」打开手机热点联网校准，获得有效信号后恢复写入；前端无有效信号时，先向门店节点校时。没有可用热点时，继续采用纸面登记流程。
+**断网是常态，不是异常**：门店节点和前端的校时信号有效时，所有门店内核心操作无需外网即可正常工作，联网后再把事件同步到总部。节点无有效校时信号时，按 [SOP](docs/sop.md)「门店机校时」打开手机热点联网校准，获得有效信号后恢复写入；前端无有效信号时，先向门店节点校时。没有可用热点时，继续采用纸面登记流程。平板连不上门店节点时，未发出的记录改用纸面登记、恢复后补录；结果未知的记录由 App 后台任务用原 ID 重试，需要时在门店机工作站核对（见 [docs/domain.md](docs/domain.md)「命令提交与结果未知」）。
 
 业务决策、事件目录与领域规则见 [docs/domain.md](docs/domain.md)；系统依赖的门店操作规范见 [docs/sop.md](docs/sop.md)；规范用词见 [docs/glossary.md](docs/glossary.md)；锁定测试使用的接口见 [docs/interfaces.md](docs/interfaces.md)；备份模块的细则见 [docs/backup.md](docs/backup.md)；不变量自检的细则见 [docs/invariant-check.md](docs/invariant-check.md)；员工认证与设备注册见 [docs/auth.md](docs/auth.md)。
 
@@ -111,18 +111,19 @@
 
 ### 路线图
 
-已完成：write path 与基础设施；设备主数据（walking skeleton）；温度记录；备份与 `/health`；其余主数据（物料、配方、供应商、报损原因）与库存投影；收货与批次号；库存明细与批次查询；报损；不变量自检；库存规则归属；定点小数。迁移到 007。
+已完成：write path 与基础设施；设备主数据（walking skeleton）；温度记录；备份与 `/health`；其余主数据（物料、配方、供应商、报损原因）与库存投影；收货与批次号；库存明细与批次查询；报损；不变量自检；库存规则归属；定点小数；门店节点校时。迁移到 007。
 
 当前实现边界：
 - `init` 写入 `store_meta` 和预置报损原因；第一个店长随认证切片加入。
 - 业务接口经 `Actor` 开发桩取得身份（[docs/auth.md](docs/auth.md)「开发桩」）。
 - 报损不判定吸收，每行都不被吸收。
-- 当前没有显式补录入口；温度记录、收货、报损的发生时间通过相对校准确定（门店节点校时切片改为前端校时后提交的 `occurred_at`）。
+- 当前没有显式补录入口；连不上门店节点时只能记纸面，补录随补录入口切片。
 - 第一版只有一家门店、没有总部：`MASTER_DATA_CHANGED` 只有 `source = LOCAL` 的写入口，由店长维护（归属见 [docs/domain.md](docs/domain.md)「主数据」）。
 
 待做，按顺序：
-1. 门店节点校时（校时前拒绝写入）→ 异常分级与通用确认（拒绝 / 需要确认 / 警告的统一分级表；报损的 `confirm_shortage` 改为通用确认）→ 盘点（含盘点吸收：已有的报损一并实现吸收判定）→ 局域网 HTTPS → 员工认证（`EMPLOYEE` 投影、写接口、golden 样本与第一个店长）。
-2. 扩展：生产 → 纠错（冲销、数量更正）→ 补录入口 → 销售导入。每一步配对应的验收用例。
+1. 异常分级与通用确认（拒绝 / 需要确认 / 警告的统一分级表；报损改用通用确认；节点请求日志）→ 盘点（含盘点吸收：已有的报损一并实现吸收判定）→ 局域网 HTTPS → 员工认证（`EMPLOYEE` 投影、写接口、golden 样本与第一个店长）。
+2. 扩展：生产 → 纠错（冲销、数量更正）→ 工作站前端（技术栈先在「尚未设计」中定）→ 补录入口 → 销售导入。每一步配对应的验收用例。
+   - 补录入口须在上线之前完成：连不上门店节点时它是唯一的入账路径。同一切片实现按任务编号查询和后台任务取消日志的上报接口。
 
 ---
 
@@ -146,7 +147,7 @@
 | 门店节点校时的 NTP 核对 | `sntpc`，关闭默认特性；本机时间经 `NtpTimestampGenerator` 取自时钟模块，UDP 用 tokio |
 | 上行同步（待实现） | `reqwest` + `rustls`，mTLS |
 
-禁止引入：Redis、消息队列、ORM、微服务、任何需要外部进程的依赖。整个节点是**一个静态链接二进制 + 一个 SQLite 文件**。
+禁止引入：Redis、消息队列、ORM、微服务、任何需要外部进程的依赖。整个节点是**一个静态链接二进制 + 一个 SQLite 文件**。工作站网页前端的静态文件编进二进制；门店机浏览器只做显示，节点不依赖它。
 **新增依赖必须先在本表登记用途，并经人工批准**；未登记的依赖不得加入任何 `Cargo.toml`。
 
 ---
@@ -154,7 +155,8 @@
 ## 架构
 
 ```
-[ 平板 / 手机原生 App（本地命令暂存）]  ──HTTP (LAN)──►  axum handler
+[ 平板 / 手机原生 App（后台任务：结果未知的命令原 ID 重试；不排队）]  ──HTTP (LAN)──►  axum handler
+[ 工作站：门店机浏览器 ]  ──HTTP（本机）──►  同一 axum（静态文件 + API）
                                    │
               ┌────────────────────┴───────────────────┐
               ▼ 命令（写）                              ▼ 查询（读）
@@ -196,7 +198,9 @@ scripts/        CI 扫描脚本。
 库存规则的业务语义只写在 [docs/domain.md](docs/domain.md)（「批次」「盘点」「盘点吸收」「纠错」「投影表」）；本节只规定代码放在哪里、谁调用谁。
 
 - domain.md 中由多个命令或事件共同引用的库存规则只有一份实现，放在下表的三层中；新切片调用它们，不在自己的 service 或事件投影函数中另写一份。
-  - 只共享语义相同的部分。只属于一个命令的规则留在该命令的 service 中，例如报损的不足确认与 `ITEM_HAS_NO_LOTS`、收货的批次日期校验与 `EXPIRES_BEFORE_OLDER_STOCK`；不为复用把不同命令合并成通用的库存命令。
+  - 只共享语义相同的部分。只属于一个命令的规则留在该命令的 service 中，例如报损的 `ITEM_HAS_NO_LOTS`、收货的批次日期校验与 `EXPIRES_BEFORE_OLDER_STOCK`；不为复用把不同命令合并成通用的库存命令。
+  - 不足判定（`STOCK_SHORTFALL` 的触发条件：`qty` 超过物料净账面或指定批次的余量）由报损和纠错共用，纯函数在 `boh_domain::inventory`；是否要求确认由命令的 service 决定。
+  - 确认的匹配与 `409 CONFIRMATION_REQUIRED` 的组装（docs/domain.md「异常分级」）是 `boh_app` 中的一个小辅助模块，供各命令的 service 调用，不放在 `service::inventory`。投影不读取确认。
 
 | 层 | 模块 | 负责 | 不做 |
 |---|---|---|---|
@@ -317,7 +321,7 @@ scripts/        CI 扫描脚本。
 - 推送 `seq > acked_seq` 的事件，按 `seq` 升序分批，批次头携带 `store_id`。事件带 `store_events` 的全部列，包括 `clock_synced_at`。
 - **严格按序**：遇阻就重试并报警，不跳号，没有 `dead` 状态。
 - 总部按 `(store_id, seq)` 严格按序、幂等地接收，先原样落库再异步处理；解析不了的事件进入总部隔离区，不退回门店。
-- 失败按指数退避。无网络时 worker 安静退避，只记 `debug` 级日志，不报错、不影响请求路径。
+- 失败按指数退避。无网络时 worker 安静退避：连接状态变化（断开、恢复）记 `info`，单次重试记 `debug`；不报错、不影响请求路径。
 
 ### 数值
 - **禁止浮点数参与业务计算**（clippy `float_arithmetic = deny`）。
@@ -344,6 +348,12 @@ scripts/        CI 扫描脚本。
     - 备份：错误附失败阶段（生成、校验、文件 fsync、分配备份序号、重命名、目录 fsync）和已确定的备份序号。
     - 启动、迁移、关闭：`main` 的 `anyhow` 附操作描述。
   - 诊断字段用允许清单：不记录完整命令、请求体、认证信息或秘密。返回客户端的仍是不含内部细节的 `500 INTERNAL_ERROR`。
+- 请求日志：每个 HTTP 请求在响应发出时记一行 `info`，字段只取允许清单：
+  - 方法、匹配到的路由模板（如 `/api/v1/lots/{lot_id}`；未匹配时不记路径）、状态码、顶层错误码（成功时省略）、原因码（`error.details.confirmations[].code`，去重、按字节序排序）、`command_type` 与 `command_id`（写命令且已解析出时）、操作人与设备（身份已确定时）、耗时（毫秒）。
+  - 不记请求体、查询参数的取值、PIN、令牌和响应内容。
+  - 它是访问日志，不是诊断：`500` 只记 `INTERNAL_ERROR`，完整诊断仍按上面「每个内部错误只在一处记录」。
+  - 用 axum 中间件实现，不新增依赖。
+  - 平板上报的后台任务取消日志写进同一日志，字段同样用允许清单（随补录入口切片，见 docs/domain.md「命令提交与结果未知」）。
 - `clippy.toml` 的 `disallowed-methods` / `disallowed-types`：
 
   | 禁用 | 只允许 `#[allow]` 的位置 |
@@ -389,15 +399,16 @@ scripts/        CI 扫描脚本。
 - 所有响应都是同一信封（`boh-app/src/http.rs`），`warnings` 总是存在，没有警告时为空数组：
 
 ```json
-{ "success": true,  "data": { },  "warnings": [ { "code": "STOCK_SHORTFALL", "message": "...", "details": { } } ], "error": null }
+{ "success": true,  "data": { },  "warnings": [ { "code": "EXPIRES_BEFORE_OLDER_STOCK", "message": "...", "details": { } } ], "error": null }
 { "success": false, "data": null, "warnings": [], "error": { "code": "IDEMPOTENCY_CONFLICT", "message": "...", "details": { } } }
 ```
 
-- 警告不改变 `success`。警告码见 `docs/domain.md`：`STOCK_SHORTFALL`、`ABSORBED_BY_COUNT`、`EXPIRES_BEFORE_OLDER_STOCK`。
+- 警告不改变 `success`。警告码见 `docs/domain.md`「异常分级」：`ABSORBED_BY_COUNT`、`EXPIRES_BEFORE_OLDER_STOCK`。
 - 错误对象包含 `code`、`message`、`details`；`details` 总是存在，没有明细时为 `{}`。
 - HTTP 状态码要和语义一致：校验失败 400、不存在 404、幂等冲突与业务冲突 409、内部错误 500、节点时钟未校时 503。`code` 是稳定的大写蛇形字符串，客户端按 `code` 判断，不按 `message`。
 - 数量和换算系数一律用小数字符串，不用 JSON 数字；金额用 JSON 整数（分）。见 `docs/domain.md`「数量」。
 - 通用错误码：结构或取值错误 `400 VALIDATION_FAILED`；引用的实体不存在 `404 REFERENCE_NOT_FOUND`。
+- 需要员工确认：`409 CONFIRMATION_REQUIRED`，`details` 为 `{"confirmations": [...]}`，结构见 `docs/domain.md`「异常分级」。
 - 其他通用错误码：未匹配的路由 `404 ROUTE_NOT_FOUND`；方法不允许 `405 METHOD_NOT_ALLOWED`；内部错误 `500 INTERNAL_ERROR`；缺少或无效的身份 `401 UNAUTHENTICATED`；角色不够 `403 FORBIDDEN`。
 - 身份与权限通过后，请求体不是合法 JSON、缺少 `Content-Type: application/json`、字段缺失、未知字段、类型或取值不对，以及路径参数无法解析，一律 `400 VALIDATION_FAILED`。
   - axum 提取器默认返回纯文本的 415 / 422，必须转换成信封。
@@ -412,8 +423,8 @@ scripts/        CI 扫描脚本。
   |---|---|
   | `status` | `"ok"` 或 `"degraded"` |
   | `schema_version` | 数据库的 `user_version` |
-  | `clock_synced` | 节点校时信号是否有效；含义见 domain.md「时间」校时信号。随门店节点校时切片加入 |
-  | `clock_synced_at` | 节点的上次校时时间（domain.md「时间」门店节点校时）；没有时为 `null`。随门店节点校时切片加入 |
+  | `clock_synced` | 节点校时信号是否有效；含义见 domain.md「时间」校时信号 |
+  | `clock_synced_at` | 节点的上次校时时间（domain.md「时间」门店节点校时）；没有时为 `null` |
   | `clock_regression_ms` | `max(0, max(store_events.recorded_at) − now)`，账本为空时为 0；含义见 domain.md「时间」时钟异常 |
   | `last_backup_ok_at` | 本进程最近一次成功备份完成时的 `now()`；本进程还没有成功过时为 `null` |
   | `last_backup_seq` | 该次备份的 `n`（见「备份」）；同上为 `null` |
@@ -454,7 +465,8 @@ ARM 门店机改用 `aarch64-unknown-linux-musl`。部署文件见 `deploy/`。
 
 ## 尚未设计（动手前先讨论）
 
-- 前端原生 App：技术栈（Android / iOS 各自开发或跨平台）、安装分发与版本更新、设备管理（MDM）的选型与设备注册流程、本地队列的持久化；时间规则已定，见 [docs/domain.md](docs/domain.md)「时间」前端校时。
+- 前端原生 App：技术栈（Android / iOS 各自开发或跨平台）、安装分发与版本更新、设备管理（MDM）的选型与设备注册流程、后台任务与盘点草稿的本地存储，断网、重试、恢复与取消的客户端日志；时间规则已定，见 [docs/domain.md](docs/domain.md)「时间」前端校时；提交状态、后台任务、参数、登出提示已定，见 [docs/domain.md](docs/domain.md)「命令提交与结果未知」。
+- 工作站网页前端：技术栈、构建方式、静态文件编进二进制的方式；新增依赖须先登记技术栈表并经人批准。工作站的登录与本机 HTTP 是否需要 HTTPS 随局域网 HTTPS 与认证切片定。
 - 下行同步：主数据包的格式、拉取与导入流程（原则已定：总部维护统一的 JSON 主数据包，逐行比对快照，`source = HQ_PACKAGE`；全部主数据归总部所有，见 [docs/domain.md](docs/domain.md)「主数据」）。**总部本期不开发，延后。**
   - 设计时一并定：门店修改申请的流程；按门店下发不同物料时，下发给某店的包内引用必须完整（配方用到的物料都在包内）；物料撤出某店的下发范围时该店只停用、不删除；新门店初始化、首次主数据包导入与首位店长本地 PIN 设定的衔接（包括如何满足 `LAST_ACTIVE_MANAGER` 约束）；员工调动后在新门店的登录（认证状态不同步，见 [docs/auth.md](docs/auth.md)）。
 - 上行同步的实现：总部接收接口、批量大小、mTLS 证书下发与轮换、失败的重试分类（哪些错误可重试）。**延后**；契约见「上行同步」。
