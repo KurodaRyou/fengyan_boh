@@ -41,8 +41,8 @@ pub struct WasteCommandLine {
     pub lot_id: Option<LotId>,
     pub input: ReceiptInput,
     pub reason_code: String,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub confirm_shortage: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acknowledged: Vec<String>,
 }
 object_serde!(WasteCommandLine);
 
@@ -74,6 +74,14 @@ impl LogWaste {
         }
         for line in &self.lines {
             line.request_line().validate()?;
+            if line
+                .acknowledged
+                .iter()
+                .any(|code| code != "STOCK_SHORTFALL")
+                || line.acknowledged.len() > 1
+            {
+                return Err(DomainError::InvalidField("acknowledged"));
+            }
         }
         Ok(())
     }
@@ -284,10 +292,6 @@ pub struct WasteRecord {
     pub recorded_at: UnixMillis,
     pub actor_id: AggregateId,
     pub device_id: AggregateId,
-}
-
-fn is_false(value: &bool) -> bool {
-    !value
 }
 
 fn validate_input(input: &ReceiptInput, reason_code: &str) -> Result<(), DomainError> {

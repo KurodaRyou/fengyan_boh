@@ -1,7 +1,7 @@
 //! Submission and precheck share the same sequential, in-memory calculation.
 
 use axum::http::StatusCode;
-use boh_domain::inventory::Allocation;
+use boh_domain::inventory::{Allocation, stock_shortfall};
 use boh_domain::lot::LotId;
 use boh_domain::quantity::Quantity;
 use boh_domain::time::{CaptureTimes, business_date, check_capture_times};
@@ -17,12 +17,11 @@ use serde_json::{Value, json};
 
 use crate::AppState;
 use crate::actor::Actor;
+use crate::confirmation::{self, Confirmation};
 use crate::http::{ApiError, ok};
 
 #[tracing::instrument(name = "command", skip_all, fields(command_type = "waste.log", command_id = %command.command_id, actor_id = %actor.employee_id, device_id = %actor.device_id))]
 pub async fn log(state: AppState, actor: Actor, command: LogWaste) -> Result<Value, ApiError> {
-    // WasteCommandLine omits false confirmation flags, making false and absent
-    // identical in the saved normalized request. True remains business content.
     let request = super::normalized(&command, None, "规范化报损命令")?;
     let writer = state.writer.clone();
     let response = writer
@@ -57,22 +56,16 @@ pub async fn log(state: AppState, actor: Actor, command: LogWaste) -> Result<Val
                         .map(|line| line.request_line())
                         .collect();
                     let calculated = calculate(tx, &requests)?;
-                    let shortages: Vec<_> = calculated
+                    let pending = calculated
                         .iter()
                         .zip(&command.lines)
-                        .filter(|(line, command)| {
-                            line.needs_confirmation && !command.confirm_shortage
+                        .filter_map(|(line, command)| {
+                            line.confirmation().filter(|item| {
+                                !confirmation::acknowledged(item, &command.acknowledged)
+                            })
                         })
-                        .map(|(line, _)| line.book.clone())
                         .collect();
-                    if !shortages.is_empty() {
-                        return Err(ApiError::new(
-                            StatusCode::CONFLICT,
-                            "WASTE_CONFIRMATION_REQUIRED",
-                            "confirm actual waste quantities",
-                        )
-                        .with_details(json!({ "lines": shortages })));
-                    }
+                    confirmation::require(pending)?;
                     let waste_record_id =
                         AggregateId::from_parts(recorded_at, ledger::entropy(tx)?)
                             .map_err(StorageError::from)?;
@@ -127,15 +120,19 @@ pub async fn precheck(
     state
         .readers
         .call(move |conn| -> Result<_, ApiError> {
-            let lines: Vec<_> = calculate(conn, &request.lines)?
+            let calculated = calculate(conn, &request.lines)?;
+            let confirmations: Vec<_> = calculated
+                .iter()
+                .filter_map(CalculatedLine::confirmation)
+                .collect();
+            let lines: Vec<_> = calculated
                 .into_iter()
                 .map(|line| PrecheckedLine {
                     book: line.book,
-                    needs_confirmation: line.needs_confirmation,
                     alloc: line.alloc,
                 })
                 .collect();
-            Ok(json!({ "lines": lines }))
+            Ok(json!({ "lines": lines, "confirmations": confirmations }))
         })
         .await
 }
@@ -159,11 +156,31 @@ struct CalculatedLine {
     logged: WasteLine,
 }
 
+impl CalculatedLine {
+    fn confirmation(&self) -> Option<Confirmation> {
+        if !self.needs_confirmation {
+            return None;
+        }
+        let book = &self.book;
+        let mut details = json!({
+            "item_id": book.item_id, "qty": book.qty, "item_book_qty": book.item_book_qty,
+        });
+        if let (Some(lot), Some(qty)) = (&book.lot_id, book.lot_book_qty) {
+            details["lot_id"] = json!(lot);
+            details["lot_book_qty"] = json!(qty);
+        }
+        Some(Confirmation {
+            line: book.line,
+            code: "STOCK_SHORTFALL",
+            details,
+        })
+    }
+}
+
 #[derive(Serialize)]
 struct PrecheckedLine {
     #[serde(flatten)]
     book: LineBook,
-    needs_confirmation: bool,
     alloc: Vec<Allocation>,
 }
 
@@ -205,8 +222,7 @@ fn calculate(
             item_book_qty: balance.book(),
             lot_book_qty,
         };
-        let needs_confirmation =
-            qty > balance.book() || lot_book_qty.is_some_and(|book| qty > book);
+        let needs_confirmation = stock_shortfall(qty, balance.book(), lot_book_qty);
         let alloc = super::inventory::allocate(balance, lot_index, qty, index, line.item_id)?;
         let logged = WasteLine {
             item_id: line.item_id,
