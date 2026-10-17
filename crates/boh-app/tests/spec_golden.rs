@@ -447,7 +447,7 @@ async fn waste_logged_specified_and_unspecified_lot() {
             cmd(6),
             json!({
                 "item_id": flour, "input": { "qty": "5000.250", "unit_code": "g", "base_qty_per_unit": "1" },
-                "reason_code": "EXPIRED", "confirm_shortage": true,
+                "reason_code": "EXPIRED", "acknowledged": ["STOCK_SHORTFALL"],
             }),
         ),
     ] {

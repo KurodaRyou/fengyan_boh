@@ -1005,7 +1005,7 @@ fn waste_line(item_id: &str, qty: &str, lot_id: Option<&str>, confirm: bool) -> 
         line["lot_id"] = json!(lot_id);
     }
     if confirm {
-        line["confirm_shortage"] = json!(true);
+        line["acknowledged"] = json!(["STOCK_SHORTFALL"]);
     }
     line
 }

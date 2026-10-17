@@ -658,7 +658,7 @@ async fn expiry_warning_ignores_lots_without_positive_remaining() {
                 "lines": [{
                     "item_id": flour, "lot_id": lot_id,
                     "input": { "qty": qty.to_string(), "unit_code": "g", "base_qty_per_unit": "1" },
-                    "reason_code": "EXPIRED", "confirm_shortage": true,
+                    "reason_code": "EXPIRED", "acknowledged": ["STOCK_SHORTFALL"],
                 }],
             }),
         )
