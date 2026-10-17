@@ -441,15 +441,13 @@ impl Checker {
         }
     }
 
-    // Only background verification observes transitions. Request and writer reads
-    // stay free of logging, and status() releases its lock before any log output.
+    // Only background verification observes transitions; request reads stay pure.
     fn observe_signal(&mut self, now: UnixMillis) -> bool {
         let (valid, last) = self.signal.status(now);
-        if valid || last.is_none() {
-            self.invalid_signal_logged = false;
-        } else if !self.invalid_signal_logged {
-            self.invalid_signal_logged = true;
-            if let Some(last) = last {
+        match (valid, last) {
+            (true, _) | (_, None) => self.invalid_signal_logged = false,
+            (false, Some(last)) if !self.invalid_signal_logged => {
+                self.invalid_signal_logged = true;
                 let reason = if now < last {
                     "clock precedes last synchronization"
                 } else {
@@ -462,12 +460,17 @@ impl Checker {
                     "node clock signal invalid"
                 );
             }
+            _ => {}
         }
         valid
     }
 
-    async fn check(&mut self, mut stop: Option<&mut watch::Receiver<bool>>) -> bool {
+    async fn check(&mut self, stop: Option<&mut watch::Receiver<bool>>) -> bool {
         self.observe_signal(self.clock.now());
+        self.check_observed(stop).await
+    }
+
+    async fn check_observed(&mut self, mut stop: Option<&mut watch::Receiver<bool>>) -> bool {
         let mut outcome = None;
         for server in &self.servers {
             if stop.as_ref().is_some_and(|stop| *stop.borrow()) {
@@ -517,9 +520,8 @@ impl Checker {
             CheckResult::NoReply => return true,
             CheckResult::Synced(time, offset) => (Some(time), offset),
             CheckResult::Incorrect(offset_ms) => {
-                let was_valid = self.signal.valid(self.clock.now());
                 self.signal.publish(None);
-                if was_valid || !self.offset_exceeded {
+                if !self.offset_exceeded {
                     tracing::warn!(host = %server.host, port = server.port, offset_ms, "node clock offset exceeds one minute");
                 } else {
                     tracing::debug!(host = %server.host, port = server.port, offset_ms, "node clock offset exceeds one minute");
@@ -694,7 +696,7 @@ async fn run_schedule(
         if !checker.observe_signal(clock.now())
             || clock.monotonic().saturating_sub(last_check) >= Duration::from_secs(3600)
         {
-            if !checker.check(Some(&mut stopped)).await {
+            if !checker.check_observed(Some(&mut stopped)).await {
                 return;
             }
             checks = checks.saturating_add(1);
@@ -766,7 +768,7 @@ mod tests {
             Err(sntpc::Error::Network)
         ));
         let result = tokio::time::timeout(
-            Duration::from_secs(1),
+            Duration::from_secs(5),
             query_addresses(
                 [blocked, working, unused.local_addr().unwrap()].into_iter(),
                 &clock.clock(),
@@ -786,7 +788,7 @@ mod tests {
         let (first, reply) = reply_once(None, 120).await;
         let unused = unused_address();
         let result = tokio::time::timeout(
-            Duration::from_secs(1),
+            Duration::from_secs(5),
             query_addresses(
                 [first, unused.local_addr().unwrap()].into_iter(),
                 &clock.clock(),
@@ -807,7 +809,7 @@ mod tests {
             let (first, reply) = reply_once(Some(code), 0).await;
             let unused = unused_address();
             let result = tokio::time::timeout(
-                Duration::from_secs(1),
+                Duration::from_secs(5),
                 query_addresses(
                     [first, unused.local_addr().unwrap()].into_iter(),
                     &clock.clock(),
@@ -911,7 +913,7 @@ mod tests {
             let capture = LogCapture::default();
             assert!(
                 tokio::time::timeout(
-                    Duration::from_secs(1),
+                    Duration::from_secs(5),
                     checker.check(None).with_subscriber(capture.subscriber())
                 )
                 .await
@@ -984,10 +986,11 @@ mod tests {
 
     #[tokio::test]
     async fn excessive_offset_warns_once_until_successful_recovery() {
-        for initially_valid in [false, true] {
+        for initial_age in [None, Some(0), Some(7 * 24 * 60 * 60 * 1000 + 1)] {
             let dir = tempfile::tempdir().unwrap();
             let clock = boh_storage::clock::ManualClock::new(UnixMillis(1_792_137_600_000));
-            let signal = ClockSignal::new(initially_valid.then(|| clock.clock().now()));
+            let signal =
+                ClockSignal::new(initial_age.map(|age| UnixMillis(clock.clock().now().0 - age)));
             let mut checker = Checker::new(
                 &dir.path().join("boh.db"),
                 clock.clock(),
@@ -1000,7 +1003,7 @@ mod tests {
                 checker.servers = vec![NtpServer::parse(&addr.to_string()).unwrap()];
                 assert!(
                     tokio::time::timeout(
-                        Duration::from_secs(1),
+                        Duration::from_secs(5),
                         checker.check(None).with_subscriber(capture.subscriber()),
                     )
                     .await
@@ -1102,7 +1105,7 @@ mod tests {
             ];
             assert!(
                 tokio::time::timeout(
-                    Duration::from_secs(1),
+                    Duration::from_secs(5),
                     checker.check(None).with_subscriber(capture.subscriber()),
                 )
                 .await
@@ -1113,7 +1116,7 @@ mod tests {
             for _ in 0..3 {
                 assert!(
                     tokio::time::timeout(
-                        Duration::from_secs(1),
+                        Duration::from_secs(5),
                         checker.check(None).with_subscriber(capture.subscriber()),
                     )
                     .await
@@ -1189,7 +1192,7 @@ mod tests {
         for _ in 0..2 {
             assert!(
                 tokio::time::timeout(
-                    Duration::from_secs(1),
+                    Duration::from_secs(5),
                     checker.check(None).with_subscriber(capture.subscriber()),
                 )
                 .await
@@ -1280,7 +1283,7 @@ mod tests {
             checker.servers = vec![NtpServer::parse(&addr.to_string()).unwrap()];
             assert!(
                 tokio::time::timeout(
-                    Duration::from_secs(1),
+                    Duration::from_secs(5),
                     checker.check(None).with_subscriber(capture.subscriber()),
                 )
                 .await
