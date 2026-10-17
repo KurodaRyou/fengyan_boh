@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 
 use axum::http::StatusCode;
 use boh_domain::receiving::{CreateReceipt, GoodsReceived, Receipt, ReceivedLine};
-use boh_domain::time::{CaptureTimes, business_date, calibrate, end_of_local_date, local_date};
+use boh_domain::time::{
+    CaptureTimes, business_date, check_capture_times, end_of_local_date, local_date,
+};
 use boh_domain::{AggregateId, EventId, UnixMillis};
 use boh_storage::StorageError;
 use boh_storage::ledger::{self, Command, Event};
@@ -36,20 +38,21 @@ pub async fn create(
                     recorded_at,
                 },
                 |ledger| {
-                    let calibrated = calibrate(
+                    super::check_node_clock(&state, recorded_at)?;
+                    check_capture_times(
                         CaptureTimes {
-                            captured_at: command.captured_at,
-                            sent_at: command.sent_at,
-                            started_captured_at: None,
+                            occurred_at: command.occurred_at,
+                            clock_synced_at: command.clock_synced_at,
+                            started_at: None,
                         },
                         recorded_at,
                     )?;
                     let date = business_date(
-                        calibrated.occurred_at,
+                        command.occurred_at,
                         &state.timezone,
                         state.business_day_cutoff,
                     )?;
-                    let calendar_date = local_date(calibrated.occurred_at, &state.timezone)?;
+                    let calendar_date = local_date(command.occurred_at, &state.timezone)?;
                     let supplier_exists: bool = tx
                         .query_row(
                             "SELECT EXISTS(SELECT 1 FROM suppliers WHERE id = ?1)",
@@ -63,13 +66,6 @@ pub async fn create(
                     let receipt_id = AggregateId::from_parts(recorded_at, ledger::entropy(tx)?)
                         .map_err(StorageError::from)?;
                     let mut warnings = Vec::new();
-                    if calibrated.capture_time_adjusted {
-                        warnings.push(WarningBody {
-                            code: "CAPTURE_TIME_ADJUSTED",
-                            message: "capture time adjusted to the receiving time".into(),
-                            details: Default::default(),
-                        });
-                    }
                     let mut earlier_expiries: BTreeMap<AggregateId, UnixMillis> = BTreeMap::new();
                     let mut balances = super::inventory::WorkingSet::default();
                     let mut lot_numbers = super::inventory::LotNumbers::new(calendar_date);
@@ -175,7 +171,7 @@ pub async fn create(
                         supplier_id: command.supplier_id,
                         lines: received.lines,
                         business_date: date.to_string(),
-                        occurred_at: calibrated.occurred_at,
+                        occurred_at: command.occurred_at,
                         recorded_at,
                         actor_id: actor.employee_id,
                         device_id: actor.device_id,
@@ -194,6 +190,7 @@ pub async fn create(
                         business_date: row.business_date.clone(),
                         occurred_at: row.occurred_at,
                         recorded_at,
+                        clock_synced_at: Some(command.clock_synced_at),
                         payload,
                     })?;
                     let mut response = ok(json!({ "receipt": row })).0;

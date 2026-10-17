@@ -25,7 +25,7 @@
 
 ## 时间
 
-实现状态：「校时信号」「门店节点校时」「前端校时」「发生时间」尚未实现，随「门店节点校时」切片实现。当前代码和 [interfaces.md](interfaces.md)「时间」仍按相对校准（`occurred_at = recorded_at − (sent_at − captured_at)`）计算发生时间，该切片一并修改。
+实现状态：「校时信号」「门店节点校时」「前端校时」「发生时间」、`store_events.clock_synced_at` 列和「节点时钟接口」尚未实现，随「门店节点校时」切片实现。当前代码仍按相对校准（`occurred_at = recorded_at − (sent_at − captured_at)`）计算发生时间，该切片一并修改。
 
 | 字段 | 含义 | 来源 | 用途 |
 |---|---|---|---|
@@ -33,6 +33,7 @@
 | `recorded_at` | 门店接收时间 | 门店节点系统时钟原值，不做钳制；写入时节点的校时信号必须有效 | 审计、展示 |
 | `occurred_at` | 业务发生时间 | 前端录入时的校准时间，或补录时由员工填写，节点原样记录、不计算；主数据命令和初始化取 `recorded_at`；冲销和数量更正取原事件的值 | 计算 `business_date` 和批次日期；吸收判定 |
 | `business_date` | 营业日 | 由 `occurred_at` 计算；`SALES_IMPORTED` 例外，由命令显式给出 | 报表归属 |
+| `clock_synced_at` | 前端声明的上次校时时间 | 实时录入的命令提交的值，原样记录，不是可信的校时证明；主数据命令、初始化、补录、冲销和数量更正为 `NULL` | 复核、时钟事故排查；随事件同步 |
 
 **分工**：业务发生时间由前端负责，接收时间由门店节点负责。各自先校时，再记录自己负责的时间；节点不推算、不修正前端给出的发生时间。
 
@@ -43,21 +44,48 @@
 
 **门店节点校时**：
 
-- 节点系统时钟由 `systemd-timesyncd` 自动校准。节点另按配置项 `ntp_servers`（必填，至少一个）向 NTP 服务器核对系统时钟：偏差不超过 1 分钟即为一次校时成功，把当时的时间写进状态目录中的文件并 fsync，跨重启保留。启动时核对一次，之后信号无效时每分钟、有效时每小时核对一次。
-- 重启不使信号失效：节点启动时读取持久化的上次校时时间，仍满足有效条件即接受写入，不等待本次联网校时成功。核对失败（如断网）不使仍有效的信号失效；只有信号本身无效时才拒绝写入，按 SOP 校准后恢复。
+- 节点系统时钟由 `systemd-timesyncd` 自动校准。节点另按配置项 `ntp_servers` 向 NTP 服务器核对系统时钟（只读偏差，不调时钟）。
+  - `ntp_servers`：必填，非空字符串数组，每项为 `host` 或 `host:port`（端口缺省 123，IPv6 地址写在方括号中）；缺失、为空或某项无法解析时拒绝启动。
+- **一次核对**：按 `ntp_servers` 的顺序逐个查询，第一个给出合法回复的服务器决定本次结果；没有合法回复的服务器跳过，全部没有时本次为「没有回复」。
+  - 每个服务器的查询（含 DNS 解析）超时 5 秒。
+  - 回复的校验由 `sntpc` 完成（originate 时间戳、来源地址、长度、mode、版本、LI、stratum、零发送时间戳等）；不通过的按没有回复处理，立即查询下一个服务器，不等满 5 秒。
+  - 收到 KoD 回复：`DENY`、`RSTR` 时本进程不再查询该服务器，记 `warn`；`RATE` 及其他代码本次按没有回复处理。
+  - 本机收到回复的时间早于发出时间，或往返超过 5 秒：本次结果丢弃，按没有回复处理（查询途中本机时钟跳变）。两者都按本机的发出、收到时间（时钟模块读数）计算，不用 `sntpc` 的往返时间。
+  - 偏差绝对值不超过 1 分钟（含）：校时成功，「当时的时间」取本机收到回复时的时间。
+  - 偏差绝对值超过 1 分钟：节点时钟有错，信号**立即失效**（见下），写入停止，直到之后的核对成功。
+  - 网络查询不在任何 `Writer::call` / `Readers::call` 闭包或写事务内进行。
+- **节奏**：启动时核对一次，不等待它完成就开始服务；之后每隔 1 分钟判断一次：信号无效时核对，有效时距上次核对满 1 小时才核对。等待期间信号过期的，下一次判断时即开始每分钟核对。间隔按单调时间计，不按墙钟时刻：墙钟回拨不推迟下一次核对。
+- **持久化**：上次校时时间保存在状态文件 `<db_path>-clock-sync` 中，跨重启保留。
+  - 内容是一行十进制整数（UTC Unix 毫秒）加换行，例如 `1792137600000`。读取时只接受这种形式：不带符号、空白和前导零的十进制整数（`0` 除外），后面至多一个换行；其他内容都按无法解析处理。
+  - 校时成功后：在同一目录写临时文件 → fsync 该文件 → 原子重命名为状态文件 → fsync 目录；四步全部成功才发布新的信号。任一步失败时内存中保留原有信号（仍有效就继续使用），记 `error`，下次核对成功时重新执行全部四步。
+    - 重命名之前失败：状态文件保持原内容。
+    - 重命名之后（fsync 目录）失败：状态文件已是新值，内存中仍是原有信号；这次重命名断电后能否保留不确定。
+    - 理由：只发布已完成持久化的信号。
+  - 偏差超过 1 分钟：先在内存中使信号失效并清除上次校时时间（`/health` 的 `clock_synced_at` 随之为 `null`），再删除状态文件并 fsync 目录。
+    - 删除或 fsync 目录失败：记 `error`，不重试（服务进程和 `init` 相同；`init` 照常以非 0 退出）。后果与维护处理见「已知限制」状态文件的存储故障。
+  - 启动时读取状态文件：不存在时没有信号（记 `info`）；内容无法解析（为空、非整数、负数）或读取出错（如路径是目录、没有读权限）时没有信号（记 `warn`），下次校时成功后覆盖。这些情况都不拒绝启动。
+- 重启不使信号失效：节点启动时读取持久化的上次校时时间，仍满足有效条件即接受写入，不等待本次联网校时成功。没有回复（如断网）不使仍有效的信号失效；只有信号本身无效、或拿到偏差超过 1 分钟的合法回复时才拒绝写入，按 SOP 校准后恢复。
   - 理由：信号需要「最近一次校时成功的时间」并跨重启保留，timesyncd 不提供。
 - 节点信号无效时：业务写命令和主数据命令返回 `503 CLOCK_NOT_SYNCED`，`details` 为 `{}`，不写事件或 `processed_commands`；前端校时接口同样返回它。其他查询、报损预检和 `/health` 照常。
   - 理由：节点未校时时写入的记录，`recorded_at` 不可信；批次号印在标签上后不能修改。
   - 在写命令处理顺序中位于幂等检查之后、业务校验之前：已成功命令的原样重试照常返回首次响应。被拒的命令不落库，员工校时后再次点击提交，用同一个 `command_id` 重提。
   - 前端按「前端错误处理」显示提示页（见 [SOP](sop.md)「门店机校时」）。
   - 校时成功后自动恢复写入，不需要人工确认。
-  - `init` 同样要求节点信号有效，否则拒绝执行；`rebuild-projections`、备份、不变量自检不受限制。
-- 部署要求：门店节点经有线网口接入门店局域网；另有无线网卡，预先保存店长手机热点的名称和密码，热点打开时自动连接。无线连接的默认路由优先于有线网口，门店路由器在线但外网断开时，校时也走热点。
+  - `init` 同样要求节点信号有效：先读状态文件；无效时按上面的「一次核对」查询一轮（每个服务器 5 秒上限），成功则写入状态文件后继续，否则以非 0 退出码结束，不写任何数据；拿到偏差超过 1 分钟的合法回复时同样删除已有的状态文件。网络查询在写事务之前完成。`rebuild-projections`、备份、不变量自检不受限制。
+- 部署要求：
+  - 门店节点经有线网口接入门店局域网；另有无线网卡，预先保存店长手机热点的名称和密码，热点打开时自动连接。无线连接的默认路由优先于有线网口，门店路由器在线但外网断开时，校时也走热点。
+  - `ntp_servers` 与 timesyncd 的服务器列表都只配域名：多个不同运营方的中国大陆公共 NTP 域名（如 `ntp.aliyun.com`、`ntp.tencent.com`、`ntp.ntsc.ac.cn`、`cn.pool.ntp.org`），部署时在门店网络中实测每一项可用。关闭经 DHCP / 网口下发的 NTP 服务器（如 systemd-networkd `[DHCPv4] UseNTP=no`），timesyncd 只用配置的列表。
+  - 门店节点用 systemd-resolved 解析域名，`/etc/resolv.conf` 指向它的本地 stub；`resolved.conf` 的全局 `DNS=` 配官方公共 DNS（`223.5.5.5`、`119.29.29.29`），与网口 DNS 一起使用，不用 `FallbackDNS=`。
+    - 理由：NTP 域名不属于任何路由域，查询同时发往网口 DNS 与全局 DNS，先成功的回复生效，门店路由器的 DNS 故障时仍能解析；`FallbackDNS=` 只在没有任何 DNS 服务器时才用。
+  - 禁止修改节点时间：员工没有门店机的系统账号，root 和终端只交给负责维护门店机的人；服务不授予 `CAP_SYS_TIME`。BIOS / UEFI 设管理员密码，防止在固件中改硬件时钟（选型时在目标机型上确认日期时间在锁定范围内）。按维护计划检查和更换主板电池。
+    - 理由：有效期内时钟向前跳系统不检测（见「校时信号」），断网时只能靠权限防止。
 
 **前端校时**：
 
-- 前端是 Android / iOS 原生 App，以门店节点为基准校时：经 `GET /api/v1/clock`（不需要身份）取节点当前时间，按往返耗时的一半修正（Cristian 算法），记下与设备单调时钟（不随系统时间修改而变化，如 Android 的 `SystemClock.elapsedRealtime()`）的偏差。App 内的当前时间由单调时钟加偏差得出，设备改时间不影响；设备重启后重新校时。
+- 前端是 Android / iOS 原生 App，以门店节点为基准校时：经 `GET /api/v1/clock`（见「接口」节点时钟）取节点当前时间，按往返耗时的一半修正（Cristian 算法），记下与设备单调时钟（不随系统时间修改而变化，如 Android 的 `SystemClock.elapsedRealtime()`）的偏差。App 内的当前时间由单调时钟加偏差得出，设备改时间不影响；设备重启后重新校时。
 - 前端只在自己的信号有效时允许录入和提交；信号无效时先校时，节点返回 `CLOCK_NOT_SYNCED` 时按 SOP 处理。
+- 部署要求：录入业务记录的平板和手机由门店统一采购、纳入设备管理（MDM），强制自动设置日期与时间并禁止员工修改（Android 企业设备用 `DISALLOW_CONFIG_DATE_TIME` 加自动时间，iOS / iPadOS 受监管设备用「强制自动设置日期与时间」）。员工私人设备不安装 App。
+  - 理由：App 的时间虽不依赖设备时间，设备层面的限制是 App 之外的另一道防线，与门店节点的权限要求一致。
 - 录入时记下设备单调时钟的读数，保存在 App 内，不提交。首次提交时，用这个读数加当时的偏差算出 `occurred_at`（生产另算 `started_at`），随命令保存；结果未知的重试用原值、原内容。
 - 每条实时录入的写命令带：
   - `occurred_at`：员工完成录入的时刻。生产另带 `started_at`：员工点「开始生产」的时刻。
@@ -88,7 +116,7 @@
 
 **通用规则**：
 
-- 一个命令产生的所有事件共用同一组 `recorded_at`、`occurred_at`、`business_date`。
+- 一个命令产生的所有事件共用同一组 `recorded_at`、`occurred_at`、`business_date`、`clock_synced_at`。
 - 冲销和数量更正的 `occurred_at`、`business_date` 取原事件的值，由写入线程填写，客户端不能指定。
 - 创建收货、生产、报损等单据时，界面显示将要记录的发生日期和时间，供操作人员核验（见 [SOP](sop.md)「记录」）。
 - **营业日**：配置项 `timezone = "Asia/Shanghai"`（IANA 时区名）、`business_day_cutoff = "04:00"`（`'HH:MM'`），都必填，缺失或非法时拒绝启动。`occurred_at` 换算到门店当地时间，早于日切的算前一营业日。由 `jiff` 纯函数计算。修改日切配置不重算历史事件。
@@ -245,9 +273,9 @@
 
 | event_type | aggregate_type | payload 要点 | 投影影响 | 实现状态 |
 |---|---|---|---|---|
-| `GOODS_RECEIVED` | `RECEIPT` | `@2`：`boh_domain::receiving::GoodsReceived`；样本 `crates/boh-app/tests/golden/GOODS_RECEIVED@2/`；`lot_id` 是批次号。`@1`（`lot_id` 为 UUID）不支持，见「收货接口」 | 每行新建一个批次 | 已实现；定点数量随定点小数切片实现 |
+| `GOODS_RECEIVED` | `RECEIPT` | `@2`：`boh_domain::receiving::GoodsReceived`；样本 `crates/boh-app/tests/golden/GOODS_RECEIVED@2/`；`lot_id` 是批次号。`@1`（`lot_id` 为 UUID）不支持，见「收货接口」 | 每行新建一个批次 | 已实现 |
 | `PRODUCTION_BATCH_COMPLETED` | `PRODUCTION_BATCH` | `recipe_id`, `recipe_version`, `batch_count`, `started_at?`, `output{item_id, planned_qty, qty, lot_id, expires_at?}`, `consumed[{item_id, planned_qty, qty, alloc \| absorbed_by_event_id}]` | 原料按分配扣减（或被吸收）；成品新建批次 | 尚未实现，随生产切片实现 |
-| `WASTE_LOGGED` | `WASTE_RECORD` | `boh_domain::waste::WasteLogged`；样本 `crates/boh-app/tests/golden/WASTE_LOGGED@1/`。`lot_id` 是员工指定的批次；`item_book_qty` 是提交时该行之前的物料净账面，指定批次的行另带该批次账面 `lot_book_qty`（与 `lot_id` 同时出现）。见「报损接口」 | 按分配扣减（或被吸收） | 部分实现：写入路径的吸收判定随盘点切片实现；定点数量随定点小数切片实现 |
+| `WASTE_LOGGED` | `WASTE_RECORD` | `boh_domain::waste::WasteLogged`；样本 `crates/boh-app/tests/golden/WASTE_LOGGED@1/`。`lot_id` 是员工指定的批次；`item_book_qty` 是提交时该行之前的物料净账面，指定批次的行另带该批次账面 `lot_book_qty`（与 `lot_id` 同时出现）。见「报损接口」 | 按分配扣减（或被吸收） | 部分实现：写入路径的吸收判定随盘点切片实现 |
 | `STOCK_COUNT_SUBMITTED` | `STOCK_COUNT` | `purpose`（`CLOSING` / `AUDIT`）, `lines[{item_id, lot_id, counted_qty, input}]` | 无 | 尚未实现，随盘点切片实现 |
 | `STOCK_ADJUSTED` | `STOCK_COUNT` | `lines[{item_id, lot_id?, book_qty, counted_qty, delta}]`：带 `lot_id` 的是批次行，不带的是每个物料一行的账外缺口清零 | 批次和账外缺口按 delta 变化；写 `inventory_counts` | 尚未实现，随盘点切片实现 |
 | `PURCHASE_ORDER_SUBMITTED` | `PURCHASE_ORDER` | `supplier_id`, `lines[{item_id, qty, input}]`, `deliver_on`（门店当地日期 `'YYYY-MM-DD'`） | 无 | 尚未实现，未排期 |
@@ -255,7 +283,7 @@
 | `QUANTITY_CORRECTED` | 与原事件相同 | `corrected_event_id`, `reason`, `lines[{line_ref, item_id, physical_at, old_qty, new_qty, delta, input?, line_cost_cents?, alloc \| absorbed_by_event_id}]` | 按差额调整（或被吸收），见「纠错」 | 尚未实现，随纠错切片实现 |
 | `EVENT_REVERSED` | 与原事件相同 | `reversed_event_id`, `reason`, `lines[{line_ref, item_id, physical_at, qty, alloc \| absorbed_by_event_id}]` | 精确取反（或被吸收），见「纠错」 | 尚未实现，随纠错切片实现 |
 | `SALES_IMPORTED` | `SALES_DAY` | `source`（`CSV` / `XLSX`）, `file_name`, `lines[{item_id, qty, amount_cents}]`, `ignored_rows`（整数） | 覆盖 `daily_sales` 中该营业日；**不写库存流水** | 尚未实现，随销售导入切片实现 |
-| `MASTER_DATA_CHANGED` | 实体名 | `entity`, `source`, `snapshot` | 覆盖对应的主数据表 | 部分实现：`EQUIPMENT`、`ITEM`、`RECIPE`、`SUPPLIER`、`WASTE_REASON` 的 `source = LOCAL` 写入已实现（定点数量与配方 `input` 随定点小数切片实现）；`EMPLOYEE` 随认证切片实现，`HQ_PACKAGE` 随下行同步实现 |
+| `MASTER_DATA_CHANGED` | 实体名 | `entity`, `source`, `snapshot` | 覆盖对应的主数据表 | 部分实现：`EQUIPMENT`、`ITEM`、`RECIPE`、`SUPPLIER`、`WASTE_REASON` 的 `source = LOCAL` 写入已实现；`EMPLOYEE` 随认证切片实现，`HQ_PACKAGE` 随下行同步实现 |
 
 - `reason_code` 的值对应 `WASTE_REASON` 的 `code`。
 - 温度记录每条读数一个新的 `TEMPERATURE_READING` 聚合。
@@ -475,12 +503,25 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 - **新建**：服务端生成 UUIDv7 作为聚合 ID，写一条 `aggregate_version = 1` 的事件。
 - **发生时间**：
   - 温度记录、收货、报损带 `occurred_at`、`clock_synced_at`，按「时间」的「发生时间的校验」校验后原样记录，`business_date` 由 `occurred_at` 计算。
+    - 提交的 `clock_synced_at` 原样记录在每条事件的 `store_events.clock_synced_at` 中（见「时间」）；它不进入规范化请求，重试返回首次响应，所以记录的是首次成功提交时的值。
     - 发生时间的校验和营业日计算属于业务校验，在幂等检查之后执行。
       理由：`recorded_at` 在写事务内才确定。重试即使带着已过期的 `clock_synced_at`，也返回首次响应，不重新校验。
   - 主数据命令不带 `occurred_at` / `clock_synced_at`：`occurred_at = recorded_at`，`business_date` 由它计算。
 - **业务校验**（幂等检查之后）：被拒绝时不写事件或 `processed_commands`。同时命中多个业务错误时，返回哪一个不作规定；接口规定了判定先后的除外（报损的不足确认在其余业务校验都通过之后判定）。
 - **引用**：引用的实体不存在时 `404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": <被引用的实体>, "id"}`，接口另有规定的除外。停用的照常受理。
 - **行下标**：带 `lines` 的命令，错误和警告 `details` 中的 `line` 是行在 `lines` 中的下标。
+
+### 节点时钟接口
+
+| 方法与路径 | 权限 |
+|---|---|
+| `GET /api/v1/clock` | 不需要身份 |
+
+- 前端校时用（见「时间」前端校时）。不是写命令，没有幂等处理。
+- 成功的 `data` 是 `{"now": <UTC 毫秒>}`，用统一信封；`now` 取节点时钟模块的当前时间。
+- 判定节点信号是否有效与生成 `now` 用同一次时间读数。信号无效时返回 `503 CLOCK_NOT_SYNCED`，`details` 为 `{}`。
+- 响应带 `Cache-Control: no-store`（成功和失败都带）。
+  - 理由：缓存的时间会让前端算出错误的偏差。
 
 ### 前端错误处理
 
@@ -538,7 +579,7 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 
 - 新建时每批产出和 `lines` 构成版本 1。
 - **数量**：每批产出和每行的每批用量都用 `input` 提交（见「单位」），按录入上限检查录入的数字，例如每批面粉录 `25` kg，不录 `25000` g。
-  - 快照中同时保存换算后的基本单位数量（`output_qty_per_batch`、`qty_per_batch`，都大于 0）和 `input`。生产按基本单位数量计算。
+  - 快照中同时保存换算后的基本单位数量（都大于 0）和 `input`，字段见 `boh_domain::master_data::RecipeSnapshot`。生产按基本单位数量计算。
   - 写入线程按当前换算核对产出物料和各行物料的单位（`UNKNOWN_UNIT`、`UNIT_CONVERSION_CHANGED`，见「单位」）：行的 `details` 带 `line`（`lines` 下标），产出的不带。已保存的版本不受之后修改换算系数的影响。
 - **追加版本**：新版本号是当前最大版本 + 1，写一条 `MASTER_DATA_CHANGED`，`revision` + 1。权限、`base_revision`、配方不存在和成功的 `data` 同「修改」。
   - 每批产出和 `lines`（含行顺序和 `input`）都与最新版本相同时，不新增版本、不写事件，`revision` 不变；命令照常成功并写入 `processed_commands`，响应为当前配方。只与最新版本比较：从 A 改为 B 再改回 A，仍新增版本；同一数量换一种单位录入（`2.5` kg 改为 `2500` g）也新增版本。
@@ -705,8 +746,13 @@ ORDER BY c.observed_at, c.event_seq LIMIT 1
 - **同一天内的批次顺序按入账先后**，不还原实物到达的先后：先到但后入账的批次流水号更大，FIFO 排在后面。
 - **批次日期依赖门店节点时钟**：节点只在校时信号有效时接受写入（见「时间」校时信号）。校时之后长期离线时，主板时钟的漂移会累积，系统不检测。
 - **盘点期间的实物变动**：系统不检测，靠操作规范禁止，违反时由重盘纠正。
-- **时钟**：校时之后系统时钟仍被改到未来再拨回时（如离线期间手动改时间），期间事件的 `business_date` 是错的，不能自动修正；`/health` 会暴露这种情况，并持续 `degraded` 到真实时间追上那些记录（见「时间」时钟异常）。
+- **时钟**：校时之后系统时钟仍被改到未来再拨回时（离线期间手动改时间由部署要求禁止，见「时间」门店节点校时），期间事件的 `business_date` 是错的，不能自动修正；`/health` 会暴露这种情况，并持续 `degraded` 到真实时间追上那些记录（见「时间」时钟异常）。
 - **发生时间由前端声明**：`occurred_at`、`clock_synced_at`、生产的 `started_at` 都由客户端提交，已认证员工可以伪造；HTTPS、设备令牌和 PIN 不能证明真实录入时间。伪造会改变记录归属的营业日、盘点窗口和吸收判定。温度记录的时间就是记录内容，伪造即记录造假。系统只保证留痕（见「时间」展示与导出），防伪造靠 [SOP](sop.md) 与店长复核。实时录入不受 Q6 锁账日约束。
+- **状态文件的存储故障**：状态文件所在目录写入、删除或 fsync 失败（磁盘满、文件系统只读、I/O 错误）时，状态文件可能与内存中的信号不一致，不保证跨重启一致：
+  - 偏差超过 1 分钟后删除失败：重启时读回已失效的上次校时，仍在有效期内时信号重新有效。这时 NTP 没有回复（如断网），节点会在旧信号剩余的有效期内用错误的时钟接受业务记录，直到下一次核对拿到偏差超过 1 分钟的回复。目录不能删除文件不等于数据库不能写：WAL 模式下事务可以追加到已打开的 WAL 文件中提交。
+  - 重命名之后 fsync 目录失败，重启时可能读到这次未发布的新值，断电后也可能读到原值。
+  - 系统记 `error`。维护处理：修复存储后，先删除状态文件再启动服务；节点重新校时成功（`/health` 的 `clock_synced` 为 `true`、`clock_synced_at` 晚于修复时间）后才恢复营业录入（见 [SOP](sop.md)「门店机校时」）。
+- **断网期间主板时钟出错**：断网且信号仍在有效期内时，节点重启后主板时钟读出的错误时间只要不早于上次校时，系统就发现不了，直到下次拿到 NTP 回复。期间记录的发生时间、营业日、批次日期是错的，扣减可能被观察时点较晚的盘点误吸收；按维护计划更换主板电池以降低概率。
 - **门店节点长时间宕机**时没有离线写入能力，改用纸质登记，恢复后走补录入口，见 [SOP](sop.md)。
 - **大数量的录入精度**：录入上限按所选单位计，大数量只能精确到大单位的 0.001。例如 11680.5 g 超过 g 的录入上限，换成 kg 是 11.6805，超过 3 位小数，只能录 `11.681` kg。账面和批次余量本身不受录入上限限制。
 - **客户端暂存**：普通命令只承诺 App 不退出期间，命令进入 App 的本地队列，界面显示「待提交 N 条」。盘点草稿是例外，可跨 App 重启、休眠恢复，规则见「盘点」第 1 条。客户端不维护库存镜像，不做批次分配。排队命令补交被拒时，界面列出命令和原因，由人工处理。

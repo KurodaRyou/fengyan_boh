@@ -294,6 +294,7 @@ mod tests {
                 business_date: "2026-10-07".into(),
                 occurred_at: UnixMillis(0),
                 recorded_at: UnixMillis(0),
+                clock_synced_at: None,
                 payload: String::new(),
             };
             for (entity, snapshot) in [
@@ -349,6 +350,7 @@ mod tests {
                     business_date: "2026-10-07".into(),
                     occurred_at: UnixMillis(0),
                     recorded_at: UnixMillis(0),
+                    clock_synced_at: None,
                     payload: String::new(),
                 };
                 let v1 = format!(

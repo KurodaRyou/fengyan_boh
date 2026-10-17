@@ -1,6 +1,6 @@
 # Fengyan BOH — 门店边缘节点
 
-烘焙门店后厨（BOH）系统的门店本地节点。部署在每家门店的一台 Linux 机器上，局域网内的平板和员工手机通过 Android / iOS 原生 App 访问。
+烘焙门店后厨（BOH）系统的门店本地节点。部署在每家门店的一台 Linux 机器上，局域网内由门店统一采购、纳入设备管理的平板和手机通过 Android / iOS 原生 App 访问（部署要求见 [docs/domain.md](docs/domain.md)「时间」前端校时）。
 **断网是常态，不是异常**：门店节点和前端的校时信号有效时，所有门店内核心操作无需外网即可正常工作，联网后再把事件同步到总部。节点无有效校时信号时，按 [SOP](docs/sop.md)「门店机校时」打开手机热点联网校准，获得有效信号后恢复写入；前端无有效信号时，先向门店节点校时。没有可用热点时，继续采用纸面登记流程。
 
 业务决策、事件目录与领域规则见 [docs/domain.md](docs/domain.md)；系统依赖的门店操作规范见 [docs/sop.md](docs/sop.md)；规范用词见 [docs/glossary.md](docs/glossary.md)；锁定测试使用的接口见 [docs/interfaces.md](docs/interfaces.md)；备份模块的细则见 [docs/backup.md](docs/backup.md)；不变量自检的细则见 [docs/invariant-check.md](docs/invariant-check.md)；员工认证与设备注册见 [docs/auth.md](docs/auth.md)。
@@ -111,7 +111,7 @@
 
 ### 路线图
 
-已完成：write path 与基础设施；设备主数据（walking skeleton）；温度记录；备份与 `/health`；其余主数据（物料、配方、供应商、报损原因）与库存投影；收货与批次号；库存明细与批次查询；报损；不变量自检；库存规则归属。迁移到 007。
+已完成：write path 与基础设施；设备主数据（walking skeleton）；温度记录；备份与 `/health`；其余主数据（物料、配方、供应商、报损原因）与库存投影；收货与批次号；库存明细与批次查询；报损；不变量自检；库存规则归属；定点小数。迁移到 007。
 
 当前实现边界：
 - `init` 写入 `store_meta` 和预置报损原因；第一个店长随认证切片加入。
@@ -121,7 +121,7 @@
 - 第一版只有一家门店、没有总部：`MASTER_DATA_CHANGED` 只有 `source = LOCAL` 的写入口，由店长维护（归属见 [docs/domain.md](docs/domain.md)「主数据」）。
 
 待做，按顺序：
-1. 定点小数（数量支持 3 位小数、小数换算系数、录入上限、库存状态上限）→ 门店节点校时（校时前拒绝写入）→ 盘点（含盘点吸收：已有的报损一并实现吸收判定）→ 局域网 HTTPS → 员工认证（`EMPLOYEE` 投影、写接口、golden 样本与第一个店长）。
+1. 门店节点校时（校时前拒绝写入）→ 异常分级与通用确认（拒绝 / 需要确认 / 警告的统一分级表；报损的 `confirm_shortage` 改为通用确认）→ 盘点（含盘点吸收：已有的报损一并实现吸收判定）→ 局域网 HTTPS → 员工认证（`EMPLOYEE` 投影、写接口、golden 样本与第一个店长）。
 2. 扩展：生产 → 纠错（冲销、数量更正）→ 补录入口 → 销售导入。每一步配对应的验收用例。
 
 ---
@@ -143,6 +143,7 @@
 | 时区 / 营业日 | `jiff`，启用 `tzdb-bundle-always`：时区库编进二进制，不依赖门店机的 zoneinfo |
 | 员工 PIN 哈希（待引入，认证切片） | `argon2`（Argon2id） |
 | 局域网 HTTPS（待引入，认证切片之前） | `rustls`，接入方式随 `docs/domain.md` Q9 确定 |
+| 门店节点校时的 NTP 核对 | `sntpc`，关闭默认特性；本机时间经 `NtpTimestampGenerator` 取自时钟模块，UDP 用 tokio |
 | 上行同步（待实现） | `reqwest` + `rustls`，mTLS |
 
 禁止引入：Redis、消息队列、ORM、微服务、任何需要外部进程的依赖。整个节点是**一个静态链接二进制 + 一个 SQLite 文件**。
@@ -181,7 +182,7 @@
 crates/
   boh-domain/   纯类型与校验不变量、库存规则纯函数（见「库存规则归属」）、发生时间校验与营业日纯函数。只允许依赖 serde / uuid / thiserror / jiff。禁止数据库、HTTP、系统 I/O（包括读系统时钟）。
   boh-storage/  SQLite：连接初始化、迁移、写入线程、读连接池、ledger（唯一写事件入口）、projections（含各事件共用的库存投影写入）、备份、时钟模块（可注入）、原生 SQL。
-  boh-app/      http（路由、响应信封）、service（命令编排，含各命令共用的库存决策读取）、sync（同步 worker，待实现）。
+  boh-app/      http（路由、响应信封）、service（命令编排，含各命令共用的库存决策读取）、节点校时核对（NTP 查询与校时信号）、sync（同步 worker，待实现）。
   boh-server/   main：加载配置、启动、信号处理、优雅关闭；子命令 init、rebuild-projections；认证切片加子命令 enroll-code、unlock-device、reset-unlock-code、revoke-device、reset-pin。
 migrations/     编号 SQL 文件，001_xxx.sql、002_xxx.sql……
 deploy/         systemd unit、示例配置。
@@ -313,7 +314,7 @@ scripts/        CI 扫描脚本。
 
 ### 上行同步（只定契约，本期不实现）
 - 不建 outbox。连续的 `seq` 就是同步游标。开发同步时新增迁移建单行表 `sync_state`（`acked_seq`、`last_attempt_at`、`last_error`、`consecutive_failures`）。
-- 推送 `seq > acked_seq` 的事件，按 `seq` 升序分批，批次头携带 `store_id`。
+- 推送 `seq > acked_seq` 的事件，按 `seq` 升序分批，批次头携带 `store_id`。事件带 `store_events` 的全部列，包括 `clock_synced_at`。
 - **严格按序**：遇阻就重试并报警，不跳号，没有 `dead` 状态。
 - 总部按 `(store_id, seq)` 严格按序、幂等地接收，先原样落库再异步处理；解析不了的事件进入总部隔离区，不退回门店。
 - 失败按指数退避。无网络时 worker 安静退避，只记 `debug` 级日志，不报错、不影响请求路径。
@@ -358,7 +359,8 @@ scripts/        CI 扫描脚本。
   crate 级 `clippy.toml` 会覆盖根目录的配置，所以根目录的规则要完整复制进去。
 - 禁止在上表以外的位置豁免这些 lint，禁止用 crate 级 `#![allow]` 放宽任何 deny 的 lint。
 - Release 配置 `panic = "abort"`：任何 panic 都直接结束进程，由 systemd 重启。不要用 `catch_unwind` 吞 panic。
-- 优雅关闭顺序：停止接收 HTTP → 停止同步 worker 和后台任务（执行完正在进行和已排队的备份、闭店流程与自检） → `WriterHandle::shutdown()` 处理完已入队的写任务 → `wal_checkpoint(TRUNCATE)` → 退出。
+- 优雅关闭顺序：停止接收 HTTP → 停止同步 worker 和后台任务（执行完正在进行和已排队的备份、闭店流程与自检；节点校时核对见下） → `WriterHandle::shutdown()` 处理完已入队的写任务 → `wal_checkpoint(TRUNCATE)` → 退出。
+  - 节点校时核对：正在等待的 NTP 查询直接取消；已经开始的状态文件持久化执行完再退出（`spawn_blocking` 开始运行后不能中止）。
   - checkpoint 因读事务未结束而未能截断 WAL（`CheckpointBusy`）时只记 `warn`，正常退出：已提交的事务已持久化在 WAL 中，下次打开时 SQLite 用保留的 WAL 读取并在需要时恢复已提交状态，checkpoint 在之后满足触发条件时执行。
     只有 `CheckpointBusy` 这样处理；I/O 错误、数据库损坏、关闭连接失败等照常报错。
 
@@ -411,6 +413,7 @@ scripts/        CI 扫描脚本。
   | `status` | `"ok"` 或 `"degraded"` |
   | `schema_version` | 数据库的 `user_version` |
   | `clock_synced` | 节点校时信号是否有效；含义见 domain.md「时间」校时信号。随门店节点校时切片加入 |
+  | `clock_synced_at` | 节点的上次校时时间（domain.md「时间」门店节点校时）；没有时为 `null`。随门店节点校时切片加入 |
   | `clock_regression_ms` | `max(0, max(store_events.recorded_at) − now)`，账本为空时为 0；含义见 domain.md「时间」时钟异常 |
   | `last_backup_ok_at` | 本进程最近一次成功备份完成时的 `now()`；本进程还没有成功过时为 `null` |
   | `last_backup_seq` | 该次备份的 `n`（见「备份」）；同上为 `null` |
@@ -451,7 +454,7 @@ ARM 门店机改用 `aarch64-unknown-linux-musl`。部署文件见 `deploy/`。
 
 ## 尚未设计（动手前先讨论）
 
-- 前端原生 App：技术栈（Android / iOS 各自开发或跨平台）、安装分发与版本更新、本地队列的持久化；时间规则已定，见 [docs/domain.md](docs/domain.md)「时间」前端校时。
+- 前端原生 App：技术栈（Android / iOS 各自开发或跨平台）、安装分发与版本更新、设备管理（MDM）的选型与设备注册流程、本地队列的持久化；时间规则已定，见 [docs/domain.md](docs/domain.md)「时间」前端校时。
 - 下行同步：主数据包的格式、拉取与导入流程（原则已定：总部维护统一的 JSON 主数据包，逐行比对快照，`source = HQ_PACKAGE`；全部主数据归总部所有，见 [docs/domain.md](docs/domain.md)「主数据」）。**总部本期不开发，延后。**
   - 设计时一并定：门店修改申请的流程；按门店下发不同物料时，下发给某店的包内引用必须完整（配方用到的物料都在包内）；物料撤出某店的下发范围时该店只停用、不删除；新门店初始化、首次主数据包导入与首位店长本地 PIN 设定的衔接（包括如何满足 `LAST_ACTIVE_MANAGER` 约束）；员工调动后在新门店的登录（认证状态不同步，见 [docs/auth.md](docs/auth.md)）。
 - 上行同步的实现：总部接收接口、批量大小、mTLS 证书下发与轮换、失败的重试分类（哪些错误可重试）。**延后**；契约见「上行同步」。

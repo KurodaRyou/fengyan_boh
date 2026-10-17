@@ -9,6 +9,8 @@ use boh_domain::time::{
 };
 use serde::{Deserialize, Deserializer};
 
+pub use boh_app::clock_sync::NtpServer;
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -28,6 +30,13 @@ pub struct Config {
     pub backup_keep_count: NonZeroU32,
     #[serde(default, deserialize_with = "closing_backup_time")]
     pub closing_backup_time: ClosingBackupTime,
+    #[serde(deserialize_with = "ntp_servers")]
+    pub ntp_servers: Vec<NtpServer>,
+}
+
+fn ntp_servers<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<NtpServer>, D::Error> {
+    let values = Vec::<String>::deserialize(de)?;
+    boh_app::clock_sync::parse_ntp_servers(&values).map_err(serde::de::Error::custom)
 }
 
 fn default_backup_keep_count() -> NonZeroU32 {
@@ -74,6 +83,7 @@ listen_addr = "127.0.0.1:8080"
 timezone = "Asia/Shanghai"
 business_day_cutoff = "04:00"
 backup_dir = "backups"
+ntp_servers = ["ntp.aliyun.com"]
 "#;
 
     #[test]
@@ -125,6 +135,35 @@ backup_dir = "backups"
     #[test]
     fn rejects_unknown_fields() {
         assert!(parse_config(&format!("{VALID}\nunknown = true")).is_err());
+    }
+
+    #[test]
+    fn ntp_error_identifies_the_invalid_entry_and_reason() {
+        for (entry, reason) in [
+            ("", "must not be empty"),
+            ("bad host", "whitespace"),
+            ("[::1", "closing ']'"),
+            ("[bad]:123", "valid IPv6"),
+            ("[::1]tail", "after ']'"),
+            ("::1", "square brackets"),
+            (":123", "host must not be empty"),
+            ("bad/host", "host must not contain"),
+            ("host:0", "1..=65535"),
+            ("host:65536", "1..=65535"),
+            ("host:abc", "decimal integer"),
+            ("ntp.aliyun.com:12:34", "port must be a decimal integer"),
+            ("host::123", "port must be a decimal integer"),
+            ("host:", "decimal integer"),
+        ] {
+            let text = VALID.replace(
+                "[\"ntp.aliyun.com\"]",
+                &format!("[\"ntp.aliyun.com\", {entry:?}]"),
+            );
+            let error = parse_config(&text).unwrap_err().to_string();
+            assert!(error.contains("ntp_servers[1]"), "{error}");
+            assert!(error.contains(&format!("{entry:?}")), "{error}");
+            assert!(error.contains(reason), "missing {reason}: {error}");
+        }
     }
 
     #[test]

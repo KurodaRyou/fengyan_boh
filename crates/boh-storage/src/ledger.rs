@@ -93,6 +93,7 @@ pub struct Event {
     pub business_date: String,
     pub occurred_at: UnixMillis,
     pub recorded_at: UnixMillis,
+    pub clock_synced_at: Option<UnixMillis>,
     pub payload: String,
 }
 
@@ -105,11 +106,11 @@ impl Ledger<'_> {
         self.tx.execute(
             "INSERT INTO store_events (id, event_type, schema_version, aggregate_type, aggregate_id,
                  aggregate_version, command_id, actor_id, device_id, business_date, occurred_at,
-                 recorded_at, payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 recorded_at, payload, clock_synced_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![event.id.to_string(), event.event_type, event.schema_version, event.aggregate_type,
                 event.aggregate_id.to_string(), event.aggregate_version, event.command_id.to_string(),
                 event.actor_id.to_string(), event.device_id.to_string(), event.business_date,
-                event.occurred_at.0, event.recorded_at.0, event.payload],
+                event.occurred_at.0, event.recorded_at.0, event.payload, event.clock_synced_at.map(|time| time.0)],
         ).map_err(|error| StorageError::sqlite("插入事件账本", error))?;
         projections::apply(self.tx, event)
     }

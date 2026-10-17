@@ -10,6 +10,7 @@ boh-domain.workspace = true
 boh-storage.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sntpc.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 

@@ -1,4 +1,7 @@
 # /etc/systemd/system/boh.service
+# 同时将 deploy/60-boh-timesyncd.conf 安装到 /etc/systemd/timesyncd.conf.d/60-boh-timesyncd.conf。
+# 将 deploy/60-boh-resolved.conf 安装到 /etc/systemd/resolved.conf.d/60-boh-resolved.conf。
+# 按这两个片段中的注释关闭网口 NTP 下发并设置 /etc/resolv.conf 的 stub 链接。
 [Unit]
 Description=Fengyan BOH store edge node
 # 只依赖 network.target，不依赖 network-online：断网是正常工作状态
@@ -13,7 +16,7 @@ Environment=RUST_LOG=info
 Restart=always
 RestartSec=2
 
-# 优雅关闭：SIGTERM → 停 HTTP → 执行完进行中和已排队的备份、闭店流程与自检 → 排空写队列 → WAL checkpoint（见 AGENTS.md「Rust」优雅关闭顺序）
+# 优雅关闭：SIGTERM → 停 HTTP 和新触发、取消 NTP 等待 → 执行完备份、闭店流程、自检与校时状态持久化 → 排空写队列 → WAL checkpoint（见 AGENTS.md「Rust」）
 KillSignal=SIGTERM
 TimeoutStopSec=120
 

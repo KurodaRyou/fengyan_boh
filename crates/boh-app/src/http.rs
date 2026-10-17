@@ -89,6 +89,14 @@ impl ApiError {
         Self::internal(StorageError::Message(message))
     }
 
+    pub fn clock_not_synced() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CLOCK_NOT_SYNCED",
+            "node clock is not synchronized",
+        )
+    }
+
     pub fn validation() -> Self {
         Self::new(
             StatusCode::BAD_REQUEST,
@@ -139,6 +147,11 @@ impl From<StorageError> for ApiError {
 impl From<TimeError> for ApiError {
     fn from(error: TimeError) -> Self {
         match error {
+            TimeError::ClientClockNotSynced => Self::new(
+                StatusCode::BAD_REQUEST,
+                "CLIENT_CLOCK_NOT_SYNCED",
+                "client clock is not synchronized",
+            ),
             TimeError::CaptureTooOld => Self::new(
                 StatusCode::BAD_REQUEST,
                 "CAPTURE_TOO_OLD",
@@ -157,6 +170,7 @@ impl From<TimeError> for ApiError {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/api/v1/clock", get(node_clock))
         .route(
             "/api/v1/equipment",
             get(list_equipment).post(create_equipment),
@@ -195,6 +209,20 @@ pub fn router(state: AppState) -> Router {
         .fallback(route_not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(state)
+}
+
+async fn node_clock(State(state): State<AppState>) -> Response {
+    let now = state.clock.now();
+    let mut response = if state.clock_signal.valid(now) {
+        ok(serde_json::json!({"now": now})).into_response()
+    } else {
+        ApiError::clock_not_synced().into_response()
+    };
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
 }
 
 async fn route_not_found() -> ApiError {
@@ -478,6 +506,8 @@ struct Health {
     status: &'static str,
     schema_version: i64,
     clock_regression_ms: u64,
+    clock_synced: bool,
+    clock_synced_at: Option<boh_domain::UnixMillis>,
     last_backup_ok_at: Option<boh_domain::UnixMillis>,
     last_backup_seq: Option<i64>,
     last_backup_failed_at: Option<boh_domain::UnixMillis>,
@@ -500,6 +530,7 @@ async fn health(State(state): State<AppState>) -> Result<Json<Envelope<Health>>,
         .await?;
     let now = state.clock.now();
     let clock_regression_ms = clock_regression(latest, now);
+    let (clock_synced, clock_synced_at) = state.clock_signal.status(now);
     let mut wal_path = state.db_path.into_os_string();
     wal_path.push("-wal");
     let span = tracing::Span::current();
@@ -518,7 +549,8 @@ async fn health(State(state): State<AppState>) -> Result<Json<Envelope<Health>>,
     let backup = state.backup_health.snapshot();
     let invariant_check = state.invariant_health.snapshot();
     Ok(ok(Health {
-        status: if clock_regression_ms > 300_000
+        status: if !clock_synced
+            || clock_regression_ms > 300_000
             || backup.last_failed_at.is_some()
             || invariant_check.degraded()
         {
@@ -528,6 +560,8 @@ async fn health(State(state): State<AppState>) -> Result<Json<Envelope<Health>>,
         },
         schema_version: version,
         clock_regression_ms,
+        clock_synced,
+        clock_synced_at,
         last_backup_ok_at: backup.last_ok_at,
         last_backup_seq: backup.last_seq,
         last_backup_failed_at: backup.last_failed_at,
@@ -591,14 +625,14 @@ mod tests {
     #[test]
     fn warning_details_serialize_as_an_object() {
         let body = WarningBody {
-            code: "CAPTURE_TIME_ADJUSTED",
-            message: "adjusted".into(),
+            code: "STOCK_SHORTFALL",
+            message: "stock shortfall".into(),
             details: Map::new(),
         };
         assert_eq!(
             serde_json::to_value(body).unwrap(),
             serde_json::json!({
-                "code": "CAPTURE_TIME_ADJUSTED", "message": "adjusted", "details": {}
+                "code": "STOCK_SHORTFALL", "message": "stock shortfall", "details": {}
             })
         );
     }

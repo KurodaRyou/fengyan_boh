@@ -155,7 +155,7 @@ async fn http_shared_structs_require_objects_before_idempotency() {
         .unwrap();
     let receipt = json!({
         "command_id": master_command_id(5), "supplier_id": supplier_id,
-        "captured_at": 1_791_248_400_000_i64, "sent_at": 1_791_248_400_000_i64,
+        "occurred_at": 1_791_248_400_000_i64, "clock_synced_at": 1_791_248_400_000_i64,
         "lines": [{
             "item_id": item_id, "input": {"qty": "5", "unit_code": "g", "base_qty_per_unit": "1"},
             "produced_on": "2026-10-01", "expires_on": "2026-10-20", "line_cost_cents": 1000

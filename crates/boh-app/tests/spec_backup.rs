@@ -673,13 +673,13 @@ async fn restore_drill_matches_the_snapshot_and_rebuilds_the_same_projections() 
     .await
     .unwrap();
     assert_success(&reply);
-    for (n, equipment, note, captured_at, sent_at) in [
-        (4, &a, Some("门 半开"), local(8, 50), local(8, 55)),
-        (5, &b, None, local(8, 58), local(8, 57)), // 负 lag，带 CAPTURE_TIME_ADJUSTED
+    for (n, equipment, note, occurred_at) in [
+        (4, &a, Some("门 半开"), local(8, 55)),
+        (5, &b, None, local(9, 0)),
     ] {
         let mut body = json!({
             "command_id": cmd(n), "equipment_id": equipment, "celsius_x10": -180,
-            "captured_at": captured_at.0, "sent_at": sent_at.0,
+            "occurred_at": occurred_at.0, "clock_synced_at": local(8, 0).0,
         });
         if let Some(note) = note {
             body["note"] = json!(note);

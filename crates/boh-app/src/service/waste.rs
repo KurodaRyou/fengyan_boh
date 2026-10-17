@@ -4,7 +4,7 @@ use axum::http::StatusCode;
 use boh_domain::inventory::Allocation;
 use boh_domain::lot::LotId;
 use boh_domain::quantity::Quantity;
-use boh_domain::time::{CaptureTimes, business_date, calibrate};
+use boh_domain::time::{CaptureTimes, business_date, check_capture_times};
 use boh_domain::waste::{
     LogWaste, PrecheckWaste, WasteEffect, WasteLine, WasteLogged, WasteRecord, WasteRequestLine,
 };
@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 
 use crate::AppState;
 use crate::actor::Actor;
-use crate::http::{ApiError, WarningBody, ok};
+use crate::http::{ApiError, ok};
 
 #[tracing::instrument(name = "command", skip_all, fields(command_type = "waste.log", command_id = %command.command_id, actor_id = %actor.employee_id, device_id = %actor.device_id))]
 pub async fn log(state: AppState, actor: Actor, command: LogWaste) -> Result<Value, ApiError> {
@@ -37,16 +37,17 @@ pub async fn log(state: AppState, actor: Actor, command: LogWaste) -> Result<Val
                     recorded_at,
                 },
                 |ledger| {
-                    let calibrated = calibrate(
+                    super::check_node_clock(&state, recorded_at)?;
+                    check_capture_times(
                         CaptureTimes {
-                            captured_at: command.captured_at,
-                            sent_at: command.sent_at,
-                            started_captured_at: None,
+                            occurred_at: command.occurred_at,
+                            clock_synced_at: command.clock_synced_at,
+                            started_at: None,
                         },
                         recorded_at,
                     )?;
                     let date = business_date(
-                        calibrated.occurred_at,
+                        command.occurred_at,
                         &state.timezone,
                         state.business_day_cutoff,
                     )?;
@@ -84,7 +85,7 @@ pub async fn log(state: AppState, actor: Actor, command: LogWaste) -> Result<Val
                         waste_record_id,
                         lines: logged.lines,
                         business_date: date.to_string(),
-                        occurred_at: calibrated.occurred_at,
+                        occurred_at: command.occurred_at,
                         recorded_at,
                         actor_id: actor.employee_id,
                         device_id: actor.device_id,
@@ -103,16 +104,10 @@ pub async fn log(state: AppState, actor: Actor, command: LogWaste) -> Result<Val
                         business_date: row.business_date.clone(),
                         occurred_at: row.occurred_at,
                         recorded_at,
+                        clock_synced_at: Some(command.clock_synced_at),
                         payload,
                     })?;
-                    let mut response = ok(json!({ "waste_record": row })).0;
-                    if calibrated.capture_time_adjusted {
-                        response.warnings.push(WarningBody {
-                            code: "CAPTURE_TIME_ADJUSTED",
-                            message: "capture time adjusted to the receiving time".into(),
-                            details: Default::default(),
-                        });
-                    }
+                    let response = ok(json!({ "waste_record": row })).0;
                     serde_json::to_string(&response).map_err(|error| {
                         ApiError::from(StorageError::external("保存报损命令响应", error))
                     })

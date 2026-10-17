@@ -238,7 +238,7 @@ fn load_balance(conn: &Connection, item_id: AggregateId) -> Result<ItemBalance, 
         .map_err(|error| ApiError::from(StorageError::external("读取库存工作集", error)))
 }
 
-/// One command's serials for its single, calibrated lot date.
+/// One command's serials for its single, client-declared lot date.
 pub(super) struct LotNumbers {
     lot_date: Date,
     calendar_date: String,

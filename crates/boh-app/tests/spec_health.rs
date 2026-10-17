@@ -40,7 +40,8 @@ async fn create_equipment(router: &axum::Router, n: u16) {
     assert_success(&reply);
 }
 
-// 「data 的字段」恰好是这八个；新节点：账本为空、本进程还没有备份结果，启动检查在空账本上通过，状态 ok。不需要身份。
+// 「data 的字段」恰好是这十个；新节点：账本为空、本进程还没有备份结果，启动检查在空账本上通过，节点信号有效
+// （状态文件中的上次校时为 3 天前，spec_support::node），状态 ok。不需要身份。clock_synced 为 false 时的 degraded 见 spec_clock.rs。
 // invariant_check 的结构见 docs/invariant-check.md「报告」，各种结果见 spec_invariant_check.rs。
 #[tokio::test]
 async fn new_node_reports_ok_and_unknown_backup_state() {
@@ -68,6 +69,8 @@ async fn new_node_reports_ok_and_unknown_backup_state() {
         keys,
         [
             "clock_regression_ms",
+            "clock_synced",
+            "clock_synced_at",
             "invariant_check",
             "last_backup_failed_at",
             "last_backup_ok_at",
@@ -83,6 +86,11 @@ async fn new_node_reports_ok_and_unknown_backup_state() {
         json!(boh_storage::LATEST_SCHEMA_VERSION)
     );
     assert_eq!(data["clock_regression_ms"], json!(0));
+    assert_eq!(data["clock_synced"], json!(true));
+    assert_eq!(
+        data["clock_synced_at"],
+        json!(NOW.0 - spec_support::DEFAULT_SYNCED_BEFORE)
+    );
     assert_eq!(data["last_backup_ok_at"], Value::Null);
     assert_eq!(data["last_backup_seq"], Value::Null);
     assert_eq!(data["last_backup_failed_at"], Value::Null);
@@ -109,7 +117,7 @@ async fn new_node_reports_ok_and_unknown_backup_state() {
 }
 
 // 「clock_regression_ms = max(0, max(store_events.recorded_at) − now)，账本为空时为 0；超过 300000 为 degraded」：
-// 恰好 300000 仍为 ok。degraded 不阻止写入；回拨后写入的记录不降低 max(recorded_at)，指标保持到时钟追上最晚的记录。
+// 恰好 300000 仍为 ok。degraded 不阻止写入（节点信号有效：上次校时为 3 天前）；回拨后写入的记录不降低 max(recorded_at)，指标保持到时钟追上最晚的记录。
 #[tokio::test]
 async fn clock_regression_measures_how_far_the_latest_record_is_ahead() {
     let dir = tempfile::tempdir().unwrap();

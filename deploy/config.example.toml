@@ -2,6 +2,10 @@
 store_id = "01890a5d-ac96-774b-bcce-b302099a8050"
 timezone = "Asia/Shanghai"
 business_day_cutoff = "04:00"
+# 节点仅核对偏差；系统时钟由 systemd-timesyncd 自动校准。
+# 按顺序查询，端口缺省 123；也接受 host:port、[IPv6] 或 [IPv6]:port。
+# 只配置域名；部署时须在门店网络实测每一项可用。
+ntp_servers = ["ntp.aliyun.com", "ntp.tencent.com", "ntp.ntsc.ac.cn", "cn.pool.ntp.org"]
 db_path = "/var/lib/boh/boh.db"
 backup_dir = "/var/lib/boh/backups"
 listen_addr = "0.0.0.0:8080"

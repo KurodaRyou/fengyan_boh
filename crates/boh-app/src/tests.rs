@@ -49,6 +49,7 @@ async fn node(dev_actor_stub: bool) -> Node {
         writer: storage.writer.clone(),
         readers: storage.readers.clone(),
         clock: clock.clock(),
+        clock_signal: crate::clock_sync::ClockSignal::new(Some(clock.clock().now())),
         timezone: parse_timezone("Asia/Shanghai").unwrap(),
         business_day_cutoff: parse_business_day_cutoff("04:00").unwrap(),
         dev_actor_stub,
@@ -62,6 +63,22 @@ async fn node(dev_actor_stub: bool) -> Node {
         router,
         clock,
     }
+}
+
+// Explicitly injected signals keep timestamp-range tests focused on their original invariant.
+fn router_synced_at(node: &Node, last: UnixMillis) -> Router {
+    http::router(AppState {
+        writer: node.storage.writer.clone(),
+        readers: node.storage.readers.clone(),
+        clock: node.clock.clock(),
+        clock_signal: crate::clock_sync::ClockSignal::new(Some(last)),
+        timezone: parse_timezone("Asia/Shanghai").unwrap(),
+        business_day_cutoff: parse_business_day_cutoff("04:00").unwrap(),
+        dev_actor_stub: true,
+        db_path: node._dir.path().join("boh.db"),
+        backup_health: Default::default(),
+        invariant_health: Default::default(),
+    })
 }
 
 fn create(n: u16, code: &str) -> Value {
@@ -174,7 +191,7 @@ async fn revision_overflow_is_internal_and_does_not_commit() {
 
 #[tokio::test]
 async fn server_business_date_failure_is_internal_and_allows_original_retry() {
-    let node = node(true).await;
+    let mut node = node(true).await;
     let now = node.clock.clock().now();
     let original = send(
         node.router.clone(),
@@ -194,6 +211,7 @@ async fn server_business_date_failure_is_internal_and_allows_original_retry() {
         "equipment_type": "OVEN", "active": false
     });
     node.clock.set(UnixMillis(i64::MAX));
+    node.router = router_synced_at(&node, UnixMillis(i64::MAX));
     assert_eq!(
         send(
             node.router.clone(),
@@ -218,6 +236,7 @@ async fn server_business_date_failure_is_internal_and_allows_original_retry() {
         original.1["data"]["equipment"]
     );
     node.clock.set(now);
+    node.router = router_synced_at(&node, now);
     let (status, body) = send(node.router.clone(), Method::PUT, &path, update).await;
     assert_eq!(status, 200);
     assert_eq!(body["data"]["equipment"]["revision"], 2);
@@ -402,7 +421,7 @@ async fn public_rebuild_matches_online_state_and_keeps_original_replies() {
 
 #[tokio::test]
 async fn clock_regression_keeps_raw_time_and_does_not_break_retries() {
-    let node = node(true).await;
+    let mut node = node(true).await;
     let original = send(
         node.router.clone(),
         Method::POST,
@@ -411,6 +430,7 @@ async fn clock_regression_keeps_raw_time_and_does_not_break_retries() {
     )
     .await;
     node.clock.set(UnixMillis(-1));
+    node.router = router_synced_at(&node, UnixMillis(-1));
     assert_eq!(
         send(
             node.router.clone(),
@@ -455,7 +475,7 @@ fn temperature(n: u16, equipment_id: &str) -> Value {
     json!({
         "command_id": format!("01890a5d-ac96-774b-bcce-b30209ab{n:04x}"),
         "equipment_id": equipment_id, "celsius_x10": 38,
-        "captured_at": 1_791_248_460_000_i64, "sent_at": 1_791_248_400_000_i64
+        "occurred_at": 1_791_248_460_000_i64, "clock_synced_at": 1_791_248_400_000_i64
     })
 }
 
@@ -478,7 +498,7 @@ async fn temperature_counts(node: &Node) -> (i64, i64, i64, i64) {
 }
 
 #[tokio::test]
-async fn concurrent_temperature_retries_share_one_reading_and_saved_warning() {
+async fn concurrent_temperature_retries_share_one_reading_and_saved_times() {
     let node = node(true).await;
     let (status, equipment) = send(
         node.router.clone(),
@@ -499,7 +519,11 @@ async fn concurrent_temperature_retries_share_one_reading_and_saved_warning() {
     );
     assert_eq!(first, second);
     assert_eq!(first.0, 200);
-    assert_eq!(first.1["warnings"][0]["code"], "CAPTURE_TIME_ADJUSTED");
+    assert_eq!(first.1["warnings"], json!([]));
+    assert_eq!(
+        first.1["data"]["temperature_reading"]["occurred_at"],
+        1_791_248_460_000_i64
+    );
     assert_eq!(temperature_counts(&node).await, (2, 2, 1, 2));
     node.clock.set(UnixMillis(i64::MAX));
     assert_eq!(
@@ -553,7 +577,7 @@ async fn temperature_projection_and_receipt_failures_rollback_and_allow_original
     }
     let (status, logged) = send(node.router.clone(), Method::POST, path, request).await;
     assert_eq!(status, 200);
-    assert_eq!(logged["warnings"][0]["code"], "CAPTURE_TIME_ADJUSTED");
+    assert_eq!(logged["warnings"], json!([]));
     assert_eq!(temperature_counts(&node).await, (2, 2, 1, 2));
     node.storage.writer_handle.shutdown().await.unwrap();
 }
@@ -571,6 +595,7 @@ async fn health_reports_wal_io_failure_and_missing_wal_without_exposing_paths() 
             writer: node.storage.writer.clone(),
             readers: node.storage.readers.clone(),
             clock: node.clock.clock(),
+            clock_signal: crate::clock_sync::ClockSignal::new(Some(node.clock.clock().now())),
             timezone: parse_timezone("Asia/Shanghai").unwrap(),
             business_day_cutoff: parse_business_day_cutoff("04:00").unwrap(),
             dev_actor_stub: false,
@@ -953,6 +978,7 @@ async fn imported_snapshots_require_objects_in_nested_arrays_and_fail_atomically
                             business_date: "2026-10-06".into(),
                             occurred_at: recorded_at,
                             recorded_at,
+                            clock_synced_at: None,
                             payload,
                         })?;
                         Ok("{}".into())

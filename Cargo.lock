@@ -96,6 +96,7 @@ dependencies = [
  "boh-storage",
  "serde",
  "serde_json",
+ "sntpc",
  "tempfile",
  "tokio",
  "tracing",
@@ -801,6 +802,15 @@ name = "smallvec"
 version = "1.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9395f0f0eee849a9b707b2f06bb92a6a422090e2123bb2ef8e87a0e61892a8e"
+
+[[package]]
+name = "sntpc"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "294278b134cd7d06d7f22eca970aebe38707864c080f66547f9ad26327534af3"
+dependencies = [
+ "cfg-if",
+]
 
 [[package]]
 name = "socket2"
