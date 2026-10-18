@@ -3,6 +3,8 @@
 锁定测试只通过本文件列出的接口访问系统（见 [AGENTS.md](../AGENTS.md)「测试分工」）。签名变更必须以 `docs:` 提交更新本文件。
 时间与营业日规则见 [domain.md](domain.md)「时间」。
 
+本文件定义测试入口；面向客户端的 HTTP 业务契约见 [domain.md「接口」](domain.md#接口)，认证规则见 [auth.md](auth.md)。标注「随局域网 HTTPS 切片」的字段与入口尚未实现，其余接口按当前已落地切片提供；总体进度见 [AGENTS.md「路线图」](../AGENTS.md#路线图)。
+
 ## boh-storage
 
 ### 公开 API

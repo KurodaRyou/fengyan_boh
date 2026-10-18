@@ -1,6 +1,14 @@
 # 门店节点部署要求
 
-规则见 `docs/`：时间与网络见 `docs/domain.md`「时间」门店节点校时的部署要求，局域网 HTTPS 见 `docs/tls.md`，备份见 `docs/backup.md`。本文件只写部署时的操作步骤。每店的具体地址和日期写进部署记录（模板 `deployment-record.template.md`），不提交到仓库。
+规则见 `docs/`：时间与网络见 [domain.md「时间」](../docs/domain.md#时间)门店节点校时的部署要求，局域网 HTTPS 见 [tls.md](../docs/tls.md)，备份见 [backup.md](../docs/backup.md)。本文件只写部署时的操作步骤。每店的具体地址和日期写进[部署记录](deployment-record.template.md)，不提交到仓库。
+
+## 适用阶段
+
+项目尚未上线；当前实现范围见 [AGENTS.md「路线图」](../AGENTS.md#路线图)。本文件描述门店上线时的目标部署步骤：
+
+- 局域网 HTTPS 尚未实现。下文的 HTTPS 监听、门店签发 CA、叶证书自动签发与 `workstation_addr` 步骤随局域网 HTTPS 切片交付生效。
+- [配置样例](config.example.toml)中的 TLS 与工作站配置目前保持注释；实现之前启用这些配置会被当前配置解析器拒绝。
+- App、MDM 托管配置与工作站页面的操作和验收，随对应客户端交付执行；工作站的 HTTP 监听与网页前端分别交付。
 
 ## 文件
 
