@@ -399,7 +399,7 @@ scripts/        CI 扫描脚本。
 ## HTTP 约定
 
 - 业务接口统一前缀 `/api/v1/`；`GET /health` 例外。
-- 节点对局域网只以 HTTPS 服务；明文 HTTP 只绑定本机回环地址，供门店机工作站使用，绑定其他地址时拒绝启动；release 构建未配置 `[tls]` 时拒绝启动。细则见 [docs/tls.md](docs/tls.md)。
+- 节点对局域网只以 HTTPS 服务，只绑定有线网口的固定 IP；明文 HTTP 只绑定本机回环地址，供门店机工作站使用，绑定其他地址时拒绝启动，`Host` 不是 `127.0.0.1` / `localhost` 的请求返回 `400 VALIDATION_FAILED`；release 构建未配置 `[tls]` 时拒绝启动。细则见 [docs/tls.md](docs/tls.md)。
 - 所有响应都是同一信封（`boh-app/src/http.rs`），`warnings` 总是存在，没有警告时为空数组：
 
 ```json
