@@ -399,7 +399,7 @@ scripts/        CI 扫描脚本。
 ## HTTP 约定
 
 - 业务接口统一前缀 `/api/v1/`；`GET /health` 例外。
-- 节点对局域网只以 HTTPS 服务，只绑定有线网口的固定 IP；明文 HTTP 只绑定本机回环地址，供门店机工作站使用，绑定其他地址时拒绝启动，`Host` 的主机部分不是 `localhost` 或 `workstation_addr` 的 IP 字面量（IPv6 带方括号）的请求返回 `400 VALIDATION_FAILED`；release 构建未配置 `[tls]` 时拒绝启动。细则见 [docs/tls.md](docs/tls.md)。
+- 节点对局域网只以 HTTPS 服务，绑定有线网口的固定 IP，并由部署的主机入站防火墙限制为仅有线业务网口可访问；明文 HTTP 只绑定本机回环地址，供门店机工作站使用，绑定其他地址时拒绝启动，`Host` 的主机部分不是 `localhost` 或 `workstation_addr` 的 IP 字面量（IPv6 带方括号）的请求返回 `400 VALIDATION_FAILED`；release 构建未配置 `[tls]` 时拒绝启动。细则见 [docs/tls.md](docs/tls.md)。
 - 所有响应都是同一信封（`boh-app/src/http.rs`），`warnings` 总是存在，没有警告时为空数组：
 
 ```json
@@ -450,10 +450,12 @@ scripts/        CI 扫描脚本。
     | `BACKUP_FAILED` | `last_backup_failed_at` 不是 `null` | `ERROR` | 店长 |
     | `INVARIANT_VIOLATED` | `invariant_check.last_attempt.result` 是 `violated` | `ERROR` | 店长 |
     | `INVARIANT_CHECK_FAILED` | `invariant_check.last_attempt.result` 是 `failed` | `ERROR` | 店长 |
+    | `TLS_NOT_READY` | 已配置 TLS，且以下任一条件成立：HTTPS 尚未成功监听；没有当前可用叶证书；门店签发 CA 按本次时钟读数尚未生效或已过期。当前证书的可用判定见 `docs/tls.md`「叶证书的签发与续期」 | `ERROR` | 全员（平板可能无法连接，按 SOP 处理） |
     | `TLS_CA_EXPIRING` | `now ≥ tls_ca_not_after − 180 天`；`now ≥ tls_ca_not_after − 30 天` 时为 `ERROR` | `WARNING` / `ERROR` | 店长 |
     | `TLS_CERT_PROVISIONAL` | `tls_cert_provisional` 是 `true` | `WARNING` | 店长 |
     | `TLS_CERT_EXPIRING` | `now ≥ tls_cert_not_after − 7 天` | `ERROR` | 店长 |
 
+    - `TLS_NOT_READY` 只根据节点已知的监听状态和当前证书、CA 判断，不探测客户端网络；生成报告时使用同一次时钟读数。全部条件消失后移除；未配置 TLS 的 debug 模式不产生此问题。其他 TLS 问题可同时存在。
     - `ERROR`：现在已经坏了，需要马上处理；`WARNING`：将来会坏。与 docs/domain.md「异常分级」的级别无关。
   - `issues` 不为空时 `status` 为 `degraded`；否则为 `ok`。
     `degraded` 只是报告，不让进程退出或重启；写入是否被拒只看 `clock_synced`。
@@ -516,6 +518,6 @@ ARM 门店机改用 `aarch64-unknown-linux-musl`。部署文件见 `deploy/`。
   非测试代码 `unwrap()` / `expect()`、浮点参与业务计算、未经 `checked_*` 的业务算术、新增未在技术栈表登记的依赖。
 - HTTP 响应不符合「HTTP 约定」：信封缺字段、状态码与语义不符、把 SQL 或内部细节返回给客户端。
 - 写命令缺少幂等处理，或缺少重复提交同一 `command_id` 的测试。
-- 认证接口、PIN 或令牌可经明文 HTTP 访问或传输。
+- 认证接口、PIN 或令牌可经不符合 `docs/tls.md` 绑定与 Host 限制的明文 HTTP 通道访问或传输；符合这些限制的本机工作站回环通道是允许的例外。
 
 `spec:` / `docs:` 提交是设计变更：检查内容是否自洽、是否与 `docs/domain.md`、`docs/auth.md` 一致；其中上线之后修改已合入的迁移仍按 P0 处理。
