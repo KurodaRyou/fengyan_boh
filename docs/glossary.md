@@ -48,8 +48,16 @@
 | Manufacturer lot number | 生产商批号 | 包装上由生产商印的批号（`manufacturer_lot_no`），可选，不作批次主键；不是供应商的批号 | domain「批次」 |
 | Allocation | 分配 | 把一笔扣减落到具体批次（或账外缺口）的结果，写进 payload 的 `alloc`，重放时不重新计算 | domain「批次」 |
 | Off-book shortfall | 账外缺口 | 未落到任何批次的账面不足：未指定批次的扣减超过全部正余量批次的部分，以及整条冲销扣回时批次不足的部分；下一次盘点该物料时清零 | domain「批次」「纠错」 |
-| Precheck | 预检 | 正式提交报损前的只读试算：返回每行的账面、是否需要确认和按当前账面预计的分配，不写任何内容 | domain「报损接口」 |
-| Shortage confirmation | 不足确认 | 员工确认报损行的数量确实发生，允许账面不足时入账；不绑定预检时的账面或分配 | domain「报损接口」 |
+| Precheck | 预检 | 正式提交报损前的只读试算：返回每行的账面、按当前账面预计的分配和需要确认的项，不写任何内容 | domain「报损接口」 |
+| Anomaly level | 异常分级 | 每个异常码固定的处置级别：拒绝、需要确认或警告，一码一级 | domain「异常分级」 |
+| Confirmation | 确认 | 员工确认某行的异常（如账面不足、疑似重复）确实如此，允许入账；码写在该行的 `acknowledged` 中；不绑定预检时的账面或分配 | domain「异常分级」 |
+| Possible duplicate | 疑似重复 | 补录内容与已入账记录重合，需要确认才入账 | domain「时间」补录 |
+| Not sent | 未发出 | 连接没有建立，节点肯定没收到的提交 | domain「命令提交与结果未知」 |
+| Unknown result | 结果未知 | 连接建立之后出错或收到 `500` 的提交，节点可能已入账 | domain「命令提交与结果未知」 |
+| Background task | 后台任务 | App 中用原 `command_id` 重试结果未知命令的任务，状态为进行中、完成、需处理、已取消 | domain「命令提交与结果未知」 |
+| Cancelled task | 已取消 | 录入人或店长在平板上取消、或员工确认登出时取消的后台任务；App 不再发送它，取消记入节点日志，不进账本 | domain「命令提交与结果未知」 |
+| Task number | 任务编号 | 后台任务的 `command_id`，以二维码显示，在工作站核对时扫码使用 | domain「命令提交与结果未知」 |
+| Workstation | 工作站 | 门店机上由节点提供的网页前端，用于按任务编号核对和补录 | domain「命令提交与结果未知」 |
 | Count absorption | 盘点吸收 | 实物发生在某次盘点观察时点之前、却在盘点之后才入账的扣减（及对盘点时已存在批次的纠错），已被盘点数计入，因此不再改动库存，只更正报表 | domain「盘点吸收」 |
 | Reversal | 冲销 | 追加一条 `EVENT_REVERSED`，整条抵消原事件 | domain「纠错」 |
 | Quantity correction | 数量更正 | 追加一条 `QUANTITY_CORRECTED`，只改数量并保持原批次 | domain「纠错」 |

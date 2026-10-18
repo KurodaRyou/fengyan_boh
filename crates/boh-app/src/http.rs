@@ -11,6 +11,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::AppState;
+use crate::request_log::{self, CommandJson, ErrorMetadata};
 use crate::service::master_data;
 use crate::{
     actor::{Actor, Manager},
@@ -123,6 +124,7 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let metadata = ErrorMetadata::new(self.code, &self.details);
         let body = Envelope::<()> {
             success: false,
             data: None,
@@ -133,7 +135,9 @@ impl IntoResponse for ApiError {
                 details: self.details,
             }),
         };
-        (self.status, Json(body)).into_response()
+        let mut response = (self.status, Json(body)).into_response();
+        response.extensions_mut().insert(metadata);
+        response
     }
 }
 
@@ -208,6 +212,7 @@ pub fn router(state: AppState) -> Router {
         )
         .fallback(route_not_found)
         .method_not_allowed_fallback(method_not_allowed)
+        .layer(axum::middleware::from_fn(request_log::log))
         .with_state(state)
 }
 
@@ -249,9 +254,9 @@ async fn list_equipment(
 async fn create_equipment(
     State(state): State<AppState>,
     Manager(actor): Manager,
-    body: Result<Json<CreateEquipment>, JsonRejection>,
+    body: Result<CommandJson<CreateEquipment>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
-    let Json(command) = body.map_err(|_| ApiError::validation())?;
+    let CommandJson(command) = body.map_err(|_| ApiError::validation())?;
     command.validate().map_err(|_| ApiError::validation())?;
     Ok(Json(service::create(state, actor, command).await?))
 }
@@ -260,11 +265,11 @@ async fn update_equipment(
     State(state): State<AppState>,
     Manager(actor): Manager,
     path: Result<Path<String>, PathRejection>,
-    body: Result<Json<UpdateEquipment>, JsonRejection>,
+    body: Result<CommandJson<UpdateEquipment>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Path(id) = path.map_err(|_| ApiError::validation())?;
     let id = AggregateId::parse(&id).map_err(|_| ApiError::validation())?;
-    let Json(command) = body.map_err(|_| ApiError::validation())?;
+    let CommandJson(command) = body.map_err(|_| ApiError::validation())?;
     command.validate().map_err(|_| ApiError::validation())?;
     Ok(Json(service::update(state, actor, id, command).await?))
 }
@@ -272,9 +277,9 @@ async fn update_equipment(
 async fn log_temperature(
     State(state): State<AppState>,
     actor: Actor,
-    body: Result<Json<LogTemperature>, JsonRejection>,
+    body: Result<CommandJson<LogTemperature>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
-    let Json(command) = body.map_err(|_| ApiError::validation())?;
+    let CommandJson(command) = body.map_err(|_| ApiError::validation())?;
     command.validate().map_err(|_| ApiError::validation())?;
     Ok(Json(service::log_temperature(state, actor, command).await?))
 }
@@ -294,9 +299,9 @@ async fn list_temperature_readings(
 async fn create_receipt(
     State(state): State<AppState>,
     actor: Actor,
-    body: Result<Json<CreateReceipt>, JsonRejection>,
+    body: Result<CommandJson<CreateReceipt>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
-    let Json(command) = body.map_err(|_| ApiError::validation())?;
+    let CommandJson(command) = body.map_err(|_| ApiError::validation())?;
     command.validate().map_err(|_| ApiError::validation())?;
     Ok(Json(
         service::receiving::create(state, actor, command).await?,
@@ -306,9 +311,9 @@ async fn create_receipt(
 async fn log_waste(
     State(state): State<AppState>,
     actor: Actor,
-    body: Result<Json<LogWaste>, JsonRejection>,
+    body: Result<CommandJson<LogWaste>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
-    let Json(command) = body.map_err(|_| ApiError::validation())?;
+    let CommandJson(command) = body.map_err(|_| ApiError::validation())?;
     command.validate().map_err(|_| ApiError::validation())?;
     Ok(Json(service::waste::log(state, actor, command).await?))
 }
@@ -356,9 +361,9 @@ async fn lookup_lot(
 async fn create_item(
     State(state): State<AppState>,
     Manager(actor): Manager,
-    body: Result<Json<CreateItem>, JsonRejection>,
+    body: Result<CommandJson<CreateItem>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
-    let Json(command) = body.map_err(|_| ApiError::validation())?;
+    let CommandJson(command) = body.map_err(|_| ApiError::validation())?;
     command.validate().map_err(|_| ApiError::validation())?;
     Ok(Json(master_data::create_item(state, actor, command).await?))
 }
@@ -367,11 +372,11 @@ async fn update_item(
     State(state): State<AppState>,
     Manager(actor): Manager,
     path: Result<Path<String>, PathRejection>,
-    body: Result<Json<UpdateItem>, JsonRejection>,
+    body: Result<CommandJson<UpdateItem>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Path(id) = path.map_err(|_| ApiError::validation())?;
     let id = AggregateId::parse(&id).map_err(|_| ApiError::validation())?;
-    let Json(command) = body.map_err(|_| ApiError::validation())?;
+    let CommandJson(command) = body.map_err(|_| ApiError::validation())?;
     command.validate().map_err(|_| ApiError::validation())?;
     Ok(Json(
         master_data::update_item(state, actor, id, command).await?,
@@ -390,9 +395,9 @@ async fn list_recipes(
 async fn create_recipe(
     State(state): State<AppState>,
     Manager(actor): Manager,
-    body: Result<Json<CreateRecipe>, JsonRejection>,
+    body: Result<CommandJson<CreateRecipe>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
-    let Json(command) = body.map_err(|_| ApiError::validation())?;
+    let CommandJson(command) = body.map_err(|_| ApiError::validation())?;
     let snapshot = command.validate().map_err(|_| ApiError::validation())?;
     Ok(Json(
         master_data::create_recipe(state, actor, command, snapshot).await?,
@@ -403,11 +408,11 @@ async fn update_recipe(
     State(state): State<AppState>,
     Manager(actor): Manager,
     path: Result<Path<String>, PathRejection>,
-    body: Result<Json<UpdateRecipe>, JsonRejection>,
+    body: Result<CommandJson<UpdateRecipe>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Path(id) = path.map_err(|_| ApiError::validation())?;
     let id = AggregateId::parse(&id).map_err(|_| ApiError::validation())?;
-    let Json(command) = body.map_err(|_| ApiError::validation())?;
+    let CommandJson(command) = body.map_err(|_| ApiError::validation())?;
     command.validate().map_err(|_| ApiError::validation())?;
     Ok(Json(
         master_data::update_recipe(state, actor, id, command).await?,
@@ -426,9 +431,9 @@ async fn list_suppliers(
 async fn create_supplier(
     State(state): State<AppState>,
     Manager(actor): Manager,
-    body: Result<Json<CreateSupplier>, JsonRejection>,
+    body: Result<CommandJson<CreateSupplier>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
-    let Json(command) = body.map_err(|_| ApiError::validation())?;
+    let CommandJson(command) = body.map_err(|_| ApiError::validation())?;
     command.validate().map_err(|_| ApiError::validation())?;
     Ok(Json(
         master_data::create_supplier(state, actor, command).await?,
@@ -439,11 +444,11 @@ async fn update_supplier(
     State(state): State<AppState>,
     Manager(actor): Manager,
     path: Result<Path<String>, PathRejection>,
-    body: Result<Json<UpdateSupplier>, JsonRejection>,
+    body: Result<CommandJson<UpdateSupplier>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Path(id) = path.map_err(|_| ApiError::validation())?;
     let id = AggregateId::parse(&id).map_err(|_| ApiError::validation())?;
-    let Json(command) = body.map_err(|_| ApiError::validation())?;
+    let CommandJson(command) = body.map_err(|_| ApiError::validation())?;
     command.validate().map_err(|_| ApiError::validation())?;
     Ok(Json(
         master_data::update_supplier(state, actor, id, command).await?,
@@ -462,9 +467,9 @@ async fn list_waste_reasons(
 async fn create_waste_reason(
     State(state): State<AppState>,
     Manager(actor): Manager,
-    body: Result<Json<CreateWasteReason>, JsonRejection>,
+    body: Result<CommandJson<CreateWasteReason>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
-    let Json(command) = body.map_err(|_| ApiError::validation())?;
+    let CommandJson(command) = body.map_err(|_| ApiError::validation())?;
     command.validate().map_err(|_| ApiError::validation())?;
     Ok(Json(
         master_data::create_waste_reason(state, actor, command).await?,
@@ -475,11 +480,11 @@ async fn update_waste_reason(
     State(state): State<AppState>,
     Manager(actor): Manager,
     path: Result<Path<String>, PathRejection>,
-    body: Result<Json<UpdateWasteReason>, JsonRejection>,
+    body: Result<CommandJson<UpdateWasteReason>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Path(id) = path.map_err(|_| ApiError::validation())?;
     let id = AggregateId::parse(&id).map_err(|_| ApiError::validation())?;
-    let Json(command) = body.map_err(|_| ApiError::validation())?;
+    let CommandJson(command) = body.map_err(|_| ApiError::validation())?;
     command.validate().map_err(|_| ApiError::validation())?;
     Ok(Json(
         master_data::update_waste_reason(state, actor, id, command).await?,
@@ -490,11 +495,11 @@ async fn add_recipe_version(
     State(state): State<AppState>,
     Manager(actor): Manager,
     path: Result<Path<String>, PathRejection>,
-    body: Result<Json<AddRecipeVersion>, JsonRejection>,
+    body: Result<CommandJson<AddRecipeVersion>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Path(id) = path.map_err(|_| ApiError::validation())?;
     let id = AggregateId::parse(&id).map_err(|_| ApiError::validation())?;
-    let Json(command) = body.map_err(|_| ApiError::validation())?;
+    let CommandJson(command) = body.map_err(|_| ApiError::validation())?;
     let proposed = command.validate().map_err(|_| ApiError::validation())?;
     Ok(Json(
         master_data::add_recipe_version(state, actor, id, command, proposed).await?,

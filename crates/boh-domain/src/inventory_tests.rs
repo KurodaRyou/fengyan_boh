@@ -256,3 +256,24 @@ fn received_lots_are_visible_to_later_fifo_lines_in_lot_date_order() {
     );
     assert_eq!(balance.book().milli(), 1);
 }
+
+#[test]
+fn shortage_compares_both_books_strictly_and_includes_negative_balances() {
+    for (qty, item, lot, expected) in [
+        (5, 5, None, false),
+        (6, 5, None, true),
+        (5, 10, Some(5), false),
+        (6, 10, Some(5), true),
+        (5, 4, Some(10), true),
+        (1, 0, None, true),
+        (1, -1, None, true),
+        (1, 10, Some(-1), true),
+        (1, 10, Some(0), true),
+        (5, 5, Some(5), false),
+    ] {
+        assert_eq!(
+            super::stock_shortfall(q(qty), q(item), lot.map(q)),
+            expected
+        );
+    }
+}

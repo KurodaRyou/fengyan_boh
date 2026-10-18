@@ -473,9 +473,9 @@ async fn zero_and_negative_lots_and_unallocated_qty_are_reported() {
     a["lot_id"] = json!(lots[0]);
     let mut b = wline(12);
     b["lot_id"] = json!(lots[1]);
-    b["confirm_shortage"] = json!(true);
+    b["acknowledged"] = json!(["STOCK_SHORTFALL"]);
     let mut rest = wline(4);
-    rest["confirm_shortage"] = json!(true);
+    rest["acknowledged"] = json!(["STOCK_SHORTFALL"]);
     for (n, line) in [(5, a), (6, b), (7, rest)] {
         node.write(
             &STAFF,
@@ -803,7 +803,7 @@ async fn fractional_and_negative_quantities_are_decimal_strings() {
             "command_id": cmd(5), "occurred_at": NOW, "clock_synced_at": CLIENT_SYNCED,
             "lines": [{
                 "item_id": flour, "input": { "qty": "36", "unit_code": "g", "base_qty_per_unit": "1" },
-                "reason_code": "EXPIRED", "confirm_shortage": true,
+                "reason_code": "EXPIRED", "acknowledged": ["STOCK_SHORTFALL"],
             }],
         }),
     )

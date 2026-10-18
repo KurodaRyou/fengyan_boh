@@ -18,6 +18,9 @@ use crate::{AppState, http};
 #[path = "receiving_tests.rs"]
 mod receiving;
 
+#[path = "request_log_tests.rs"]
+mod request_logs;
+
 #[path = "diagnostic_tests.rs"]
 mod diagnostics;
 

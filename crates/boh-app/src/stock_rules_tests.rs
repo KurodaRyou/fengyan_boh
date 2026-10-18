@@ -382,7 +382,7 @@ async fn interleaved_items_keep_separate_balances_and_serials() {
     let mut first = waste(&flour);
     first["lot_id"] = json!("RAW-FLOUR-20261006-001");
     first["input"]["qty"] = json!("6");
-    first["confirm_shortage"] = json!(true);
+    first["acknowledged"] = json!(["STOCK_SHORTFALL"]);
     let command = json!({"command_id": master_command_id(4), "lines": [first, waste(sugar), waste(&flour)], "occurred_at": NOW, "clock_synced_at": NOW});
     let reply = send(node.router.clone(), Method::POST, WASTE, command).await;
     assert_eq!(reply.0, 200, "{reply:?}");
@@ -451,7 +451,7 @@ async fn normalized_requests_and_saved_responses_keep_their_exact_text() {
     assert_eq!(saved_command(&node, master_command_id(3)).await, saved);
 
     let mut line = waste(&item);
-    line["confirm_shortage"] = json!(false);
+    line["acknowledged"] = json!([]);
     let mut command = json!({"command_id": master_command_id(4), "lines": [line], "occurred_at": NOW, "clock_synced_at": NOW});
     let logged = send(node.router.clone(), Method::POST, WASTE, command.clone()).await;
     assert_eq!(logged.0, 200, "{logged:?}");
@@ -472,7 +472,7 @@ async fn normalized_requests_and_saved_responses_keep_their_exact_text() {
     command["lines"][0]
         .as_object_mut()
         .unwrap()
-        .remove("confirm_shortage");
+        .remove("acknowledged");
     command["clock_synced_at"] = json!(i64::MIN);
     assert_eq!(
         send(node.router.clone(), Method::POST, WASTE, command).await,

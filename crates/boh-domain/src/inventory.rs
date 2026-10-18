@@ -82,6 +82,17 @@ pub struct Allocation {
 }
 object_serde!(Allocation);
 
+/// Whether a deduction exceeds the item net book or the specified lot balance.
+/// Equal quantities are sufficient; zero and negative balances require confirmation
+/// for any positive deduction. The caller decides how to handle the shortfall.
+pub fn stock_shortfall(
+    qty: Quantity,
+    item_book_qty: Quantity,
+    lot_book_qty: Option<Quantity>,
+) -> bool {
+    qty > item_book_qty || lot_book_qty.is_some_and(|book| qty > book)
+}
+
 /// A lot balance supplied in FIFO order by the decision-reading layer.
 #[derive(Debug)]
 pub struct LotBalance {

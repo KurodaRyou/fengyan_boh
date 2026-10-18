@@ -293,7 +293,7 @@ async fn waste(router: &Router, n: u16, now: i64, item: &str, lot: Option<&str>,
         "item_id": item,
         "input": { "qty": qty.to_string(), "unit_code": "g", "base_qty_per_unit": "1" },
         "reason_code": "EXPIRED",
-        "confirm_shortage": true,
+        "acknowledged": ["STOCK_SHORTFALL"],
     });
     if let Some(lot) = lot {
         line["lot_id"] = json!(lot);

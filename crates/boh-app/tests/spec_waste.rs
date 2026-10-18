@@ -358,7 +358,7 @@ impl Node {
             .unwrap()
     }
 
-    /// `processed_commands` 中该命令的 (`command_type`, 规范化请求, `recorded_at`)；规范化请求去掉值为 false 的确认标记。
+    /// `processed_commands` 中该命令的 (`command_type`, 规范化请求, `recorded_at`)。
     fn processed(&self, command_id: &str) -> Rows<(String, Value, i64)> {
         let reader = spec_support::reader(&self.db_path)?;
         let (command_type, request, recorded_at): (String, String, i64) = reader.query_row(
@@ -366,11 +366,7 @@ impl Node {
             [command_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
-        Ok((
-            command_type,
-            without_false_confirmations(serde_json::from_str(&request)?),
-            recorded_at,
-        ))
+        Ok((command_type, serde_json::from_str(&request)?, recorded_at))
     }
 
     #[allow(clippy::unwrap_used)] // 同上。
@@ -455,9 +451,9 @@ fn at(mut line: Value, lot_id: &str) -> Value {
     line
 }
 
-/// 带确认标记。
+/// 带不足确认：行内 `acknowledged: ["STOCK_SHORTFALL"]`。
 fn confirmed(mut line: Value) -> Value {
-    line["confirm_shortage"] = json!(true);
+    line["acknowledged"] = json!(["STOCK_SHORTFALL"]);
     line
 }
 
@@ -513,13 +509,39 @@ fn logged(
     line
 }
 
-/// `WASTE_CONFIRMATION_REQUIRED` 的 `details.lines` 中的一项。
+/// `409 CONFIRMATION_REQUIRED` 的 `details.confirmations`（以及预检 `data.confirmations`）中的一项：
+/// `{line, code: "STOCK_SHORTFALL", details: {item_id, qty, item_book_qty, lot_id?, lot_book_qty?}}`。
+/// `lot` 为 (指定的批次, 该批次的账面)；不指定批次时 `details` 不带 `lot_id`、`lot_book_qty` 两个键。
 fn short(
     line: usize,
     item_id: &str,
     lot: Option<(&str, i64)>,
     qty: i64,
     item_book_qty: i64,
+) -> Value {
+    let mut details = json!({
+        "item_id": item_id, "qty": qty.to_string(), "item_book_qty": item_book_qty.to_string(),
+    });
+    if let Some((lot_id, lot_book_qty)) = lot {
+        details["lot_id"] = json!(lot_id);
+        details["lot_book_qty"] = json!(lot_book_qty.to_string());
+    }
+    json!({ "line": line, "code": "STOCK_SHORTFALL", "details": details })
+}
+
+/// `409 CONFIRMATION_REQUIRED` 的 `details`。
+fn confirmations(items: Vec<Value>) -> Value {
+    json!({ "confirmations": items })
+}
+
+/// 预检 `data.lines` 中的一项：`{line, item_id, lot_id?, qty, item_book_qty, lot_book_qty?, alloc}`。
+fn checked(
+    line: usize,
+    item_id: &str,
+    lot: Option<(&str, i64)>,
+    qty: i64,
+    item_book_qty: i64,
+    alloc: Vec<Value>,
 ) -> Value {
     let mut row = json!({
         "line": line, "item_id": item_id, "qty": qty.to_string(),
@@ -529,21 +551,6 @@ fn short(
         row["lot_id"] = json!(lot_id);
         row["lot_book_qty"] = json!(lot_book_qty.to_string());
     }
-    row
-}
-
-/// 预检 `data.lines` 中的一项。
-fn checked(
-    line: usize,
-    item_id: &str,
-    lot: Option<(&str, i64)>,
-    qty: i64,
-    item_book_qty: i64,
-    needs_confirmation: bool,
-    alloc: Vec<Value>,
-) -> Value {
-    let mut row = short(line, item_id, lot, qty, item_book_qty);
-    row["needs_confirmation"] = json!(needs_confirmation);
     row["alloc"] = json!(alloc);
     row
 }
@@ -573,28 +580,36 @@ fn movement(
     )
 }
 
-/// 期望的规范化请求：剥离 `command_id`、`clock_synced_at`，并去掉值为 false 的确认标记（与省略等价）。
+/// 期望的规范化请求（domain「异常分级」确认）：剥离 `command_id`、`clock_synced_at`；`acknowledged` 为空数组的行省略该键，
+/// 非空时按码的字节序排序。
 fn canonical(request: &Value) -> Value {
     let mut canonical = request.clone();
     if let Some(object) = canonical.as_object_mut() {
         object.remove("command_id");
         object.remove("clock_synced_at");
     }
-    without_false_confirmations(canonical)
-}
-
-/// 去掉各行中值为 false 的 `confirm_shortage`：省略与 false 的规范化请求相同，存储时用哪种写法不作规定。
-fn without_false_confirmations(mut request: Value) -> Value {
-    if let Some(lines) = request["lines"].as_array_mut() {
+    if let Some(lines) = canonical["lines"].as_array_mut() {
         for line in lines {
-            if line["confirm_shortage"] == json!(false)
-                && let Some(object) = line.as_object_mut()
-            {
-                object.remove("confirm_shortage");
+            let Some(object) = line.as_object_mut() else {
+                continue;
+            };
+            let codes = object
+                .get("acknowledged")
+                .and_then(Value::as_array)
+                .cloned();
+            match codes {
+                Some(codes) if codes.is_empty() => {
+                    object.remove("acknowledged");
+                }
+                Some(mut codes) => {
+                    codes.sort_by(|x, y| x.as_str().cmp(&y.as_str()));
+                    object.insert("acknowledged".into(), Value::Array(codes));
+                }
+                None => {}
             }
         }
     }
-    request
+    canonical
 }
 
 #[allow(clippy::unwrap_used)] // 测试夹具：成功响应缺少这些字段已违反接口约定，直接终止测试。
@@ -863,9 +878,12 @@ async fn capture_time_limits_and_business_date_apply() {
 // ---------------------------------------------------------------------------------------------
 
 // 场景「指定批次不足」（domain「报损接口」是否需要确认、分配）：批次 A 5、B 10；报损 8 g，指定 A。
-// - 不带确认：409 WASTE_CONFIRMATION_REQUIRED，details.lines 列出该行（lot_book_qty 5、item_book_qty 15），不写任何内容。
-// - 同一 command_id 加确认重提：入账，A 8 SPECIFIED，不转去扣 B；A −3、B 10；没有账外缺口；warnings 为空（不返回 STOCK_SHORTFALL）。
-// - 确认标记 true 保存在规范化请求中；payload 不带确认标记。
+// - 不带确认：409 CONFIRMATION_REQUIRED，details 为 {confirmations: [{line 0, code STOCK_SHORTFALL, details: {item_id, qty 8,
+//   item_book_qty 15, lot_id A, lot_book_qty 5}}]}（指定批次的行 lot_id 与 lot_book_qty 同时出现），不写任何内容。
+//   行内 acknowledged: [] 与省略等价，同样是这个 409。
+// - 同一 command_id 加确认（acknowledged: ["STOCK_SHORTFALL"]）重提：入账，A 8 SPECIFIED，不转去扣 B；A −3、B 10；没有账外缺口；
+//   warnings 为空（不返回 STOCK_SHORTFALL）。
+// - acknowledged 保存在规范化请求中；payload 不带确认。
 #[tokio::test]
 async fn specified_lot_shortage_requires_confirmation() {
     let node = node();
@@ -876,8 +894,15 @@ async fn specified_lot_shortage_requires_confirmation() {
         .waste(&body(&cmd(10), vec![at(wline(&flour, 8), A)], 0))
         .await;
     assert_eq!(
-        assert_error(&reply, 409, "WASTE_CONFIRMATION_REQUIRED"),
-        &json!({ "lines": [short(0, &flour, Some((A, 5)), 8, 15)] })
+        assert_error(&reply, 409, "CONFIRMATION_REQUIRED"),
+        &confirmations(vec![short(0, &flour, Some((A, 5)), 8, 15)])
+    );
+    let mut empty = at(wline(&flour, 8), A);
+    empty["acknowledged"] = json!([]);
+    let reply = node.waste(&body(&cmd(10), vec![empty], 0)).await;
+    assert_eq!(
+        assert_error(&reply, 409, "CONFIRMATION_REQUIRED"),
+        &confirmations(vec![short(0, &flour, Some((A, 5)), 8, 15)])
     );
     assert_eq!(node.state(), before);
 
@@ -897,7 +922,15 @@ async fn specified_lot_shortage_requires_confirmation() {
     );
     let (_, stored, _) = node.processed(&cmd(10)).unwrap();
     assert_eq!(stored, canonical(&request));
-    assert_eq!(stored["lines"][0]["confirm_shortage"], json!(true));
+    assert_eq!(
+        stored["lines"][0]["acknowledged"],
+        json!(["STOCK_SHORTFALL"])
+    );
+    assert!(
+        node.wastes().unwrap()[0].payload["lines"][0]
+            .get("acknowledged")
+            .is_none()
+    );
 }
 
 // 场景「指定批次、净账面不足」（domain「报损接口」是否需要确认）：只有批次 A 5 时报损 15 g（不指定批次，确认）→ A 0、账外缺口 −10；再收货建批次 B 5
@@ -924,8 +957,8 @@ async fn specified_lot_also_checks_the_item_book() {
         .waste(&body(&cmd(7), vec![at(wline(&flour, 3), B)], 0))
         .await;
     assert_eq!(
-        assert_error(&reply, 409, "WASTE_CONFIRMATION_REQUIRED"),
-        &json!({ "lines": [short(0, &flour, Some((B, 5)), 3, -5)] })
+        assert_error(&reply, 409, "CONFIRMATION_REQUIRED"),
+        &confirmations(vec![short(0, &flour, Some((B, 5)), 3, -5)])
     );
     assert_eq!(node.state(), before);
 
@@ -954,8 +987,8 @@ async fn unspecified_line_checks_the_item_book_including_negative_lots() {
 
     let reply = node.waste(&body(&cmd(11), vec![wline(&flour, 8)], 0)).await;
     assert_eq!(
-        assert_error(&reply, 409, "WASTE_CONFIRMATION_REQUIRED"),
-        &json!({ "lines": [short(0, &flour, None, 8, 7)] })
+        assert_error(&reply, 409, "CONFIRMATION_REQUIRED"),
+        &confirmations(vec![short(0, &flour, None, 8, 7)])
     );
     assert_eq!(node.state(), before);
 
@@ -976,7 +1009,7 @@ async fn unspecified_line_checks_the_item_book_including_negative_lots() {
 // - 确认后 A 5 FIFO + 3 SHORTFALL（不带 lot_id）；A 0，账外缺口 −3，账面 −3；warnings 为空，不返回 STOCK_SHORTFALL。
 //   SHORTFALL 流水的 lot_id 为 NULL；inventory_unallocated 没有该物料的行时新建。
 // - 场景「收货后耗尽」：再报 2 g。面粉曾经收货（有批次 A），不受「从未收货」的限制：不带确认时照常 409
-//   WASTE_CONFIRMATION_REQUIRED（item_book_qty −3）；确认后 A 余量为 0，被 FIFO 跳过，整行 2 SHORTFALL；
+//   CONFIRMATION_REQUIRED（item_book_qty −3）；确认后 A 余量为 0，被 FIFO 跳过，整行 2 SHORTFALL；
 //   账外缺口累加到 −5，仍是一行。
 #[tokio::test]
 async fn shortfall_beyond_positive_lots_goes_off_book() {
@@ -989,8 +1022,8 @@ async fn shortfall_beyond_positive_lots_goes_off_book() {
 
     let reply = node.waste(&body(&cmd(5), vec![wline(&flour, 8)], 0)).await;
     assert_eq!(
-        assert_error(&reply, 409, "WASTE_CONFIRMATION_REQUIRED"),
-        &json!({ "lines": [short(0, &flour, None, 8, 5)] })
+        assert_error(&reply, 409, "CONFIRMATION_REQUIRED"),
+        &confirmations(vec![short(0, &flour, None, 8, 5)])
     );
 
     let reply = node
@@ -1014,8 +1047,8 @@ async fn shortfall_beyond_positive_lots_goes_off_book() {
 
     let reply = node.waste(&body(&cmd(6), vec![wline(&flour, 2)], 0)).await;
     assert_eq!(
-        assert_error(&reply, 409, "WASTE_CONFIRMATION_REQUIRED"),
-        &json!({ "lines": [short(0, &flour, None, 2, -3)] })
+        assert_error(&reply, 409, "CONFIRMATION_REQUIRED"),
+        &confirmations(vec![short(0, &flour, None, 2, -3)])
     );
     let record = node
         .waste_ok(&body(&cmd(6), vec![confirmed(wline(&flour, 2))], 0))
@@ -1080,6 +1113,8 @@ async fn item_without_lots_cannot_be_wasted() {
 // - 指定 B 报 3 g：B 只到 −2，净账面会是 −1000000001：{line 0, item_id 面粉}，不带 lot_id。
 // - 不指定批次报 3 g：B 1 FIFO + 2 SHORTFALL，净账面会是 −1000000001：同上，不带 lot_id。
 // - 指定 B 报 9999.999 max（约 10^13 g）：{line 0, …, lot_id B}，不溢出、不当作取值错误。
+// - [糖 6 g, 指定 A 2 g]：糖只有 5 g，line 0 需要确认；line 1 越界。不带确认时也返回 {line 1, …, lot_id A}，不是
+//   CONFIRMATION_REQUIRED（库存状态上限先于确认；未确认的 line 0 照确认后的结果继续试算）。
 // - 合法边界不误拒：同一 command_id 改为 [糖 1 g, 指定 A 1 g]（带确认）照常入账，A 恰好 −1000000000；账面值是小数字符串
 //   （lot_book_qty "-999999999"、item_book_qty "-999999998"）。再不指定批次报 1 g（确认）：B 1 FIFO，净账面恰好 −1000000000。
 // - 幂等检查先于库存状态上限：之后原内容重试第一次报损，返回首次响应。
@@ -1147,6 +1182,10 @@ async fn the_stock_limit_rejects_the_whole_command() {
         (
             vec![in_unit(B, "9999.999", "max", "1000000000")],
             over(0, Some(B)),
+        ),
+        (
+            vec![wline(&sugar, 6), at(wline(&flour, 2), A)],
+            over(1, Some(A)),
         ),
     ] {
         let reply = node.precheck(lines.clone()).await;
@@ -1254,7 +1293,7 @@ async fn the_stock_limit_rejects_the_whole_command() {
 // - 报损 0.001 half：qty "0.001"，item_book_qty "3.75"，A 0.001 FIFO（A 1.499 g，存 1499）。
 // - 再报 3.875 g：净账面 3.749，需要确认（409，details 中 qty "3.875"、item_book_qty "3.749"）；确认后 A 1.499 + B 2.25 FIFO，
 //   "0.126" SHORTFALL；A、B 为 0，账外缺口 −0.126 g（存 −126），账面 −126。
-// - 预检的数量与账面同样是小数字符串。
+// - 预检的数量与账面同样是小数字符串；不需要确认时 data.confirmations 为空数组。
 // - 系数只是写法不同（"0.500"）时规范化请求相同：同一 command_id 重发返回首次响应。
 #[tokio::test]
 async fn fractional_quantities_round_and_allocate_exactly() {
@@ -1284,8 +1323,8 @@ async fn fractional_quantities_round_and_allocate_exactly() {
         data,
         json!({ "lines": [{
             "line": 0, "item_id": flour, "qty": "0.001", "item_book_qty": "3.75",
-            "needs_confirmation": false, "alloc": [fifo_text(A, "0.001")],
-        }] })
+            "alloc": [fifo_text(A, "0.001")],
+        }], "confirmations": [] })
     );
     let first = node.waste(&body(&cmd(5), vec![half.clone()], 0)).await;
     let record = record(&first).clone();
@@ -1310,8 +1349,11 @@ async fn fractional_quantities_round_and_allocate_exactly() {
     });
     let reply = node.waste(&body(&cmd(6), vec![line.clone()], 0)).await;
     assert_eq!(
-        assert_error(&reply, 409, "WASTE_CONFIRMATION_REQUIRED"),
-        &json!({ "lines": [{ "line": 0, "item_id": flour, "qty": "3.875", "item_book_qty": "3.749" }] })
+        assert_error(&reply, 409, "CONFIRMATION_REQUIRED"),
+        &json!({ "confirmations": [{
+            "line": 0, "code": "STOCK_SHORTFALL",
+            "details": { "item_id": flour, "qty": "3.875", "item_book_qty": "3.749" },
+        }] })
     );
     let record = node
         .waste_ok(&body(&cmd(6), vec![confirmed(line)], 0))
@@ -1359,8 +1401,8 @@ async fn later_lines_see_the_book_after_earlier_lines() {
         ))
         .await;
     assert_eq!(
-        assert_error(&reply, 409, "WASTE_CONFIRMATION_REQUIRED"),
-        &json!({ "lines": [short(1, &flour, Some((A, 0)), 1, 7)] })
+        assert_error(&reply, 409, "CONFIRMATION_REQUIRED"),
+        &confirmations(vec![short(1, &flour, Some((A, 0)), 1, 7)])
     );
 
     let record = node
@@ -1381,11 +1423,14 @@ async fn later_lines_see_the_book_after_earlier_lines() {
     assert_eq!(node.on_hand(&flour), 6_000);
 }
 
-// 报损接口「不足确认」：需要确认但没带确认的行，照确认后的结果继续试算后续各行；409 一次按 line 升序列出全部这样的行。
+// domain「异常分级」确认的判定时机：需要确认但没带确认的行，照确认后的结果继续试算后续各行；409 CONFIRMATION_REQUIRED 一次
+// 按 line 升序列出全部这样的行。
 // A 5、B 10；lines[0] 指定 A 8（批次不足），lines[1] 不指定批次 1（净账面 7，不需要确认，扣 B），lines[2] 指定 A 1
 // （A 已试算为 −3，净账面 6）。
 // - 都不带确认：列出 line 0、line 2，lines[2] 的账面按 lines[0]、lines[1] 已扣减计算。
 // - 只确认其中一行：只列另一行，账面相同。
+// - 指定批次与不指定批次的项同时列出：[指定 A 8, 不指定 20]，都不带确认 → line 0 带 lot_id、lot_book_qty 5；
+//   line 1（净账面按 line 0 确认后为 7）不带 lot_id、lot_book_qty。
 // - 都确认后入账：A −4、B 9。
 #[tokio::test]
 async fn every_unconfirmed_shortage_is_listed_at_once() {
@@ -1413,11 +1458,25 @@ async fn every_unconfirmed_shortage_is_listed_at_once() {
             .waste(&body(&cmd(10), lines(confirm0, confirm2), 0))
             .await;
         assert_eq!(
-            assert_error(&reply, 409, "WASTE_CONFIRMATION_REQUIRED"),
-            &json!({ "lines": listed }),
+            assert_error(&reply, 409, "CONFIRMATION_REQUIRED"),
+            &json!({ "confirmations": listed }),
             "{confirm0} {confirm2}"
         );
     }
+    let reply = node
+        .waste(&body(
+            &cmd(10),
+            vec![at(wline(&flour, 8), A), wline(&flour, 20)],
+            0,
+        ))
+        .await;
+    assert_eq!(
+        assert_error(&reply, 409, "CONFIRMATION_REQUIRED"),
+        &confirmations(vec![
+            short(0, &flour, Some((A, 5)), 8, 15),
+            short(1, &flour, None, 20, 7),
+        ])
+    );
     assert_eq!(node.state(), before);
 
     let record = node.waste_ok(&body(&cmd(10), lines(true, true), 0)).await;
@@ -1433,9 +1492,60 @@ async fn every_unconfirmed_shortage_is_listed_at_once() {
     assert_eq!(node.on_hand(&flour), 5_000);
 }
 
+// domain「异常分级」确认写在每一行内，确认随行移动：删除或重排行之后，确认跟着原来那一行，不指向别的行；不需要确认的行上的
+// 确认不能替别的行确认。同一 command_id 被拒绝后可以改内容重提。面粉 A 5、B 10，糖 S 5：
+// P = 面粉指定 A 8（批次不足）；Q = 糖 1（够）；R = 糖 6（不足）。
+// - [P, Q✓]：409，只列 line 0（P）。
+// - [Q✓, P]：409，只列 line 1（P 移到了 line 1）。
+// - [P✓, R]：409，只列 line 1（R，糖 item_book_qty 5）。
+// - [R]（删掉 P 和它的确认）：409，只列 line 0（R）。
+// - [R, P✓]：409，只列 line 0（R）；P 的确认随 P 移到 line 1，P 不再列出。
+// - [R✓, P✓]：入账；糖 S 5 FIFO + 1 SHORTFALL，A 8 SPECIFIED。
+#[tokio::test]
+async fn confirmations_follow_their_lines() {
+    let node = node();
+    let flour = flour_ab(&node).await;
+    let (sugar, s) = node.sugar(10, 5).await;
+    let p = || at(wline(&flour, 8), A);
+    let q = || wline(&sugar, 1);
+    let r = || wline(&sugar, 6);
+    let p_short = |line| short(line, &flour, Some((A, 5)), 8, 15);
+    let r_short = |line| short(line, &sugar, None, 6, 5);
+    let before = node.state();
+
+    for (lines, listed) in [
+        (vec![p(), confirmed(q())], vec![p_short(0)]),
+        (vec![confirmed(q()), p()], vec![p_short(1)]),
+        (vec![confirmed(p()), r()], vec![r_short(1)]),
+        (vec![r()], vec![r_short(0)]),
+        (vec![r(), confirmed(p())], vec![r_short(0)]),
+    ] {
+        let reply = node.waste(&body(&cmd(20), lines.clone(), 0)).await;
+        assert_eq!(
+            assert_error(&reply, 409, "CONFIRMATION_REQUIRED"),
+            &confirmations(listed),
+            "{lines:?}"
+        );
+    }
+    assert_eq!(node.state(), before);
+
+    let record = node
+        .waste_ok(&body(&cmd(20), vec![confirmed(r()), confirmed(p())], 0))
+        .await;
+    assert_eq!(
+        record["lines"],
+        json!([
+            logged(&sugar, None, 6, 5, vec![fifo(&s, 5), shortfall(1)]),
+            logged(&flour, Some((A, 5)), 8, 15, vec![specified(A, 8)]),
+        ])
+    );
+    assert_eq!(node.lots(), [pair(A, -3), pair(B, 10), pair(&s, 0)]);
+    assert_eq!(node.unallocated(), [(sugar.clone(), -1_000)]);
+}
+
 // domain「报损接口」需要确认的条件用严格大于：报损量等于批次账面、等于净账面时不需要确认，扣到 0。
-// A 5、B 10；lines[0] 指定 A 5（批次 5、净账面 15），lines[1] 不指定批次 10（净账面 10）。预检两行 needs_confirmation 都是
-// false，且不写任何内容；正式提交不带确认直接入账：lines[1] 的 FIFO 跳过余量为 0 的 A，分配 B 10；A 0、B 0，没有账外缺口。
+// A 5、B 10；lines[0] 指定 A 5（批次 5、净账面 15），lines[1] 不指定批次 10（净账面 10）。预检 data.confirmations 为空数组，
+// 且不写任何内容；正式提交不带确认直接入账：lines[1] 的 FIFO 跳过余量为 0 的 A，分配 B 10；A 0、B 0，没有账外缺口。
 #[tokio::test]
 async fn quantity_equal_to_the_book_needs_no_confirmation() {
     let node = node();
@@ -1446,10 +1556,13 @@ async fn quantity_equal_to_the_book_needs_no_confirmation() {
         .await;
     assert_eq!(
         data,
-        json!({ "lines": [
-            checked(0, &flour, Some((A, 5)), 5, 15, false, vec![specified(A, 5)]),
-            checked(1, &flour, None, 10, 10, false, vec![fifo(B, 10)]),
-        ] })
+        json!({
+            "lines": [
+                checked(0, &flour, Some((A, 5)), 5, 15, vec![specified(A, 5)]),
+                checked(1, &flour, None, 10, 10, vec![fifo(B, 10)]),
+            ],
+            "confirmations": [],
+        })
     );
     assert_eq!(node.state(), before);
 
@@ -1473,8 +1586,9 @@ async fn quantity_equal_to_the_book_needs_no_confirmation() {
     assert_eq!(node.on_hand(&flour), 0);
 }
 
-// domain「报损接口」不足确认：账面足够的行带了确认标记照常处理，分配与不带确认相同；确认标记保存在规范化请求中，
-// 不写进 payload。
+// domain「异常分级」确认（多余确认保留）：账面足够、不需要确认的行带了 acknowledged 照常受理，分配与不带确认相同；
+// acknowledged 保存在规范化请求中，不写进 payload。之后用同一 command_id 去掉这个多余的确认重发：规范化请求不同，
+// 409 IDEMPOTENCY_CONFLICT，fields 为 ["lines"]，什么都不写。
 #[tokio::test]
 async fn confirmation_on_a_sufficient_line_is_accepted() {
     let node = node();
@@ -1493,23 +1607,37 @@ async fn confirmation_on_a_sufficient_line_is_accepted() {
     );
     let (_, stored, _) = node.processed(&cmd(10)).unwrap();
     assert_eq!(stored, canonical(&request));
+    assert_eq!(
+        stored["lines"][0]["acknowledged"],
+        json!(["STOCK_SHORTFALL"])
+    );
+
+    let before = node.state();
+    let reply = node.waste(&body(&cmd(10), vec![wline(&flour, 3)], 0)).await;
+    assert_eq!(
+        assert_error(&reply, 409, "IDEMPOTENCY_CONFLICT"),
+        &json!({ "fields": ["lines"] })
+    );
+    assert_eq!(node.state(), before);
 }
 
 // ---------------------------------------------------------------------------------------------
 // 预检（场景「预检只读」「确认后不足加大」「提交时新出现的不足」）
 // ---------------------------------------------------------------------------------------------
 
-// 场景「预检只读」与 domain「报损接口」预检：data.lines 每行 {line, item_id, lot_id?, qty, item_book_qty, lot_book_qty?,
-// needs_confirmation, alloc}，按正式提交的逐行规则计算，假设需要确认的行都已确认。面粉 A 5、B 10（净账面 15），糖 S 20：
+// 场景「预检只读」与 domain「报损接口」预检：data 为 {lines, confirmations}。lines 每行 {line, item_id, lot_id?, qty,
+// item_book_qty, lot_book_qty?, alloc}（没有 needs_confirmation），按正式提交的逐行规则计算，假设需要确认的行都已确认；
+// confirmations 列出正式提交不带确认时需要确认的项，结构与排序同 409 CONFIRMATION_REQUIRED 的 details.confirmations。面粉 A 5、B 10（净账面 15），糖 S 20：
 // - lines[0] 面粉指定 A 8：批次 5，需要确认，预计 A 8 SPECIFIED（之后 A −3，面粉净账面 7）；
 // - lines[1] 糖 3：item_book_qty 是糖自己的 20，不受面粉的扣减或两种物料合计的影响；预计 S 3（之后糖 17）；
 // - lines[2] 面粉不指定批次 5：面粉净账面仍是 7（不受糖的行影响），不需要确认，FIFO 跳过 A，预计 B 5（之后 2）；
 // - lines[3] 面粉不指定批次 6：需要确认，预计 B 5 + 1 SHORTFALL（之后 −4）；
 // - lines[4] 面粉指定 B 2：批次 0、净账面 −4，需要确认，预计 B 2 SPECIFIED；
 // - lines[5] 糖 4：糖的账面接着自己的 lines[1] 算，为 17。
+// confirmations 依次为 line 0、3、4（与正式提交不带确认时的 409 相同）。
 // 不指定批次的行没有 lot_id、lot_book_qty 两个键；warnings 为空。预检不写事件、processed_commands 或任何投影。
-// 店长同样可以预检：面粉 3 g 不需要确认，needs_confirmation 为 false；1 bag 按当前系数换算成 1000 g，qty 是基本单位数量，
-// 净账面 12 不足，预计 A 2 + B 10 FIFO、988 SHORTFALL。
+// 店长同样可以预检：面粉 3 g 不需要确认；1 bag 按当前系数换算成 1000 g，qty 是基本单位数量，
+// 净账面 12 不足，预计 A 2 + B 10 FIFO、988 SHORTFALL；confirmations 只有 line 1。
 #[tokio::test]
 async fn precheck_reports_each_line_and_writes_nothing() {
     let node = node();
@@ -1530,14 +1658,21 @@ async fn precheck_reports_each_line_and_writes_nothing() {
 
     assert_eq!(
         data,
-        json!({ "lines": [
-            checked(0, &flour, Some((A, 5)), 8, 15, true, vec![specified(A, 8)]),
-            checked(1, &sugar, None, 3, 20, false, vec![fifo(&s, 3)]),
-            checked(2, &flour, None, 5, 7, false, vec![fifo(B, 5)]),
-            checked(3, &flour, None, 6, 2, true, vec![fifo(B, 5), shortfall(1)]),
-            checked(4, &flour, Some((B, 0)), 2, -4, true, vec![specified(B, 2)]),
-            checked(5, &sugar, None, 4, 17, false, vec![fifo(&s, 4)]),
-        ] })
+        json!({
+            "lines": [
+                checked(0, &flour, Some((A, 5)), 8, 15, vec![specified(A, 8)]),
+                checked(1, &sugar, None, 3, 20, vec![fifo(&s, 3)]),
+                checked(2, &flour, None, 5, 7, vec![fifo(B, 5)]),
+                checked(3, &flour, None, 6, 2, vec![fifo(B, 5), shortfall(1)]),
+                checked(4, &flour, Some((B, 0)), 2, -4, vec![specified(B, 2)]),
+                checked(5, &sugar, None, 4, 17, vec![fifo(&s, 4)]),
+            ],
+            "confirmations": [
+                short(0, &flour, Some((A, 5)), 8, 15),
+                short(3, &flour, None, 6, 2),
+                short(4, &flour, Some((B, 0)), 2, -4),
+            ],
+        })
     );
     let bag = json!({
         "item_id": flour, "input": { "qty": "1", "unit_code": "bag", "base_qty_per_unit": "1000" },
@@ -1552,15 +1687,18 @@ async fn precheck_reports_each_line_and_writes_nothing() {
         .await;
     assert_eq!(
         assert_success(&reply),
-        &json!({ "lines": [
-            checked(0, &flour, None, 3, 15, false, vec![fifo(A, 3)]),
-            checked(1, &flour, None, 1000, 12, true, vec![fifo(A, 2), fifo(B, 10), shortfall(988)]),
-        ] })
+        &json!({
+            "lines": [
+                checked(0, &flour, None, 3, 15, vec![fifo(A, 3)]),
+                checked(1, &flour, None, 1000, 12, vec![fifo(A, 2), fifo(B, 10), shortfall(988)]),
+            ],
+            "confirmations": [short(1, &flour, None, 1000, 12)],
+        })
     );
     assert_eq!(node.state(), before);
 }
 
-// 场景「确认后不足加大」（domain「报损接口」不足确认）：A 5；预检指定 A 报 8（lot_book_qty 5，需要确认）后员工确认；提交前另一台平板报损 A 2
+// 场景「确认后不足加大」（domain「报损接口」不足确认、「异常分级」确认）：A 5；预检指定 A 报 8（lot_book_qty 5，需要确认）后员工确认；提交前另一台平板报损 A 2
 // （不需要确认）已入账；带确认提交照常入账，确认不绑定预检时的账面：lot_book_qty、item_book_qty 记提交时的值 3、13；A −5。
 #[tokio::test]
 async fn confirmation_holds_when_the_shortage_grows() {
@@ -1568,8 +1706,11 @@ async fn confirmation_holds_when_the_shortage_grows() {
     let flour = flour_ab(&node).await;
     let data = node.precheck_ok(vec![at(wline(&flour, 8), A)]).await;
     assert_eq!(
-        data["lines"][0],
-        checked(0, &flour, Some((A, 5)), 8, 15, true, vec![specified(A, 8)])
+        data,
+        json!({
+            "lines": [checked(0, &flour, Some((A, 5)), 8, 15, vec![specified(A, 8)])],
+            "confirmations": [short(0, &flour, Some((A, 5)), 8, 15)],
+        })
     );
     let reply = node
         .post(
@@ -1592,13 +1733,13 @@ async fn confirmation_holds_when_the_shortage_grows() {
 }
 
 // 场景「提交时新出现的不足」（domain「报损接口」不足确认）：A 5；预检指定 A 报 4 不需要确认；提交前另一台平板报损 A 2 已入账；不带确认提交时
-// 在写事务内重新计算：409 WASTE_CONFIRMATION_REQUIRED（lot_book_qty 3、item_book_qty 13），不入账。
+// 在写事务内重新计算：409 CONFIRMATION_REQUIRED（lot_book_qty 3、item_book_qty 13），不入账。
 #[tokio::test]
 async fn a_shortage_appearing_at_submit_requires_confirmation() {
     let node = node();
     let flour = flour_ab(&node).await;
     let data = node.precheck_ok(vec![at(wline(&flour, 4), A)]).await;
-    assert_eq!(data["lines"][0]["needs_confirmation"], json!(false));
+    assert_eq!(data["confirmations"], json!([]));
     let reply = node
         .post(
             &MANAGER,
@@ -1614,15 +1755,54 @@ async fn a_shortage_appearing_at_submit_requires_confirmation() {
         .await;
 
     assert_eq!(
-        assert_error(&reply, 409, "WASTE_CONFIRMATION_REQUIRED"),
-        &json!({ "lines": [short(0, &flour, Some((A, 3)), 4, 13)] })
+        assert_error(&reply, 409, "CONFIRMATION_REQUIRED"),
+        &confirmations(vec![short(0, &flour, Some((A, 3)), 4, 13)])
     );
     assert_eq!(node.state(), before);
 }
 
-// domain「报损接口」业务校验：不足确认在其余业务校验都通过之后判定。lines[0] 是没带确认的不足行，同时另一处有其他业务错误时，
-// 返回那个错误，不是 WASTE_CONFIRMATION_REQUIRED：换算系数变了（409 UNIT_CONVERSION_CHANGED）、报损原因不存在（404）、
-// 批次属于其他物料（400 LOT_ITEM_MISMATCH）、超过 72 小时（400 CAPTURE_TOO_OLD）。都不写任何内容。
+// 场景「提交时不足消失」（domain「异常分级」确认：多余确认照常受理）：只有批次 A 5；预检报损 8 g（不指定批次）需要确认，员工确认；
+// 提交前另一台平板收货建批次 B 10（RAW-FLOUR-20261006-002）。带确认提交照常入账，按提交时的账面：item_book_qty 15，
+// A 5 + B 3 FIFO，没有 SHORTFALL、没有账外缺口；acknowledged 仍保留在规范化请求中。
+#[tokio::test]
+async fn confirmation_is_kept_when_the_shortage_disappears() {
+    let node = node();
+    let flour = node.item(1, "FLOUR", &[]).await;
+    let supplier = node.supplier(2).await;
+    node.reason(3, "EXPIRED").await;
+    node.receive(4, &supplier, vec![rline(&flour, 5, "2026-10-20")], 0)
+        .await;
+    let data = node.precheck_ok(vec![wline(&flour, 8)]).await;
+    assert_eq!(data["confirmations"], json!([short(0, &flour, None, 8, 5)]));
+    let lots = node
+        .receive(5, &supplier, vec![rline(&flour, 10, "2026-10-20")], 0)
+        .await;
+    assert_eq!(lots, [B]);
+
+    let request = body(&cmd(6), vec![confirmed(wline(&flour, 8))], 0);
+    let reply = node.waste(&request).await;
+
+    assert_eq!(
+        record(&reply)["lines"],
+        json!([logged(&flour, None, 8, 15, vec![fifo(A, 5), fifo(B, 3)])])
+    );
+    assert_eq!(reply.body["warnings"], json!([]));
+    assert_eq!(node.lots(), [pair(A, 0), pair(B, 7)]);
+    assert_eq!(node.unallocated(), Vec::<(String, i64)>::new());
+    let (_, stored, _) = node.processed(&cmd(6)).unwrap();
+    assert_eq!(stored, canonical(&request));
+    assert_eq!(
+        stored["lines"][0]["acknowledged"],
+        json!(["STOCK_SHORTFALL"])
+    );
+}
+
+// domain「报损接口」业务校验与「异常分级」判定时机：不足确认在其余业务校验都通过之后判定。lines[0] 是没带确认的不足行，
+// 同时另一处有其他业务错误时，返回那个错误，不是 CONFIRMATION_REQUIRED：换算系数变了（409 UNIT_CONVERSION_CHANGED）、
+// 报损原因不存在（404）、批次属于其他物料（400 LOT_ITEM_MISMATCH）、物料还没有任何批次（409 ITEM_HAS_NO_LOTS）、
+// 超过 72 小时（400 CAPTURE_TOO_OLD）、前端信号无效或 occurred_at 晚于接收时间超过 1 分钟（400 CLIENT_CLOCK_NOT_SYNCED）。
+// 出错的行自己带了确认也一样：指定的批次不存在（404，entity LOT）、批次属于其他物料（400 LOT_ITEM_MISMATCH）。
+// 都不写任何内容。库存状态上限先于确认见 the_stock_limit_rejects_the_whole_command。
 #[tokio::test]
 async fn confirmation_is_judged_after_other_business_checks() {
     let node = node();
@@ -1637,8 +1817,20 @@ async fn confirmation_is_judged_after_other_business_checks() {
     });
     let mut unknown_reason = wline(&flour, 1);
     unknown_reason["reason_code"] = json!("MISSING");
+    let salt = node.item(13, "SALT", &[]).await;
     let before = node.state();
 
+    let reply = node
+        .waste(&body(
+            &cmd(12),
+            vec![short_line.clone(), wline(&salt, 1)],
+            0,
+        ))
+        .await;
+    assert_eq!(
+        assert_error(&reply, 409, "ITEM_HAS_NO_LOTS"),
+        &json!({ "line": 1, "item_id": salt })
+    );
     let reply = node
         .waste(&body(&cmd(12), vec![short_line.clone(), bag], 0))
         .await;
@@ -1665,10 +1857,82 @@ async fn confirmation_is_judged_after_other_business_checks() {
         &json!({ "line": 1, "item_id": sugar, "lot_id": B })
     );
     let reply = node
-        .waste(&body(&cmd(12), vec![short_line], MAX_LAG + 1))
+        .waste(&body(&cmd(12), vec![short_line.clone()], MAX_LAG + 1))
         .await;
     assert_eq!(assert_error(&reply, 400, "CAPTURE_TOO_OLD"), &json!({}));
+    for (occurred_at, clock_synced_at) in [
+        (NOW, NOW - 7 * 24 * HOUR - 1),
+        (NOW + MINUTE + 1, CLIENT_SYNCED),
+    ] {
+        let reply = node
+            .waste(&timed_body(
+                &cmd(12),
+                vec![short_line.clone()],
+                occurred_at,
+                clock_synced_at,
+            ))
+            .await;
+        assert_eq!(
+            assert_error(&reply, 400, "CLIENT_CLOCK_NOT_SYNCED"),
+            &json!({}),
+            "{occurred_at} {clock_synced_at}"
+        );
+    }
 
+    let missing = "RAW-FLOUR-20261006-003";
+    let reply = node
+        .waste(&body(
+            &cmd(12),
+            vec![confirmed(at(wline(&flour, 1), missing))],
+            0,
+        ))
+        .await;
+    assert_eq!(
+        assert_error(&reply, 404, "REFERENCE_NOT_FOUND"),
+        &json!({ "entity": "LOT", "id": missing })
+    );
+    let reply = node
+        .waste(&body(
+            &cmd(12),
+            vec![confirmed(at(wline(&sugar, 30), B))],
+            0,
+        ))
+        .await;
+    assert_eq!(
+        assert_error(&reply, 400, "LOT_ITEM_MISMATCH"),
+        &json!({ "line": 0, "item_id": sugar, "lot_id": B })
+    );
+
+    assert_eq!(node.state(), before);
+}
+
+// domain「报损接口」重提：确认后重提时 occurred_at 沿用首次录入的值，超过 72 小时返回 CAPTURE_TOO_OLD（改走补录）。
+// A 5、B 10；NOW 录入报损 8 g 指定 A，不带确认 → 409 CONFIRMATION_REQUIRED；节点时钟走到 NOW + 72 小时 + 1 ms，
+// 同一 command_id、原 occurred_at 带确认重提 → 400 CAPTURE_TOO_OLD，details {}，不写任何内容。
+#[tokio::test]
+async fn confirmed_resubmission_after_72_hours_is_too_old() {
+    let node = node();
+    let flour = flour_ab(&node).await;
+    let before = node.state();
+
+    let reply = node
+        .waste(&body(&cmd(10), vec![at(wline(&flour, 8), A)], 0))
+        .await;
+    assert_eq!(
+        assert_error(&reply, 409, "CONFIRMATION_REQUIRED"),
+        &confirmations(vec![short(0, &flour, Some((A, 5)), 8, 15)])
+    );
+
+    node.clock.set(UnixMillis(NOW + MAX_LAG + 1));
+    let reply = node
+        .waste(&timed_body(
+            &cmd(10),
+            vec![confirmed(at(wline(&flour, 8), A))],
+            NOW,
+            CLIENT_SYNCED,
+        ))
+        .await;
+    assert_eq!(assert_error(&reply, 400, "CAPTURE_TOO_OLD"), &json!({}));
     assert_eq!(node.state(), before);
 }
 
@@ -1771,11 +2035,12 @@ async fn fifo_orders_by_lot_date_then_serial() {
 // 幂等与处理顺序
 // ---------------------------------------------------------------------------------------------
 
-// 验收用例「幂等」、场景「确认标记与幂等」与 domain「报损接口」重提：
-// - 带确认的报损成功后，库存又被另一条报损改变；一小时后用原 command_id、原内容（含确认标记）重发，
+// 验收用例「幂等」、场景「确认标记与幂等」与 domain「报损接口」重提、「异常分级」确认的规范化：
+// - 带确认的报损成功后，库存又被另一条报损改变；一小时后用原 command_id、原内容（含 acknowledged）重发，
 //   clock_synced_at 不同（包括已过期的值），节点时间已超过 occurred_at 72 小时：原样返回首次响应（含 warnings 和首次的账面、分配），
 //   seq 不增加，不重新计算、不重新校验发生时间。
-// - 确认标记省略与 false 等价：原请求省略的行改写为 false，或原请求为 false 的行改为省略，都返回首次响应，不是冲突。
+// - acknowledged 空数组与省略等价：原请求省略的行改写为 []，或原请求为 [] 的行改为省略，都返回首次响应，不是冲突。
+//   原请求为 [] 的行在规范化请求中省略该键。
 #[tokio::test]
 async fn retries_return_the_original_response() {
     let node = node();
@@ -1798,10 +2063,12 @@ async fn retries_return_the_original_response() {
         ])
     );
     assert_warnings(&first, &[]);
-    let mut with_false = wline(&flour, 1);
-    with_false["confirm_shortage"] = json!(false);
-    let second = node.waste(&body(&cmd(11), vec![with_false], 0)).await;
+    let mut with_empty = wline(&flour, 1);
+    with_empty["acknowledged"] = json!([]);
+    let second = node.waste(&body(&cmd(11), vec![with_empty], 0)).await;
     record(&second);
+    let (_, stored, _) = node.processed(&cmd(11)).unwrap();
+    assert!(stored["lines"][0].get("acknowledged").is_none(), "{stored}");
     let before = node.state();
 
     for (now, clock_synced_at) in [
@@ -1824,18 +2091,20 @@ async fn retries_return_the_original_response() {
             "clock_synced_at = {clock_synced_at}"
         );
     }
-    let mut explicit_false = lines.clone();
-    explicit_false[1]["confirm_shortage"] = json!(false);
+    let mut explicit_empty = lines.clone();
+    explicit_empty[1]["acknowledged"] = json!([]);
     let reply = node
         .waste(&timed_body(
             &cmd(10),
-            explicit_false,
+            explicit_empty,
             occurred_at,
             CLIENT_SYNCED,
         ))
         .await;
+    assert_eq!(reply.status, 200);
     assert_eq!(reply.body, first.body);
     let reply = node.waste(&body(&cmd(11), vec![wline(&flour, 1)], 0)).await;
+    assert_eq!(reply.status, 200);
     assert_eq!(reply.body, second.body);
 
     assert_eq!(node.state(), before);
@@ -1890,7 +2159,8 @@ async fn retries_skip_unit_checks_after_the_unit_changes() {
 }
 
 // AGENTS「幂等」与 domain「报损接口」重提：成功之后同一 command_id、内容不同时 409 IDEMPOTENCY_CONFLICT，
-// details.fields 为不同的顶层字段名（字典序）。去掉、改为 false 或新加确认标记，改数量、批次、原因，行序不同，都列为 "lines"；
+// details.fields 为不同的顶层字段名（字典序）。去掉确认（省略或改为 []）、给原来没有确认的行加确认，改数量、批次、原因，
+// 行序不同，都列为 "lines"；
 // command_type 不同时只列 "command_type"。幂等检查先于业务校验：改成不存在的原因、72 小时以外的 occurred_at，仍是 409。
 #[tokio::test]
 async fn idempotency_conflicts_list_differing_fields() {
@@ -1911,7 +2181,7 @@ async fn idempotency_conflicts_list_differing_fields() {
             body(
                 &x,
                 changed(0, &|l| {
-                    l.as_object_mut().unwrap().remove("confirm_shortage");
+                    l.as_object_mut().unwrap().remove("acknowledged");
                 }),
                 10 * MINUTE,
             ),
@@ -1920,7 +2190,7 @@ async fn idempotency_conflicts_list_differing_fields() {
         (
             body(
                 &x,
-                changed(0, &|l| l["confirm_shortage"] = json!(false)),
+                changed(0, &|l| l["acknowledged"] = json!([])),
                 10 * MINUTE,
             ),
             json!(["lines"]),
@@ -1928,7 +2198,7 @@ async fn idempotency_conflicts_list_differing_fields() {
         (
             body(
                 &x,
-                changed(1, &|l| l["confirm_shortage"] = json!(true)),
+                changed(1, &|l| l["acknowledged"] = json!(["STOCK_SHORTFALL"])),
                 10 * MINUTE,
             ),
             json!(["lines"]),
@@ -1997,7 +2267,7 @@ async fn idempotency_conflicts_list_differing_fields() {
     assert_eq!(node.state(), before);
 }
 
-// AGENTS「幂等」与 domain「报损接口」重提：被业务校验拒绝的命令不落库。收到 WASTE_CONFIRMATION_REQUIRED、
+// AGENTS「幂等」与 domain「报损接口」重提：被业务校验拒绝的命令不落库。收到 CONFIRMATION_REQUIRED、
 // 404 REFERENCE_NOT_FOUND 之后，同一 command_id 可以改内容重提（例如改小数量、不再需要确认）；成功之后再用被拒绝时的内容提交，
 // 则是幂等冲突。
 #[tokio::test]
@@ -2012,7 +2282,7 @@ async fn rejected_commands_can_be_resubmitted_with_changes() {
     let reply = node
         .waste(&body(&cmd(10), vec![at(wline(&flour, 8), A)], 0))
         .await;
-    assert_error(&reply, 409, "WASTE_CONFIRMATION_REQUIRED");
+    assert_error(&reply, 409, "CONFIRMATION_REQUIRED");
 
     let record = node
         .waste_ok(&body(&cmd(10), vec![at(wline(&flour, 3), A)], 0))
@@ -2033,6 +2303,8 @@ async fn rejected_commands_can_be_resubmitted_with_changes() {
 
 // AGENTS「HTTP 约定」处理顺序：请求结构与取值校验先于幂等检查——已成功的 command_id 携带非法内容重发时是 400，不是 409。
 // 超出录入上限（10000 g）、换算结果为 0、数量写成 JSON 数字都属于取值（domain「数量」「单位」）。
+// acknowledged 的取值同样在幂等检查之前（domain「异常分级」确认）：null、不属于实时报损可确认集合的码（POSSIBLE_DUPLICATE、
+// 未知码）、同一行内重复的码；旧字段 confirm_shortage 按未知字段处理。
 #[tokio::test]
 async fn validation_precedes_the_idempotency_check() {
     let node = node();
@@ -2045,7 +2317,14 @@ async fn validation_precedes_the_idempotency_check() {
         ("lines", json!([])),
         ("lot_id", json!("raw-flour-20261006-001")),
         ("reason_code", json!("")),
-        ("confirm_shortage", Value::Null),
+        ("acknowledged", Value::Null),
+        ("acknowledged", json!(["POSSIBLE_DUPLICATE"])),
+        ("acknowledged", json!(["UNKNOWN_CODE"])),
+        (
+            "acknowledged",
+            json!(["STOCK_SHORTFALL", "STOCK_SHORTFALL"]),
+        ),
+        ("confirm_shortage", json!(true)),
         ("item_id", json!("FLOUR")),
         (
             "input",
@@ -2229,7 +2508,10 @@ fn invalid_lines(valid: &Value) -> Vec<(&'static str, Value)> {
 }
 
 // domain「报损接口」取值、「写命令通用规则」取值与 AGENTS「HTTP 约定」：结构或取值错误一律 400 VALIDATION_FAILED，details 为 {}，什么都不写。
-// lot_id 按批次号格式校验（同「批次查询」）；confirm_shortage 只接受布尔值，不接受 null、字符串或数字。
+// lot_id 按批次号格式校验（同「批次查询」）。
+// acknowledged（domain「异常分级」确认、「报损接口」取值）：可以省略，不接受 null；必须是码的数组，码属于实时报损的可确认集合
+// （只有 STOCK_SHORTFALL；POSSIBLE_DUPLICATE 只用于补录，其他级别的码和未知码、大小写不同都不行），同一行内不重复。
+// 有行的命令不接受顶层 acknowledged。旧字段 confirm_shortage 是未知字段（true、false 都不接受）。
 #[tokio::test]
 async fn invalid_values_are_validation_failed() {
     let node = node();
@@ -2263,6 +2545,9 @@ async fn invalid_values_are_validation_failed() {
     top("sent_at present", &|r| r["sent_at"] = json!(NOW));
     top("started_at present", &|r| r["started_at"] = json!(NOW));
     top("unknown field", &|r| r["note"] = json!("x"));
+    top("acknowledged at top level", &|r| {
+        r["acknowledged"] = json!(["STOCK_SHORTFALL"])
+    });
     top("command_id missing", &|r| {
         r.as_object_mut().unwrap().remove("command_id");
     });
@@ -2276,9 +2561,42 @@ async fn invalid_values_are_validation_failed() {
         cases.push((name, request));
     }
     for (name, value) in [
-        ("confirm_shortage null", Value::Null),
-        ("confirm_shortage string", json!("true")),
-        ("confirm_shortage number", json!(1)),
+        ("acknowledged null", Value::Null),
+        ("acknowledged string", json!("STOCK_SHORTFALL")),
+        ("acknowledged object", json!({ "code": "STOCK_SHORTFALL" })),
+        ("acknowledged bool", json!(true)),
+        ("acknowledged [null]", json!([null])),
+        ("acknowledged [number]", json!([1])),
+        ("acknowledged lowercase", json!(["stock_shortfall"])),
+        ("acknowledged padded", json!([" STOCK_SHORTFALL"])),
+        ("acknowledged empty code", json!([""])),
+        ("acknowledged unknown code", json!(["UNKNOWN_CODE"])),
+        (
+            "acknowledged POSSIBLE_DUPLICATE",
+            json!(["POSSIBLE_DUPLICATE"]),
+        ),
+        (
+            "acknowledged with POSSIBLE_DUPLICATE",
+            json!(["POSSIBLE_DUPLICATE", "STOCK_SHORTFALL"]),
+        ),
+        ("acknowledged warning code", json!(["ABSORBED_BY_COUNT"])),
+        ("acknowledged reject code", json!(["ITEM_HAS_NO_LOTS"])),
+        (
+            "acknowledged top-level code",
+            json!(["CONFIRMATION_REQUIRED"]),
+        ),
+        (
+            "acknowledged duplicate",
+            json!(["STOCK_SHORTFALL", "STOCK_SHORTFALL"]),
+        ),
+    ] {
+        let mut request = valid.clone();
+        request["lines"][0]["acknowledged"] = value;
+        cases.push((name, request));
+    }
+    for (name, value) in [
+        ("confirm_shortage true", json!(true)),
+        ("confirm_shortage false", json!(false)),
     ] {
         let mut request = valid.clone();
         request["lines"][0]["confirm_shortage"] = value;
@@ -2304,7 +2622,8 @@ async fn invalid_values_are_validation_failed() {
 
 // domain「报损接口」预检：请求体只有 lines，行的取值规则同正式提交；不接受 command_id、occurred_at、clock_synced_at
 // （以及相对校准时代的 captured_at、sent_at），
-// 行内不接受 confirm_shortage（true、false 都不接受）。都是 400 VALIDATION_FAILED，details 为 {}，什么都不写。
+// 行内不接受 acknowledged（有码、空数组、null 都不接受），也不接受旧字段 confirm_shortage。
+// 都是 400 VALIDATION_FAILED，details 为 {}，什么都不写。
 #[tokio::test]
 async fn invalid_precheck_requests_are_validation_failed() {
     let node = node();
@@ -2331,17 +2650,23 @@ async fn invalid_precheck_requests_are_validation_failed() {
         r["clock_synced_at"] = json!(CLIENT_SYNCED)
     });
     top("unknown field", &|r| r["note"] = json!("x"));
+    top("acknowledged at top level", &|r| {
+        r["acknowledged"] = json!(["STOCK_SHORTFALL"])
+    });
     for (name, line) in invalid_lines(&valid["lines"][0]) {
         let mut request = valid.clone();
         request["lines"][0] = line;
         cases.push((name, request));
     }
-    for (name, value) in [
-        ("confirm_shortage true", json!(true)),
-        ("confirm_shortage false", json!(false)),
+    for (name, key, value) in [
+        ("acknowledged", "acknowledged", json!(["STOCK_SHORTFALL"])),
+        ("acknowledged empty", "acknowledged", json!([])),
+        ("acknowledged null", "acknowledged", Value::Null),
+        ("confirm_shortage true", "confirm_shortage", json!(true)),
+        ("confirm_shortage false", "confirm_shortage", json!(false)),
     ] {
         let mut request = valid.clone();
-        request["lines"][0]["confirm_shortage"] = value;
+        request["lines"][0][key] = value;
         cases.push((name, request));
     }
 

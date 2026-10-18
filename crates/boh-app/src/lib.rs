@@ -3,8 +3,10 @@
 pub mod actor;
 pub mod background;
 pub mod clock_sync;
+mod confirmation;
 pub mod http;
 mod invariant_check;
+mod request_log;
 pub use invariant_check::InvariantCheckHealth;
 #[doc(hidden)]
 pub use invariant_check::InvariantCheckHold;

@@ -27,7 +27,9 @@ async fn fail_equipment_insert(node: &super::Node) {
 fn assert_diagnostic(capture: &Capture, command_id: &str) {
     let text = capture.text();
     assert_eq!(
-        text.lines().filter(|line| line.contains("ERROR")).count(),
+        text.lines()
+            .filter(|line| line.trim_start().starts_with("ERROR "))
+            .count(),
         1,
         "{text}"
     );
@@ -158,7 +160,9 @@ async fn queue_failure_is_logged_once_on_the_request_side_with_identity() {
     assert_internal_error(response);
     let text = capture.text();
     assert_eq!(
-        text.lines().filter(|line| line.contains("ERROR")).count(),
+        text.lines()
+            .filter(|line| line.trim_start().starts_with("ERROR "))
+            .count(),
         1,
         "{text}"
     );
@@ -203,7 +207,9 @@ fn backup_health_logs_one_full_diagnostic_with_phase_and_number() {
         });
         let text = capture.text();
         assert_eq!(
-            text.lines().filter(|line| line.contains("ERROR")).count(),
+            text.lines()
+                .filter(|line| line.trim_start().starts_with("ERROR "))
+                .count(),
             1,
             "{text}"
         );

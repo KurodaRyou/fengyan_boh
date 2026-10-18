@@ -74,11 +74,15 @@ impl FromRequestParts<AppState> for Actor {
             "MANAGER" => Role::Manager,
             _ => return Err(rejected()),
         };
-        Ok(Self {
+        let actor = Self {
             employee_id,
             device_id,
             role,
-        })
+        };
+        if let Some(context) = parts.extensions.get::<crate::request_log::Context>() {
+            context.actor(actor);
+        }
+        Ok(actor)
     }
 }
 
