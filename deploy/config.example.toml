@@ -10,3 +10,14 @@ db_path = "/var/lib/boh/boh.db"
 backup_dir = "/var/lib/boh/backups"
 listen_addr = "0.0.0.0:8080"
 reader_pool_size = 4
+
+# 局域网 HTTPS（docs/tls.md）。随局域网 HTTPS 切片生效：实现之前保持注释，否则配置解析失败。
+# 生效后 listen_addr 改为有线网口固定 IP 上的 HTTPS 端口（IP 等于 [tls].ip，不用 0.0.0.0），工作站只经本机回环地址访问：
+# listen_addr = "192.168.1.20:8443"
+# workstation_addr = "127.0.0.1:8080"   # 只接受回环地址
+#
+# [tls]
+# ip = "192.168.1.20"                   # 部署记录中门店节点的固定 IP
+# ca_cert_path = "/run/credentials/boh.service/store-ca.crt"
+# ca_key_path = "/run/credentials/boh.service/store-ca.key"
+# cert_dir = "/var/lib/boh/tls"         # 叶证书与叶私钥，节点自动签发
