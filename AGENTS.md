@@ -416,6 +416,7 @@ scripts/        CI 扫描脚本。
 - 其他通用错误码：未匹配的路由 `404 ROUTE_NOT_FOUND`；方法不允许 `405 METHOD_NOT_ALLOWED`；内部错误 `500 INTERNAL_ERROR`；缺少或无效的身份 `401 UNAUTHENTICATED`；角色不够 `403 FORBIDDEN`。
 - 身份与权限通过后，请求体不是合法 JSON、缺少 `Content-Type: application/json`、字段缺失、未知字段、类型或取值不对，以及路径参数无法解析，一律 `400 VALIDATION_FAILED`。
   - axum 提取器默认返回纯文本的 415 / 422，必须转换成信封。
+- 配置 TLS 的局域网请求先完成 TLS 握手与证书验证，再进入下述 HTTP 处理；握手失败由客户端处理 TLS 错误，不产生 HTTP 错误信封，错误与日志分层见 docs/tls.md「请求顺序与错误」。
 - 写命令按以下顺序处理，先命中的结果生效：身份与权限 → 请求结构与取值（反序列化成强类型命令）→ 幂等检查 → 节点校时信号 → 业务校验。被前两步拒绝的请求不做幂等比对。
 - 写命令成功一律 `200`，重试返回的原响应也是 `200`。
 - 需要人工处理后重提的错误码，由前端 App 底层按 `docs/domain.md`「前端错误处理」的对照表统一显示提示页和处理动作，处理后以同一个 `command_id` 重提；各业务页面不各自处理。
@@ -437,7 +438,6 @@ scripts/        CI 扫描脚本。
   | `invariant_check` | 本进程最近一次不变量自检的尝试与报告，结构见 [docs/invariant-check.md](docs/invariant-check.md)「报告」 |
   | `tls_ca_not_after` | 门店签发 CA 的 `notAfter`；未配置 TLS 时为 `null` |
   | `tls_cert_not_after` | 正在使用的叶证书的 `notAfter`；未配置 TLS 或没有叶证书时为 `null` |
-  | `tls_cert_provisional` | 正在使用的是临时证书时为 `true`，是正式证书时为 `false`；未配置 TLS 或没有叶证书时为 `null`（[docs/tls.md](docs/tls.md)） |
   | `issues` | 问题清单：`[{code, severity, since}]`，按下表顺序排列，没有时为 `[]` |
 
   - 问题清单：生成报告时按下表判定。`since` 是本进程中第一次判定该问题存在时的 `now()`；问题消失时移除，再出现时重新计时。只在进程内存中，不写数据库。
@@ -452,7 +452,6 @@ scripts/        CI 扫描脚本。
     | `INVARIANT_CHECK_FAILED` | `invariant_check.last_attempt.result` 是 `failed` | `ERROR` | 店长 |
     | `TLS_NOT_READY` | 已配置 TLS，且以下任一条件成立：HTTPS 尚未成功监听；没有当前可用叶证书；门店签发 CA 按本次时钟读数尚未生效或已过期。当前证书的可用判定见 `docs/tls.md`「叶证书的签发与续期」 | `ERROR` | 全员（平板可能无法连接，按 SOP 处理） |
     | `TLS_CA_EXPIRING` | `now ≥ tls_ca_not_after − 180 天`；`now ≥ tls_ca_not_after − 30 天` 时为 `ERROR` | `WARNING` / `ERROR` | 店长 |
-    | `TLS_CERT_PROVISIONAL` | `tls_cert_provisional` 是 `true` | `WARNING` | 店长 |
     | `TLS_CERT_EXPIRING` | `now ≥ tls_cert_not_after − 7 天` | `ERROR` | 店长 |
 
     - `TLS_NOT_READY` 只根据节点已知的监听状态和当前证书、CA 判断，不探测客户端网络；生成报告时使用同一次时钟读数。全部条件消失后移除；未配置 TLS 的 debug 模式不产生此问题。其他 TLS 问题可同时存在。
@@ -462,7 +461,7 @@ scripts/        CI 扫描脚本。
   - 备份字段只反映本进程：`null` 表示「本进程还不知道」，不表示没有备份；重启会清掉失败状态。`ok` 只表示本进程暂未发现异常，不表示已有一份可用备份。
     判断备份是否过期、重启前的历史，留到需要「门店当前是否受有效备份保护」时另行设计。
   - 生成报告成功返回 `200`（含 `degraded`）；查询数据库或读取 WAL 文件失败（文件不存在除外）返回 `500 INTERNAL_ERROR`。监控必须看 `data.status`，不能只看状态码。
-  - 实现状态：`tls_ca_not_after`、`tls_cert_not_after`、`tls_cert_provisional`、`issues` 随局域网 HTTPS 切片实现；实现之前 `status` 仍按问题清单中前五个码的条件判定。
+  - 实现状态：`tls_ca_not_after`、`tls_cert_not_after`、`issues` 随局域网 HTTPS 切片实现；实现之前 `status` 仍按问题清单中前五个码的条件判定。
   - 后续加入的字段：认证实现后加 `auth_failures_last_hour`；同步实现后加 `max(seq) − acked_seq` 和最后一次成功同步的时间。
 
 ---

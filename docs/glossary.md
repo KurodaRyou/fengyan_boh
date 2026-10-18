@@ -33,7 +33,6 @@
 | Chain root | 连锁根 | 局域网 HTTPS 信任链的起点，全连锁一个，私钥离线保存，根证书内置 App | tls「证书层级」 |
 | Store issuing CA | 门店签发 CA | 每店一张、由连锁根签发、带名称约束的中间 CA，私钥在门店节点上，用来签发叶证书 | tls「证书层级」 |
 | Leaf certificate | 叶证书 | 门店节点在 HTTPS 握手中出示的服务器证书，由节点用门店签发 CA 自动签发和续期 | tls「叶证书的签发与续期」 |
-| Provisional certificate | 临时证书 | 节点信号无效又没有可用叶证书时签发、只在内存中的叶证书；信号有效后换成正式证书 | tls「叶证书的签发与续期」 |
 | Name constraints | 名称约束 | 门店签发 CA 证书中限制它能签哪些 DNS 名和 IP 的扩展 | tls「证书层级」 |
 | Issue list | 问题清单 | `/health` 的 `issues`：节点当前存在的运维问题，每项有码、严重度 `ERROR` / `WARNING` 和开始时间；严重度与异常分级无关 | AGENTS「HTTP 约定」 |
 | Deployment record | 部署记录 | 每店一份、不进仓库的记录：设备固定 IP、路由器网段与地址池、门店签发 CA 到期日等 | `deploy/` |
