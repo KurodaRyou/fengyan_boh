@@ -4,7 +4,7 @@
 # 按这两个片段中的注释关闭网口 NTP 下发并设置 /etc/resolv.conf 的 stub 链接。
 [Unit]
 Description=Fengyan BOH store edge node
-# 只依赖 network.target，不依赖 network-online：断网是正常工作状态
+# 只依赖 network.target，不依赖 network-online：断网时节点照常工作
 After=network.target
 
 [Service]

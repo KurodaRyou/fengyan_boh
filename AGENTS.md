@@ -1,7 +1,7 @@
 # Fengyan BOH — 门店边缘节点
 
 烘焙门店后厨（BOH）系统的门店本地节点。部署在每家门店的一台 Linux 机器上，局域网内由门店统一采购、纳入设备管理的平板和手机通过 Android / iOS 原生 App 访问（部署要求见 [docs/domain.md](docs/domain.md)「时间」前端校时）。
-**断网是常态，不是异常**：门店节点和前端的校时信号有效时，所有门店内核心操作无需外网即可正常工作，联网后再把事件同步到总部。节点无有效校时信号时，按 [SOP](docs/sop.md)「门店机校时」打开手机热点联网校准，获得有效信号后恢复写入；前端无有效信号时，先向门店节点校时。没有可用热点时，继续采用纸面登记流程。平板连不上门店节点时，未发出的记录改用纸面登记、恢复后补录；结果未知的记录由 App 后台任务用原 ID 重试，需要时在门店机工作站核对（见 [docs/domain.md](docs/domain.md)「命令提交与结果未知」）。
+**断网是可能出现的情况**：正常情况下门店长时间有外网，偶尔因路由器故障、重启等断开外网。门店节点和前端的校时信号有效时，所有门店内核心操作无需外网即可正常工作，联网后再把事件同步到总部。节点无有效校时信号时，按 [SOP](docs/sop.md)「门店机校时」打开手机热点联网校准，获得有效信号后恢复写入；前端无有效信号时，先向门店节点校时。没有可用热点时，继续采用纸面登记流程。平板连不上门店节点时，未发出的记录改用纸面登记、恢复后补录；结果未知的记录由 App 后台任务用原 ID 重试，需要时在门店机工作站核对（见 [docs/domain.md](docs/domain.md)「命令提交与结果未知」）。
 
 业务决策、事件目录与领域规则见 [docs/domain.md](docs/domain.md)；系统依赖的门店操作规范见 [docs/sop.md](docs/sop.md)；规范用词见 [docs/glossary.md](docs/glossary.md)；锁定测试使用的接口见 [docs/interfaces.md](docs/interfaces.md)；备份模块的细则见 [docs/backup.md](docs/backup.md)；不变量自检的细则见 [docs/invariant-check.md](docs/invariant-check.md)；员工认证与设备注册见 [docs/auth.md](docs/auth.md)。
 
