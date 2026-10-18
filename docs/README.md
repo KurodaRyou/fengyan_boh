@@ -1,38 +1,59 @@
 # 文档索引
 
-本文件供 agent 按任务定位规范，只维护阅读入口；规则正文保留在对应文档中。
+本文件只维护阅读入口。规则正文保留在对应专题；任务涉及多个主题时取并集，不要求通读全部文档。正文中的跨主题链接用于定位：与本次行为有关的条件、例外必须读取；未来功能的背景链接不扩展实现范围。
+
+## 目录结构
+
+| 目录 | 正文范围 |
+|---|---|
+| [engineering/](engineering/) | 开发与审查流程、架构、Rust、存储、HTTP 共同规则 |
+| [business/](business/) | 时间、命令提交、主数据、库存、业务操作、员工认证 |
+| [operations/](operations/) | 服务生命周期、健康状态、备份、不变量自检、TLS、门店 SOP |
+| [interfaces/](interfaces/) | storage、domain、app、server 的稳定测试接口 |
+
+根目录保留本任务索引、[领域总览](domain.md)、[接口索引](interfaces.md)和[术语](glossary.md)。`auth.md`、`backup.md`、`invariant-check.md`、`sop.md`、`tls.md` 只保留章节导航，供现有引用定位；正文按上表分类存放。
 
 ## 开始任务
 
-1. 确认当前工作目录、分支、HEAD 和未提交改动；实现状态以当前 checkout 为准。
-2. 读取 [AGENTS.md](../AGENTS.md)，核对[路线图](../AGENTS.md#路线图)、[开发阶段与上线](../AGENTS.md#开发阶段与上线)与本轮任务范围。已定规则不代表功能已实现；依赖[待确认问题](domain.md#待确认问题)或[尚未设计事项](../AGENTS.md#尚未设计动手前先讨论)的部分遵守相应限制。
-3. 按下表读取相关章节，并继续读取其中引用的共用规则；涉及多个主题时取并集。无需为单一任务通读全部 `docs/`。
-4. 实现或 review 时，再定位对应源码与锁定测试。独立测试审查的阶段、依据和禁读范围以 [AGENTS.md「测试分工」](../AGENTS.md#测试分工)为准。
+1. 核对当前目录、分支、HEAD、未提交改动与任务范围，读取完整 [AGENTS.md](../AGENTS.md)。
+2. 核对[路线图](../AGENTS.md#路线图)、[上线阶段](../AGENTS.md#开发阶段与上线)、相关章节的实现状态；[尚未设计](domain.md#尚未设计动手前先讨论)和[待确认问题](domain.md#待确认问题)不能自行实现。
+3. 按下表读取业务专题及其共同规则。实现先读[开发顺序第 5 步](engineering/development.md#开发顺序每个新功能)、[模块职责](engineering/architecture.md#crate-划分)、[Rust 与诊断规则](engineering/rust.md)；设计、锁定测试和 review 按开发顺序中的当前步骤执行。
+4. 再定位源码与锁定测试；独立测试审查遵守[测试分工](engineering/development.md#测试分工)的先后顺序、独立副本和禁读范围，不能据此提前读实现。
 
 ## 按任务读取
 
-| 任务涉及 | 规则入口与共同依赖 |
-|---|---|
-| 业务写命令 | [写命令通用规则](domain.md#写命令通用规则)、[HTTP 约定](../AGENTS.md#http-约定)、[幂等](../AGENTS.md#幂等)、[节点校时](domain.md#门店节点校时)、[发生时间校验](domain.md#发生时间的校验)、[异常分级](domain.md#异常分级)，再读[具体命令接口](domain.md#阅读导航) |
-| 主数据维护与初始化 | [主数据归属与初始化](domain.md#主数据)、[主数据接口](domain.md#主数据接口)、[员工主数据](auth.md#员工主数据)；写入还适用「业务写命令」行的共用规则 |
-| 库存决策、投影与查询 | [库存规则归属](../AGENTS.md#库存规则归属)、[数量](domain.md#数量)、[单位](domain.md#单位)、[批次](domain.md#批次)、[投影表](domain.md#投影表)，再读对应业务、[库存明细](domain.md#库存明细查询)或[批次查询](domain.md#批次查询)；涉及吸收时读[盘点](domain.md#盘点)与[盘点吸收](domain.md#盘点吸收) |
-| 时钟、营业日与补录 | [时间](domain.md#时间)；补录另读[命令提交与结果未知](domain.md#命令提交与结果未知)、[异常分级](domain.md#异常分级)与[待确认问题](domain.md#待确认问题) |
-| App 提交、重试、取消与工作站 | [前端校时](domain.md#前端校时)、[命令提交与结果未知](domain.md#命令提交与结果未知)、[前端错误处理](domain.md#前端错误处理)、[认证](auth.md)、[HTTPS 的 App 要求](tls.md#对前端-app-的要求)、[SOP](sop.md) |
-| 认证、权限与设备注册 | [auth.md](auth.md)、[局域网 HTTPS](tls.md)、[主数据](domain.md#主数据)；当前身份入口见[开发桩](auth.md#开发桩) |
-| 备份、自检与健康状态 | [备份](backup.md)、[不变量自检](invariant-check.md)、[SQLite](../AGENTS.md#sqlite)、[HTTP 约定中的 `/health`](../AGENTS.md#http-约定)；后台任务关闭顺序见 [Rust](../AGENTS.md#rust) |
-| 配置、监听、启动与关闭 | [局域网 HTTPS](tls.md)、[节点校时](domain.md#门店节点校时)、[Rust 关闭顺序](../AGENTS.md#rust)、[进程与配置测试接口](interfaces.md)、[部署要求](../deploy/README.md) |
-| 锁定测试与验收 | [测试分工](../AGENTS.md#测试分工)、[稳定测试接口](interfaces.md)、相关业务规范的验收用例；预期值确认按[开发顺序](../AGENTS.md#开发顺序每个新功能)执行 |
-| 门店部署与人工操作 | [部署要求及适用阶段](../deploy/README.md#适用阶段)、[部署记录模板](../deploy/deployment-record.template.md)、[SOP](sop.md)及其引用的时间、认证、TLS 规则 |
+| 任务 | 主题正文 | 必须同时读取的共同规则与验收入口 |
+|---|---|---|
+| 业务写命令、handler、幂等或确认 | [HTTP、幂等、写命令与异常分级](engineering/http.md)及具体业务接口 | [存储事务与账本](engineering/storage.md)；[ID](business/time.md#id-与时间)、[节点信号](business/time.md#门店节点校时)、[发生时间校验](business/time.md#发生时间的校验)、[营业日等通用规则](business/time.md#通用规则)；[当前身份开发桩](business/auth.md#开发桩)；[app 测试入口](interfaces/app.md)、[相关验收](business/operations.md#验收用例) |
+| 主数据、初始化 | [主数据与接口](business/master-data.md) | 写入还适用上一行；含数量时读[数量与单位](business/inventory.md#数量)；员工/PIN 另读 [business/auth.md](business/auth.md)；CLI 读 [init 契约](interfaces/server.md#boh-serverinit-子命令) |
+| 收货、报损、温度记录 | [收货](business/operations.md#收货接口)、[报损](business/operations.md#报损接口)或[温度](business/operations.md#温度记录接口) | 写入共用规则；库存操作读[数值、数量、单位、批次与投影](business/inventory.md)、[库存职责](engineering/architecture.md#库存规则归属)；[已锁定算例与测试文件](business/operations.md#已锁定)。报损另读[吸收边界](business/operations.md#盘点吸收)，不得提前实现尚未落地的判定 |
+| 生产、盘点、吸收、纠错、销售导入 | [业务操作](business/operations.md#生产规则)中对应章节 | 写入共用规则、[库存共同规则](business/inventory.md)、[库存职责](engineering/architecture.md#库存规则归属)、[待实现验收](business/operations.md#待实现)；补录/锁账读 [business/time.md](business/time.md#补录) 与 [Q6](domain.md#待确认问题) |
+| 库存投影或查询 | [库存共同规则与查询](business/inventory.md) | [职责](engineering/architecture.md#库存规则归属)、[存储/重建](engineering/storage.md)、[HTTP 信封与错误](engineering/http.md#http-约定)；按影响读取业务事件、[事件目录](domain.md#事件目录)、[重放验收入口](business/operations.md#已锁定) |
+| 节点校时、时间纯函数、营业日 | [business/time.md](business/time.md) 中节点、校验或营业日章节；[时间与存储故障限制](business/time.md#已知限制) | [Clock](interfaces/storage.md#时钟boh_storageclock)、[domain 时间接口](interfaces/domain.md#boh-domain时间boh_domaintime)、[app 核对测试入口](interfaces/app.md#boh-app带后台任务的测试节点)、[配置/init/进程](interfaces/server.md)；[健康与关闭](operations/runtime.md)。修改节点核对无需读取主数据、库存或销售全文 |
+| App 提交、重试、取消、工作站 | [business/command-submission.md](business/command-submission.md) | [前端校时](business/time.md#前端校时)、[补录](business/time.md#补录)、[异常确认](engineering/http.md#异常分级)、[business/auth.md](business/auth.md)、[TLS 的 App 要求](operations/tls.md#对前端-app-的要求)、[SOP](operations/sop.md)；实现阶段按路线图 |
+| 认证、权限、设备注册 | [business/auth.md](business/auth.md) | [operations/tls.md](operations/tls.md)、[主数据归属](business/master-data.md#主数据)、[HTTP 与幂等](engineering/http.md)、[认证验收](business/auth.md#验收用例) |
+| 备份、不变量自检或健康报告 | [operations/backup.md](operations/backup.md)、[operations/invariant-check.md](operations/invariant-check.md)或 [operations/runtime.md](operations/runtime.md#健康状态get-health) | [SQLite 连接例外](engineering/storage.md#sqlite)、[关闭顺序](operations/runtime.md#优雅关闭)、[测试节点](interfaces/app.md#boh-app带后台任务的测试节点)；各专题的测试章节 |
+| 配置、监听、启动、关闭或进程 review | [server 契约](interfaces/server.md)、[operations/runtime.md](operations/runtime.md) | [节点校时](business/time.md#门店节点校时)、[备份](operations/backup.md)、[自检](operations/invariant-check.md)、[存储启动/关闭接口](interfaces/storage.md#公开-api)、[TLS 状态与启动/关闭](operations/tls.md)、[部署适用阶段](../deploy/README.md#适用阶段)；[独立进程验收范围](engineering/development.md#测试分工)。不要求库存命令全文 |
+| 锁定测试、规范审查或代码 review | [engineering/development.md](engineering/development.md) 的相应阶段、[稳定接口索引](interfaces.md) | 按被测行为读取业务规范和验收；预期值须人确认，不能用实现推导预期或破坏独立审查的读取范围；代码 review 另读 [工程检查表](engineering/rust.md#机器强制) |
+| 依赖、模块归属或工程约束 | [engineering/architecture.md](engineering/architecture.md)、[engineering/rust.md](engineering/rust.md) | [角色和受保护路径](engineering/development.md#协作分工)、[当前开发步骤](engineering/development.md#开发顺序每个新功能)；依赖先登记并经人批准 |
+| 门店部署与人工操作 | [部署要求](../deploy/README.md)、[部署记录模板](../deploy/deployment-record.template.md)、[SOP](operations/sop.md) | 按步骤读取时间、认证、TLS 和备份规则；上线时的操作要求不等于当前软件能力 |
+
+## 三个代表任务的阅读路径
+
+- **实现报损**：开始任务 → `business/operations.md`[「报损接口」](business/operations.md#报损接口)及已锁定表的报损行 → `engineering/http.md` → `business/inventory.md` 的数值、数量、单位、批次、投影 → `engineering/architecture.md`[「库存规则归属」](engineering/architecture.md#库存规则归属) → `engineering/storage.md` → `business/time.md` 的 ID、节点信号、发生时间校验、通用规则 → [开发桩](business/auth.md#开发桩) → `interfaces/app.md` 的 Router、`interfaces/domain.md` 的报损 payload → [spec_waste.rs](../crates/boh-app/tests/spec_waste.rs)、[golden](../crates/boh-app/tests/golden/WASTE_LOGGED@1)、[重放测试](../crates/boh-app/tests/spec_replay.rs)。检查 `business/operations.md`[「盘点吸收」](business/operations.md#盘点吸收)的当前边界；结果未知语义读 `business/command-submission.md`「提交状态」「后台重试收到的结果」，无需读销售或认证未来设计全文。
+- **修改节点校时**：开始任务 → `business/time.md` 的 ID、校时信号、门店节点校时、节点时钟接口 → [时间与状态文件故障](business/time.md#已知限制) → `interfaces/storage.md` 的 Clock、`interfaces/app.md` 的 TestNode、`interfaces/server.md` 的配置/init/进程 → `operations/runtime.md` 的关闭和健康状态 → `interfaces/domain.md` 的信号有效性接口 → [节点校时测试](../crates/boh-app/tests/spec_clock_sync.rs)、[时间测试](../crates/boh-domain/tests/spec_time.rs)、[init 测试](../crates/boh-server/tests/spec_init.rs)和[服务测试](../crates/boh-server/tests/spec_serve.rs)。涉及前端或营业日时才扩展读取相应章节。
+- **审查服务启动关闭**：开始任务与 `engineering/development.md` 的第 6 步/测试分工 → `interfaces/server.md` → `operations/runtime.md` → `interfaces/storage.md` 的公开 API → `business/time.md`[「门店节点校时」](business/time.md#门店节点校时) → `operations/backup.md`、`operations/invariant-check.md` 的触发/关闭与初始化要求 → `operations/tls.md` 的实现边界、监听、启动检查、关闭 → `deploy/README.md` 适用阶段。按实际改动决定黑盒验收及返修证据沿用范围；无需读取报损或销售业务。
 
 ## 规则与事实的来源
 
-| 要确定什么 | 来源 |
+| 要确定什么 | 权威来源 |
 |---|---|
-| 工程约束、角色边界、交付流程 | [AGENTS.md](../AGENTS.md)；Claude 的补充流程见 [CLAUDE.md](../CLAUDE.md) |
-| 业务语义、条件、例外、错误与警告 | [domain.md](domain.md#阅读导航)；认证、备份、自检、TLS 的细则分别在对应专题文档 |
-| 已落地的字段与表结构 | `boh-domain` 结构体与迁移 SQL，按业务章节中的代码指向定位；测试入口的契约见 [interfaces.md](interfaces.md) |
-| 验收预期与覆盖范围 | 经人确认的锁定测试；文档中的代表算例与待实现用例见[验收用例](domain.md#验收用例)。预期值的修改限制见[测试分工](../AGENTS.md#测试分工) |
-| 实现进度与运行证据 | [路线图](../AGENTS.md#路线图)与各节状态说明用于定位；是否已交付须核对当前代码、测试和对应 HEAD 的验证结果 |
-| 规范用词 | [术语表](glossary.md)；具体规则仍读其指向的正文 |
+| 核心硬规则、角色边界与当前阶段 | [AGENTS.md](../AGENTS.md)；详细工程与流程正文按其中链接读取；Claude 补充流程见 [CLAUDE.md](../CLAUDE.md) |
+| 业务语义、适用条件、例外、错误与警告 | [领域索引](domain.md#阅读导航)指向的专题，以及认证、备份、自检、TLS 专题；引用位置不复制规则全文 |
+| 已落地的字段与表结构 | `boh-domain` 结构体、迁移 SQL；业务章节提供代码定位。未实现结构仍按相应设计章节，不自行冻结未决设计 |
+| 稳定测试接口、可见性和测试能力 | [interfaces.md](interfaces.md) 及 storage/domain/app/server 专题；客户端业务 API 在各业务专题 |
+| 验收预期与覆盖 | 经人确认的锁定测试；[代表算例与待实现用例](business/operations.md#验收用例)、[认证用例](business/auth.md#验收用例)和各基础设施专题测试要求。不得为通过测试改预期 |
+| 实现状态与运行证据 | [路线图](../AGENTS.md#路线图)和原专题的状态说明用于定位；当前 checkout 的代码、测试、对应 HEAD 的验证结果证明交付。静态检查不证明真实进程行为 |
+| 规范用词 | [glossary.md](glossary.md)；具体条件仍以其引用的正文为准 |
 
-发现来源之间不一致时，指出具体位置和差异，按 [AGENTS.md「协作分工」](../AGENTS.md#协作分工)及「开发顺序」处理；不通过改预期值或绕过受保护路径来消除冲突。
+发现来源冲突时，报告具体位置和差异，按[协作分工](engineering/development.md#协作分工)及[设计变更流程](engineering/development.md#开发顺序每个新功能)处理，不自行选一方、改预期或绕过受保护路径。
