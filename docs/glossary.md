@@ -30,6 +30,13 @@
 | Canonical request | 规范化请求 | 命令反序列化成强类型结构体后再序列化、剥离 `command_id` 和 `clock_synced_at` 得到的文本，用于幂等比对；含 PIN 或授权秘密的命令另有例外，见 auth「敏感命令的幂等」 | AGENTS「幂等」 |
 | Envelope | 信封 | 所有 HTTP 响应共用的外层结构：`success`、`data`、`warnings`、`error` | AGENTS「HTTP 约定」 |
 | Invariant self-check | 不变量自检 | 启动时和闭店时在读连接上检查投影是否满足不变量，`/health` 返回最近一次的结果 | invariant-check「触发」 |
+| Chain root | 连锁根 | 局域网 HTTPS 信任链的起点，全连锁一个，私钥离线保存，根证书内置 App | tls「证书层级」 |
+| Store issuing CA | 门店签发 CA | 每店一张、由连锁根签发、带名称约束的中间 CA，私钥在门店节点上，用来签发叶证书 | tls「证书层级」 |
+| Leaf certificate | 叶证书 | 门店节点在 HTTPS 握手中出示的服务器证书，由节点用门店签发 CA 自动签发和续期 | tls「叶证书的签发与续期」 |
+| Provisional certificate | 临时证书 | 节点信号无效又没有可用叶证书时签发、只在内存中的叶证书；信号有效后换成正式证书 | tls「叶证书的签发与续期」 |
+| Name constraints | 名称约束 | 门店签发 CA 证书中限制它能签哪些 DNS 名和 IP 的扩展 | tls「证书层级」 |
+| Issue list | 问题清单 | `/health` 的 `issues`：节点当前存在的运维问题，每项有码、严重度 `ERROR` / `WARNING` 和开始时间；严重度与异常分级无关 | AGENTS「HTTP 约定」 |
+| Deployment record | 部署记录 | 每店一份、不进仓库的记录：设备固定 IP、路由器网段与地址池、门店签发 CA 到期日等 | `deploy/` |
 | Sync cursor | 同步游标 | `sync_state.acked_seq`：总部已确认收到的最大 `seq`，上行同步从它之后推送 | AGENTS「上行同步」 |
 
 ## 业务领域

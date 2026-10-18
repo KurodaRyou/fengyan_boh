@@ -3,7 +3,7 @@
 烘焙门店后厨（BOH）系统的门店本地节点。部署在每家门店的一台 Linux 机器上，局域网内由门店统一采购、纳入设备管理的平板和手机通过 Android / iOS 原生 App 访问（部署要求见 [docs/domain.md](docs/domain.md)「时间」前端校时）。
 **断网是可能出现的情况**：正常情况下门店长时间有外网，偶尔因路由器故障、重启等断开外网。门店节点和前端的校时信号有效时，所有门店内核心操作无需外网即可正常工作，联网后再把事件同步到总部。节点无有效校时信号时，按 [SOP](docs/sop.md)「门店机校时」打开手机热点联网校准，获得有效信号后恢复写入；前端无有效信号时，先向门店节点校时。没有可用热点时，继续采用纸面登记流程。平板连不上门店节点时，未发出的记录改用纸面登记、恢复后补录；结果未知的记录由 App 后台任务用原 ID 重试，需要时在门店机工作站核对（见 [docs/domain.md](docs/domain.md)「命令提交与结果未知」）。
 
-业务决策、事件目录与领域规则见 [docs/domain.md](docs/domain.md)；系统依赖的门店操作规范见 [docs/sop.md](docs/sop.md)；规范用词见 [docs/glossary.md](docs/glossary.md)；锁定测试使用的接口见 [docs/interfaces.md](docs/interfaces.md)；备份模块的细则见 [docs/backup.md](docs/backup.md)；不变量自检的细则见 [docs/invariant-check.md](docs/invariant-check.md)；员工认证与设备注册见 [docs/auth.md](docs/auth.md)。
+业务决策、事件目录与领域规则见 [docs/domain.md](docs/domain.md)；系统依赖的门店操作规范见 [docs/sop.md](docs/sop.md)；规范用词见 [docs/glossary.md](docs/glossary.md)；锁定测试使用的接口见 [docs/interfaces.md](docs/interfaces.md)；备份模块的细则见 [docs/backup.md](docs/backup.md)；不变量自检的细则见 [docs/invariant-check.md](docs/invariant-check.md)；员工认证与设备注册见 [docs/auth.md](docs/auth.md)；局域网 HTTPS 的细则见 [docs/tls.md](docs/tls.md)。
 
 本文件是所有编码 agent（Codex、Antigravity、Claude Code 等）共用的项目规则。
 
@@ -143,7 +143,8 @@
 | 测试临时目录 | `tempfile`（仅 dev-dependency） |
 | 时区 / 营业日 | `jiff`，启用 `tzdb-bundle-always`：时区库编进二进制，不依赖门店机的 zoneinfo |
 | 员工 PIN 哈希（待引入，认证切片） | `argon2`（Argon2id） |
-| 局域网 HTTPS（待引入，认证切片之前） | `rustls`，接入方式随 `docs/domain.md` Q9 确定 |
+| 局域网 HTTPS（待引入，局域网 HTTPS 切片） | `rustls`（关闭默认特性，启用 `ring`、`std`、`tls12`）：TLS 实现；`rustls-pki-types`：读取 PEM（不用已停止维护的 `rustls-pemfile`）；`axum-server`（rustls 特性，不带默认密码学实现）：HTTPS 监听、`Handle` 优雅关闭、`RustlsConfig` 重新加载证书。见 [docs/tls.md](docs/tls.md) |
+| 叶证书签发（待引入，局域网 HTTPS 切片） | `rcgen`（默认 `ring`，加 `pem`、`x509-parser` 特性）：节点签发叶证书；`x509-parser` 解析门店签发 CA 和现有叶证书（签发者名称取 CA 证书原文，读取 `notAfter`） |
 | 门店节点校时的 NTP 核对 | `sntpc`，关闭默认特性；本机时间经 `NtpTimestampGenerator` 取自时钟模块，UDP 用 tokio |
 | 上行同步（待实现） | `reqwest` + `rustls`，mTLS |
 
@@ -155,8 +156,8 @@
 ## 架构
 
 ```
-[ 平板 / 手机原生 App（后台任务：结果未知的命令原 ID 重试；不排队）]  ──HTTP (LAN)──►  axum handler
-[ 工作站：门店机浏览器 ]  ──HTTP（本机）──►  同一 axum（静态文件 + API）
+[ 平板 / 手机原生 App（后台任务：结果未知的命令原 ID 重试；不排队）]  ──HTTPS (LAN)──►  axum handler
+[ 工作站：门店机浏览器 ]  ──HTTP（只绑定本机回环地址）──►  同一 axum（静态文件 + API）
                                    │
               ┌────────────────────┴───────────────────┐
               ▼ 命令（写）                              ▼ 查询（读）
@@ -173,7 +174,7 @@
                 └─ INSERT processed_commands（含响应和 warnings）
               COMMIT
 
-   后台任务（读连接 / 备份连接）：备份、不变量自检、节点校时核对
+   后台任务（读连接 / 备份连接）：备份、不变量自检、节点校时核对；叶证书续期（不用数据库连接）
    同步 worker（待实现，与请求完全解耦）
    └─ SELECT store_events WHERE seq > acked_seq ORDER BY seq ─► mTLS 推送总部 ─► 更新 sync_state
 ```
@@ -184,10 +185,10 @@
 crates/
   boh-domain/   纯类型与校验不变量、库存规则纯函数（见「库存规则归属」）、发生时间校验与营业日纯函数。只允许依赖 serde / uuid / thiserror / jiff。禁止数据库、HTTP、系统 I/O（包括读系统时钟）。
   boh-storage/  SQLite：连接初始化、迁移、写入线程、读连接池、ledger（唯一写事件入口）、projections（含各事件共用的库存投影写入）、备份、时钟模块（可注入）、原生 SQL。
-  boh-app/      http（路由、响应信封）、service（命令编排，含各命令共用的库存决策读取）、节点校时核对（NTP 查询与校时信号）、sync（同步 worker，待实现）。
-  boh-server/   main：加载配置、启动、信号处理、优雅关闭；子命令 init、rebuild-projections；认证切片加子命令 enroll-code、unlock-device、reset-unlock-code、revoke-device、reset-pin。
+  boh-app/      http（路由、响应信封）、service（命令编排，含各命令共用的库存决策读取）、节点校时核对（NTP 查询与校时信号）、叶证书签发与续期（见 docs/tls.md）、sync（同步 worker，待实现）。
+  boh-server/   main：加载配置、启动（HTTPS 与本机工作站监听）、信号处理、优雅关闭；子命令 init、rebuild-projections；认证切片加子命令 enroll-code、unlock-device、reset-unlock-code、revoke-device、reset-pin。
 migrations/     编号 SQL 文件，001_xxx.sql、002_xxx.sql……
-deploy/         systemd unit、示例配置。
+deploy/         systemd unit、示例配置、部署要求与部署记录模板。
 scripts/        CI 扫描脚本。
 ```
 
@@ -314,7 +315,7 @@ scripts/        CI 扫描脚本。
 ### 认证
 细则（设备注册、登录、PIN 设定与重置、限速、敏感命令的幂等、开发桩）见 [docs/auth.md](docs/auth.md)。
 - PIN（含确认值）和 PIN 重置授权秘密不得明文写入事件、数据库、WAL、备份、日志或留存响应；初始化和 CLI 仅在终端无回显输入 PIN，不接受 PIN 命令行参数。
-- 设备令牌、PIN、会话令牌、PIN 重置授权只经 HTTPS 传输；节点未配置 TLS 时不注册认证接口，release 构建启用认证但未配置 TLS 时**拒绝启动**。
+- 设备令牌、PIN、会话令牌、PIN 重置授权、注册码、解锁码只经 HTTPS 或本机回环地址（门店机工作站）传输；节点未配置 TLS 时不注册认证接口。监听与启动检查见 [docs/tls.md](docs/tls.md)。
 
 ### 上行同步（只定契约，本期不实现）
 - 不建 outbox。连续的 `seq` 就是同步游标。开发同步时新增迁移建单行表 `sync_state`（`acked_seq`、`last_attempt_at`、`last_error`、`consecutive_failures`）。
@@ -363,15 +364,16 @@ scripts/        CI 扫描脚本。
   | `boh_storage::testing` 中的函数 | 锁定测试及 `spec_support/` |
   | `boh_app::test_router`、`boh_app::test_node` | 锁定测试及 `spec_support/` |
   | `boh_storage::backup::Backup::hold` | `boh_app::TestNode::hold_backups`、`boh-app` / `boh-storage` 中备份相关的 `#[cfg(test)]` 单元测试 |
-  | `std::time::SystemTime::now`、`jiff::Timestamp::now`、`jiff::Zoned::now`、`jiff::tz::TimeZone::system`、`jiff::tz::TimeZone::try_system` | 时钟模块 |
+  | `std::time::SystemTime::now`、`jiff::Timestamp::now`、`jiff::Zoned::now`、`jiff::tz::TimeZone::system`、`jiff::tz::TimeZone::try_system`、`time::OffsetDateTime::now_utc`、`time::OffsetDateTime::now_local`、`time::UtcDateTime::now`、`x509_parser::time::ASN1Time::now`、`x509_parser::certificate::Validity::is_valid`、`x509_parser::certificate::Validity::time_to_expiration` | 时钟模块 |
   | `std::thread::sleep` | 无 |
   | `HashMap` / `HashSet`（`boh-domain`） | 无 |
 
   crate 级 `clippy.toml` 会覆盖根目录的配置，所以根目录的规则要完整复制进去。
 - 禁止在上表以外的位置豁免这些 lint，禁止用 crate 级 `#![allow]` 放宽任何 deny 的 lint。
 - Release 配置 `panic = "abort"`：任何 panic 都直接结束进程，由 systemd 重启。不要用 `catch_unwind` 吞 panic。
-- 优雅关闭顺序：停止接收 HTTP → 停止同步 worker 和后台任务（执行完正在进行和已排队的备份、闭店流程与自检；节点校时核对见下） → `WriterHandle::shutdown()` 处理完已入队的写任务 → `wal_checkpoint(TRUNCATE)` → 退出。
+- 优雅关闭顺序：停止接收 HTTP（局域网 HTTPS 与本机工作站监听）→ 停止同步 worker 和后台任务（执行完正在进行和已排队的备份、闭店流程与自检；节点校时核对、叶证书续期见下） → `WriterHandle::shutdown()` 处理完已入队的写任务 → `wal_checkpoint(TRUNCATE)` → 退出。
   - 节点校时核对：正在等待的 NTP 查询直接取消；已经开始的状态文件持久化执行完再退出（`spawn_blocking` 开始运行后不能中止）。
+  - 叶证书续期：等待下一次判断的间隔直接取消；已经开始的签发与证书文件持久化执行完再退出（见 [docs/tls.md](docs/tls.md)「关闭」）。
   - checkpoint 因读事务未结束而未能截断 WAL（`CheckpointBusy`）时只记 `warn`，正常退出：已提交的事务已持久化在 WAL 中，下次打开时 SQLite 用保留的 WAL 读取并在需要时恢复已提交状态，checkpoint 在之后满足触发条件时执行。
     只有 `CheckpointBusy` 这样处理；I/O 错误、数据库损坏、关闭连接失败等照常报错。
 
@@ -397,6 +399,7 @@ scripts/        CI 扫描脚本。
 ## HTTP 约定
 
 - 业务接口统一前缀 `/api/v1/`；`GET /health` 例外。
+- 节点对局域网只以 HTTPS 服务；明文 HTTP 只绑定本机回环地址，供门店机工作站使用，绑定其他地址时拒绝启动；release 构建未配置 `[tls]` 时拒绝启动。细则见 [docs/tls.md](docs/tls.md)。
 - 所有响应都是同一信封（`boh-app/src/http.rs`），`warnings` 总是存在，没有警告时为空数组：
 
 ```json
@@ -432,12 +435,32 @@ scripts/        CI 扫描脚本。
   | `last_backup_failed_at` | 本进程最近一次备份尝试失败时为该次失败时的 `now()`；最近一次尝试成功或还没有尝试时为 `null` |
   | `wal_size_bytes` | `<数据库文件>-wal` 的大小；文件不存在时为 0 |
   | `invariant_check` | 本进程最近一次不变量自检的尝试与报告，结构见 [docs/invariant-check.md](docs/invariant-check.md)「报告」 |
+  | `tls_ca_not_after` | 门店签发 CA 的 `notAfter`；未配置 TLS 时为 `null` |
+  | `tls_cert_not_after` | 正在使用的叶证书的 `notAfter`；未配置 TLS 或没有叶证书时为 `null` |
+  | `tls_cert_provisional` | 正在使用的是临时证书时为 `true`，是正式证书时为 `false`；未配置 TLS 或没有叶证书时为 `null`（[docs/tls.md](docs/tls.md)） |
+  | `issues` | 问题清单：`[{code, severity, since}]`，按下表顺序排列，没有时为 `[]` |
 
-  - `clock_synced` 是 `false`，`clock_regression_ms > 300000`，`last_backup_failed_at` 不是 `null`，或 `invariant_check.last_attempt.result` 是 `violated` / `failed`，`status` 为 `degraded`；否则为 `ok`。
+  - 问题清单：生成报告时按下表判定。`since` 是本进程中第一次判定该问题存在时的 `now()`；问题消失时移除，再出现时重新计时。只在进程内存中，不写数据库。
+    显示对象由前端按 `code` 决定，见下表；节点不按身份过滤（`/health` 不需要身份，只给码）。
+
+    | `code` | 条件 | `severity` | 显示对象 |
+    |---|---|---|---|
+    | `CLOCK_NOT_SYNCED` | `clock_synced` 是 `false` | `ERROR` | 全员（写入被拒，按 SOP 开热点） |
+    | `CLOCK_REGRESSION` | `clock_regression_ms > 300000` | `WARNING` | 店长 |
+    | `BACKUP_FAILED` | `last_backup_failed_at` 不是 `null` | `ERROR` | 店长 |
+    | `INVARIANT_VIOLATED` | `invariant_check.last_attempt.result` 是 `violated` | `ERROR` | 店长 |
+    | `INVARIANT_CHECK_FAILED` | `invariant_check.last_attempt.result` 是 `failed` | `ERROR` | 店长 |
+    | `TLS_CA_EXPIRING` | `now ≥ tls_ca_not_after − 180 天`；`now ≥ tls_ca_not_after − 30 天` 时为 `ERROR` | `WARNING` / `ERROR` | 店长 |
+    | `TLS_CERT_PROVISIONAL` | `tls_cert_provisional` 是 `true` | `WARNING` | 店长 |
+    | `TLS_CERT_EXPIRING` | `now ≥ tls_cert_not_after − 7 天` | `ERROR` | 店长 |
+
+    - `ERROR`：现在已经坏了，需要马上处理；`WARNING`：将来会坏。与 docs/domain.md「异常分级」的级别无关。
+  - `issues` 不为空时 `status` 为 `degraded`；否则为 `ok`。
     `degraded` 只是报告，不让进程退出或重启；写入是否被拒只看 `clock_synced`。
   - 备份字段只反映本进程：`null` 表示「本进程还不知道」，不表示没有备份；重启会清掉失败状态。`ok` 只表示本进程暂未发现异常，不表示已有一份可用备份。
     判断备份是否过期、重启前的历史，留到需要「门店当前是否受有效备份保护」时另行设计。
   - 生成报告成功返回 `200`（含 `degraded`）；查询数据库或读取 WAL 文件失败（文件不存在除外）返回 `500 INTERNAL_ERROR`。监控必须看 `data.status`，不能只看状态码。
+  - 实现状态：`tls_ca_not_after`、`tls_cert_not_after`、`tls_cert_provisional`、`issues` 随局域网 HTTPS 切片实现；实现之前 `status` 仍按问题清单中前五个码的条件判定。
   - 后续加入的字段：认证实现后加 `auth_failures_last_hour`；同步实现后加 `max(seq) − acked_seq` 和最后一次成功同步的时间。
 
 ---
@@ -467,11 +490,10 @@ ARM 门店机改用 `aarch64-unknown-linux-musl`。部署文件见 `deploy/`。
 ## 尚未设计（动手前先讨论）
 
 - 前端原生 App：技术栈（Android / iOS 各自开发或跨平台）、安装分发与版本更新、设备管理（MDM）的选型与设备注册流程、后台任务与盘点草稿的本地存储，断网、重试、恢复与取消的客户端日志；时间规则已定，见 [docs/domain.md](docs/domain.md)「时间」前端校时；提交状态、后台任务、参数、登出提示已定，见 [docs/domain.md](docs/domain.md)「命令提交与结果未知」。
-- 工作站网页前端：技术栈、构建方式、静态文件编进二进制的方式；新增依赖须先登记技术栈表并经人批准。工作站的登录与本机 HTTP 是否需要 HTTPS 随局域网 HTTPS 与认证切片定。
+- 工作站网页前端：技术栈、构建方式、静态文件编进二进制的方式、登录与入口；新增依赖须先登记技术栈表并经人批准。传输已定：经本机回环地址的明文 HTTP（见 [docs/tls.md](docs/tls.md)「监听」）。
 - 下行同步：主数据包的格式、拉取与导入流程（原则已定：总部维护统一的 JSON 主数据包，逐行比对快照，`source = HQ_PACKAGE`；全部主数据归总部所有，见 [docs/domain.md](docs/domain.md)「主数据」）。**总部本期不开发，延后。**
   - 设计时一并定：门店修改申请的流程；按门店下发不同物料时，下发给某店的包内引用必须完整（配方用到的物料都在包内）；物料撤出某店的下发范围时该店只停用、不删除；新门店初始化、首次主数据包导入与首位店长本地 PIN 设定的衔接（包括如何满足 `LAST_ACTIVE_MANAGER` 约束）；员工调动后在新门店的登录（认证状态不同步，见 [docs/auth.md](docs/auth.md)）。
-- 上行同步的实现：总部接收接口、批量大小、mTLS 证书下发与轮换、失败的重试分类（哪些错误可重试）。**延后**；契约见「上行同步」。
-- 局域网 HTTPS：证书签发与平板信任方式（见 `docs/domain.md` Q9）。**认证切片的前置条件。**
+- 上行同步的实现：总部接收接口、批量大小、mTLS 证书下发与轮换、失败的重试分类（哪些错误可重试）。**延后**；契约见「上行同步」。信任体系沿用 [docs/tls.md](docs/tls.md) 的连锁根，客户端证书用单独的签发 CA 和私钥。
 - 异地备份复制的实现。
 - 门店节点恢复与业务连续性：恢复入口与操作步骤（方向：数据库备份 + 纸面业务凭据 + 人工补录 + 盘点核对），覆盖收货、生产、报损、盘点、幂等重试，以及恢复后的上行同步（恢复到旧备份会让 `seq` 回退，与总部已接收的事件冲突）。恢复后不得重用已贴在货物上的批次号。原则已定：恢复时清空会话、PIN 重置授权、设备注册、设备解锁码、锁定状态与失败计数，平板重新注册；员工 PIN 哈希保留（认证状态表见 [docs/auth.md](docs/auth.md)）。认证幂等记录不得绕过恢复后的设备注册校验。**延后**；恢复演练测试照常要求。
 

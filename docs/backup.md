@@ -6,6 +6,7 @@
 
 备份目录由必填配置项 `backup_dir` 指定。启动时目录不存在则创建（含上级目录）；创建失败或路径不是目录，拒绝启动。
 - `deploy/boh.service` 的 `ProtectSystem=strict` 只放行 `StateDirectory`：示例配置用 `/var/lib/boh/backups`，放到其他位置要在 unit 中加 `ReadWritePaths`。
+- 局域网 HTTPS 的证书和私钥不在数据库和备份目录中，不进备份；恢复到新机器时重新签发门店签发 CA（见 [tls.md](tls.md)「节点更换」）。
 
 ## 文件名
 

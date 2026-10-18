@@ -340,6 +340,16 @@ pub struct Config {
     pub backup_keep_count: NonZeroU32,
     pub closing_backup_time: ClosingBackupTime,
     pub ntp_servers: Vec<NtpServer>,
+    pub workstation_addr: Option<SocketAddr>,  // 随局域网 HTTPS 切片
+    pub tls: Option<TlsConfig>,                // 随局域网 HTTPS 切片
+}
+
+// 随局域网 HTTPS 切片
+pub struct TlsConfig {
+    pub ip: Ipv4Addr,
+    pub ca_cert_path: PathBuf,
+    pub ca_key_path: PathBuf,
+    pub cert_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -355,6 +365,8 @@ pub fn parse_config(text: &str) -> Result<Config, impl std::error::Error>;
 - `ntp_servers` 必填，非空字符串数组，按原顺序解析（domain.md「时间」门店节点校时）：
   - `host` 或 `host:port`，端口是 `1`–`65535` 的十进制数，缺省 123；IPv6 地址写成 `[addr]` 或 `[addr]:port`，`host` 中不带方括号。
   - `host` 不能为空，不含空白；不带方括号的 IPv6 地址（如 `::1`）有多个冒号，无法区分端口，为错误。
+- `workstation_addr`（随局域网 HTTPS 切片）可选；IP 不是回环地址（`127.0.0.0/8`、`::1`）时为错误。
+- `[tls]`（随局域网 HTTPS 切片）可选；有这一段时四项都必填，`ip` 必须在 `10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16` 内（docs/tls.md「配置与启动检查」）。release 构建缺少 `[tls]` 时拒绝启动，这一检查不在 `parse_config` 中。
 - `main` 经此函数加载配置。
 
 ## boh-server：`init` 子命令
@@ -384,6 +396,7 @@ pub fn parse_config(text: &str) -> Result<Config, impl std::error::Error>;
 锁定测试以子进程运行：`boh-server <配置文件>`，经配置的 `listen_addr`（本机地址）用 HTTP/1.1 访问，由测试经系统 `kill` 命令发送信号。
 
 - 就绪：`GET /health` 返回 200 之后视为已开始服务。
+- 局域网 HTTPS 切片：配置 `[tls]` 的服务进程经 HTTPS 访问，测试用 `spec_support/` 中固定的测试连锁根与门店签发 CA；`TestNode` 驱动叶证书续期的测试入口、HTTPS 测试客户端随该切片的锁定测试给出。
 - 启动时读取状态文件并开始一次核对，不等待它完成就开始服务（domain.md「时间」门店节点校时）。
 - 收到 SIGTERM 或 SIGINT 后按 AGENTS.md「Rust」的优雅关闭顺序退出，退出码 0：
   - 正在等待的 NTP 查询直接取消，不等满 5 秒超时。只在等待 NTP、没有进行中的备份、自检、闭店流程或状态文件持久化时，退出时间不受这 5 秒影响（锁定测试在这种场景下断言 3 秒内退出）；有这些工作时按 AGENTS.md 的关闭顺序执行完再退出。
