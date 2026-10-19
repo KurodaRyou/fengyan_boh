@@ -47,7 +47,7 @@ pub fn parse_config(text: &str) -> Result<Config, impl std::error::Error>;
   - `host` 或 `host:port`，端口是 `1`–`65535` 的十进制数，缺省 123；IPv6 地址写成 `[addr]` 或 `[addr]:port`，`host` 中不带方括号。
   - `host` 不能为空，不含空白；不带方括号的 IPv6 地址（如 `::1`）有多个冒号，无法区分端口，为错误。
 - `workstation_addr`（随局域网 HTTPS 切片）可选；IP 不是回环地址（`127.0.0.0/8`、`::1`）时为错误。
-- `[tls]`（随局域网 HTTPS 切片）可选；有这一段时四项都必填，`ip` 必须在 `10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16` 内，`listen_addr` 的 IP 必须等于 `ip`（[监听](../operations/tls.md#监听)「配置与启动检查」）。release 构建缺少 `[tls]` 时拒绝启动，这一检查不在 `parse_config` 中。
+- `[tls]`（随局域网 HTTPS 切片）可选；有这一段时四项都必填，`ip` 必须在 `10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16` 内，`listen_addr` 的 IP 必须等于 `ip`（[监听](../operations/tls.md#监听)、[配置与启动检查](../operations/tls.md#配置与启动检查)）。release 构建缺少 `[tls]` 时拒绝启动，这一检查不在 `parse_config` 中。
 - `main` 经此函数加载配置。
 
 ## boh-server：`init` 子命令

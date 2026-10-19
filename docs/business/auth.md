@@ -1,7 +1,7 @@
 # 员工认证
 
 本文件定义员工认证、设备注册与含 PIN / PIN 重置授权秘密的命令。领域规则见 [domain.md](../domain.md)，工程规则见 [AGENTS.md](../../AGENTS.md)。
-除「开发桩」外随认证切片实现（前置：局域网 HTTPS；Q7 见 [待确认问题](../domain.md#待确认问题)）。
+除[「开发桩」](#开发桩)外随认证切片实现（前置：局域网 HTTPS；Q7 见 [待确认问题](../domain.md#待确认问题)）。
 
 ## 认证规则
 
@@ -43,7 +43,7 @@
 ## 员工主数据
 
 - HTTP `EMPLOYEE` 命令新建 `MANAGER`、将 `STAFF` 改为 `MANAGER`，或将停用员工启用且新 `role = MANAGER` 时，首次执行须校验已验证会话所属店长的当前 PIN；条件在同一写事务内按变更前投影和新快照判定，不因 `source = HQ_PACKAGE` 豁免。
-- 上述 PIN 仅为命令的敏感字段，不进入 `EMPLOYEE` 快照或事件 payload，适用「敏感命令的幂等」；错误计入设备 PIN 失败次数，设备锁定时拒绝校验，拒绝时不改员工、不写事件或 `processed_commands`。
+- 上述 PIN 仅为命令的敏感字段，不进入 `EMPLOYEE` 快照或事件 payload，适用[「敏感命令的幂等」](#敏感命令的幂等)；错误计入设备 PIN 失败次数，设备锁定时拒绝校验，拒绝时不改员工、不写事件或 `processed_commands`。
 - `EMPLOYEE` 变更后必须至少保留一名已设定 PIN 且启用的 `MANAGER`，否则返回 `409 LAST_ACTIVE_MANAGER`，不写事件或 `processed_commands`。
 - **认证状态不进事件流**：`employee_credentials`（PIN 的 Argon2id 哈希）、设备注册、设备解锁码哈希、设备锁定状态与失败计数、会话、PIN 重置授权都是普通状态表，不同步，不参与重建。
 

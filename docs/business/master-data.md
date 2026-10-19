@@ -27,7 +27,7 @@
 - `ITEM` 的 `code` 只能由 `A`–`Z`、`0`–`9` 和 `_` 组成（本地编辑和总部包导入都一样）。
   理由：它是批次号的一段，要印在标签上并由人录入。
 - `units` 不含基本单位：`unit_code` 等于 `base_unit` 时系数恒为 1。`units` 中的 `unit_code` 在同一物料内唯一、不等于 `base_unit`，按 `unit_code` 升序；系数规则见[「单位」](inventory.md#单位)。
-- `versions` 按 `version` 升序，从 1 连续编号；每批产出和每行每批用量见「主数据接口」配方；同一版本的 `lines` 中 `item_id` 不重复，顺序为录入顺序。
+- `versions` 按 `version` 升序，从 1 连续编号；每批产出和每行每批用量见[「主数据接口」](#主数据接口)配方；同一版本的 `lines` 中 `item_id` 不重复，顺序为录入顺序。
 - 快照字段与枚举随 `MASTER_DATA_CHANGED@1` 冻结；结构变更按 [开发阶段与上线](../../AGENTS.md#开发阶段与上线)处理：上线前直接修改、不升 `schema_version`；上线后按[「只追加」](../engineering/storage.md#只追加append-only)升版本。
 
 - 主键一律 UUIDv7。`code` 人可读、各门店统一（物料的 `code` 用于销售导入）。
@@ -74,7 +74,7 @@
 - 写命令成功的 `data` 是 `{<单行键>: 行}`，行为该命令执行后的实体：`<ID 字段>`、快照的全部字段、`revision`，可选字段缺省时省略该键。查询的 `data` 是 `{<列表键>: [行…]}`，含停用的，按 `code` 的字节序升序。
 - 取值：`code`、`name` 非空，首尾不能有空白字符；`base_revision` 是正整数；其余字段见下文。
 - **新建**：`code` 已被同一实体的其他行使用（含停用的）：`409 CODE_ALREADY_EXISTS`，`details` 为 `{"code", <ID 字段>}`（已占用该 `code` 的行）。
-- **修改**：行不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": <实体>, "id"}`。`base_revision` 规则见「主数据」。
+- **修改**：行不存在：`404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": <实体>, "id"}`。`base_revision` 规则见[「主数据」](#主数据)。
   - 新快照与当前快照相同时不写事件，命令照常成功并写入 `processed_commands`，响应为当前行。
 - **引用**：引用其他主数据的字段必须指向已有的行（含停用的），规则见[「写命令通用规则」](../engineering/http.md#写命令通用规则)。
 

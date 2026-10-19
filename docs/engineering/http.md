@@ -53,7 +53,7 @@
     - 发生时间的校验和营业日计算属于业务校验，在幂等检查之后执行。
       理由：`recorded_at` 在写事务内才确定。重试即使带着已过期的 `clock_synced_at`，也返回首次响应，不重新校验。
   - 主数据命令不带 `occurred_at` / `clock_synced_at`：`occurred_at = recorded_at`，`business_date` 由它计算。
-- **业务校验**（幂等检查之后）：被拒绝时不写事件或 `processed_commands`。同时命中多个业务错误时，返回哪一个不作规定；需要确认的项在其余业务校验都通过之后判定（见「异常分级」），接口另外规定了判定先后的也除外。
+- **业务校验**（幂等检查之后）：被拒绝时不写事件或 `processed_commands`。同时命中多个业务错误时，返回哪一个不作规定；需要确认的项在其余业务校验都通过之后判定（见[「异常分级」](#异常分级)），接口另外规定了判定先后的也除外。
 - **引用**：引用的实体不存在时 `404 REFERENCE_NOT_FOUND`，`details` 为 `{"entity": <被引用的实体>, "id"}`，接口另有规定的除外。停用的照常受理。
 - **行下标**：带 `lines` 的命令，错误和警告 `details` 中的 `line` 是行在 `lines` 中的下标。
 
@@ -73,14 +73,14 @@
   - 理由：前端按 `code` 选处理器；同一码在不同命令中级别不同，前端就要再按命令分支。
 - 需要员工确认的原因共用顶层码 `409 CONFIRMATION_REQUIRED`，具体原因码放在 `details.confirmations` 中。以后出现别的类别时，各起自己的顶层码。
 - 需要确认的异常，其触发条件必须能从 payload 判定；判定不了的，必须把判定依据写进 payload。确认本身不写进 payload，执行人由 `store_events.actor_id` 记录。
-  - 例：报损事件记录了 `qty`、`item_book_qty`、`lot_book_qty`，满足不足条件又没被吸收的行必然经过了确认。疑似重复判定不了，所以写 `possible_duplicate_of`（见[「时间」](../business/time.md#时间)补录）。
+  - 例：报损事件记录了 `qty`、`item_book_qty`、`lot_book_qty`，满足不足条件又没被吸收的行必然经过了确认。疑似重复判定不了，所以写 `possible_duplicate_of`（见[「补录」](../business/time.md#补录)）。
 
 **分级表**：
 
 | 码 | 级别 | 触发条件 | 适用命令 | 实现状态 |
 |---|---|---|---|---|
 | `STOCK_SHORTFALL` | 需要确认 | 报损：未被吸收的行数量超过账面（见[「报损接口」](../business/operations.md#报损接口)逐行处理）；纠错：扣回时批次余量不够（见[「纠错」](../business/operations.md#纠错)） | 报损、纠错 | 报损已实现；纠错随纠错切片 |
-| `POSSIBLE_DUPLICATE` | 需要确认 | 补录行与已入账事件疑似重复（见[「时间」](../business/time.md#时间)补录） | 补录的收货、报损、温度记录；生产随生产切片 | 随补录入口切片 |
+| `POSSIBLE_DUPLICATE` | 需要确认 | 补录行与已入账事件疑似重复（见[「补录」](../business/time.md#补录)） | 补录的收货、报损、温度记录；生产随生产切片 | 随补录入口切片 |
 | `ITEM_HAS_NO_LOTS` | 拒绝 | 报损的物料还没有任何批次 | 报损 | 已实现 |
 | `COUNT_REQUIRED` | 拒绝 | 纠错的退回会使账外缺口大于 0 | 纠错 | 随纠错切片 |
 | `STOCK_LIMIT_EXCEEDED` | 拒绝 | 超出库存状态上限（见[「数量」](../business/inventory.md#数量)） | 收货、报损；生产、盘点、纠错随各自切片 | 收货、报损已实现 |
