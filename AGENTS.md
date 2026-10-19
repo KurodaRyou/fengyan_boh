@@ -1,6 +1,6 @@
 # Fengyan BOH — 门店边缘节点
 
-烘焙门店后厨的本地 Linux 节点，门店管理的 Android / iOS 原生 App 经局域网访问。节点和前端校时信号有效时，核心操作无需外网；信号失效须按 SOP 校准；无法校准或连不上节点时，未发出的记录改用纸面流程。结果未知的请求保留原 ID 重试。完整[部署与断网边界](docs/engineering/architecture.md#部署与断网)和[提交规则](docs/business/command-submission.md)按任务读取。
+烘焙门店后厨的本地 Linux 节点，门店管理的 Android / iOS 原生 App 经局域网访问。节点和前端校时信号有效时，核心操作无需外网；信号失效须按 SOP 校准，无法校准时改用纸面登记；连不上节点时，未发出的记录改用纸面登记。结果未知的请求保留原 ID 重试。完整[部署与断网边界](docs/engineering/architecture.md#部署与断网)和[提交规则](docs/business/command-submission.md)按任务读取。
 
 本文件是所有编码 agent（Codex、Antigravity、Claude Code 等）共用的项目规则。
 
