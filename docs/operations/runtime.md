@@ -22,7 +22,7 @@
   | `clock_synced_at` | 节点的上次校时时间（[门店节点校时](../business/time.md#门店节点校时)）；没有时为 `null` |
   | `clock_regression_ms` | `max(0, max(store_events.recorded_at) − now)`，账本为空时为 0；含义见 [时钟异常](../business/time.md#通用规则) |
   | `last_backup_ok_at` | 本进程最近一次成功备份完成时的 `now()`；本进程还没有成功过时为 `null` |
-  | `last_backup_seq` | 该次备份的 `n`（见[「备份」](backup.md#备份)）；同上为 `null` |
+  | `last_backup_seq` | 该次备份的 `n`（见[备份流程](backup.md#流程)）；同上为 `null` |
   | `last_backup_failed_at` | 本进程最近一次备份尝试失败时为该次失败时的 `now()`；最近一次尝试成功或还没有尝试时为 `null` |
   | `wal_size_bytes` | `<数据库文件>-wal` 的大小；文件不存在时为 0 |
   | `invariant_check` | 本进程最近一次不变量自检的尝试与报告，结构见 [报告](invariant-check.md#报告) |
