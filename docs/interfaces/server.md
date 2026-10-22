@@ -42,7 +42,7 @@ pub fn parse_config(text: &str) -> Result<Config, impl std::error::Error>;
 ```
 
 - 解析 TOML 配置文本，不读文件、不创建目录。错误类型由实现决定，锁定测试只区分 `Ok` / `Err`。
-- `backup_dir` 必填；`backup_keep_count` 缺省为 168，必须是正整数（TOML 整数，`1`–`u32::MAX`）；`closing_backup_time` 缺省为 `"23:30"`，格式见 `parse_closing_backup_time`。
+- `backup_dir` 必填；`backup_keep_count` 缺省为 168，必须是正整数（TOML 整数，`1`–`u32::MAX`）；`closing_backup_time` 缺省为 `"23:30"`，格式见 [`parse_closing_backup_time`](domain.md#闭店备份时刻)。
 - `ntp_servers` 必填，非空字符串数组，按原顺序解析（[门店节点校时](../business/time.md#门店节点校时)）：
   - `host` 或 `host:port`，端口是 `1`–`65535` 的十进制数，缺省 123；IPv6 地址写成 `[addr]` 或 `[addr]:port`，`host` 中不带方括号。
   - `host` 不能为空，不含空白；不带方括号的 IPv6 地址（如 `::1`）有多个冒号，无法区分端口，为错误。
